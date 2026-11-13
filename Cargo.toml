@@ -1,0 +1,25 @@
+[package]
+name = "rbxcache"
+version = "0.1.0"
+edition = "2021"
+description = "Explorer for the Roblox client asset cache (rbx-storage)"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+eframe = "0.31"
+egui_extras = "0.31"
+md-5 = "0.10"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
+open = "5"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[profile.release]
+opt-level = 3
+strip = true
+
