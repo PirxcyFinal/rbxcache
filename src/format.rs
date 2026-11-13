@@ -6,6 +6,7 @@
 //! | u32 headerLen | u32 headerSum | u32 bodyLen | u32 bodySum | u32 reserved
 //! | response headers | body
 //! ```
+//! Both sums are [`checksum`] of the bytes they cover.
 
 pub const MAGIC: &[u8; 4] = b"RBXH";
 
@@ -70,14 +71,25 @@ pub fn wrapper_len(buf: &[u8]) -> Option<usize> {
     fixed.checked_add(u32le(buf, fixed - 20) as usize)
 }
 
-/// Rebuilds a wrapped blob around a new body, keeping URL, status and headers.
-/// The body length field is updated; the body checksum is left as it was
-/// because its algorithm is not known.
+/// The checksum Roblox stores for the response headers and for the body:
+/// XXH32 with a fixed seed, and zero for empty data.
+pub fn checksum(data: &[u8]) -> u32 {
+    const SEED: u32 = 0x00c4_e564;
+    if data.is_empty() {
+        0
+    } else {
+        xxhash_rust::xxh32::xxh32(data, SEED)
+    }
+}
+
+/// Rebuilds a wrapped blob around a new body, keeping URL, status and headers
+/// and updating the body's length and checksum.
 pub fn with_new_body(old: &[u8], header: &Header, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(header.body_offset + body.len());
     out.extend_from_slice(&old[..header.body_offset]);
     let len_at = 12 + header.url_len + 13;
     out[len_at..len_at + 4].copy_from_slice(&(body.len() as u32).to_le_bytes());
+    out[len_at + 4..len_at + 8].copy_from_slice(&checksum(body).to_le_bytes());
     out.extend_from_slice(body);
     out
 }
@@ -340,6 +352,15 @@ mod tests {
         assert_eq!(&new[h2.body_offset..], b"a much longer new body");
         assert_eq!(h2.body_len, 22);
         assert_eq!((h2.url.as_str(), h2.status, h2.headers.as_str()), ("https://example.com/x", 200, "a: b\r\n"));
-        assert_eq!((h2.header_sum, h2.body_sum), (h.header_sum, h.body_sum));
+        assert_eq!((h2.header_sum, h2.body_sum), (h.header_sum, checksum(b"a much longer new body")));
+        assert_eq!(parse_header(&with_new_body(&old, &h, b"")).unwrap().body_sum, 0);
+    }
+
+    #[test]
+    fn checksum_matches_values_roblox_stored() {
+        assert_eq!(checksum(b"roblox-assettypeid: 1\r\n"), 0xaf46_d420);
+        assert_eq!(checksum(b"roblox-assettypeid: 4\r\n"), 0xe472_056a);
+        assert_eq!(checksum(b"roblox-assettypeid: 84\r\n"), 0x5992_45d5);
+        assert_eq!(checksum(b""), 0);
     }
 }

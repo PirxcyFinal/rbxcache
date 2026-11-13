@@ -7,6 +7,7 @@ mod gui;
 mod store;
 mod theme;
 mod viewers;
+mod watch;
 
 use anyhow::{Context, Result};
 use clap::Parser;

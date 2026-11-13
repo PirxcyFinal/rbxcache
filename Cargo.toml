@@ -1,6 +1,6 @@
 [package]
 name = "rbxcache"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Viewer and editor for the Roblox client asset cache (rbx-storage)"
 
@@ -26,6 +26,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 texture2ddecoder = "0.1.2"
 ureq = "2"
+xxhash-rust = { version = "0.8", features = ["xxh32"] }
 
 [profile.release]
 opt-level = 3

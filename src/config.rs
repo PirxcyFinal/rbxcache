@@ -17,7 +17,7 @@ use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -298,6 +298,8 @@ pub struct RuleReport {
     pub matched: usize,
     /// Entries whose content was (or, on a dry run, would be) changed.
     pub changed: usize,
+    /// The entries as they are after being rewritten; empty on a dry run.
+    pub written: Vec<Entry>,
     pub notes: Vec<String>,
 }
 
@@ -326,7 +328,9 @@ struct Plan {
 ///
 /// Every rule is resolved against the cache as it was at the start, so rules
 /// that swap two assets with each other see the original content of both.
-pub fn run(store: &Store, entries: &[Entry], idmap: &IdMap, rules: &[Rule], apply: bool) -> Vec<RuleReport> {
+/// `only` limits the entries that may be changed, for re-applying a config to
+/// the few entries Roblox has just written.
+pub fn run(store: &Store, entries: &[Entry], idmap: &IdMap, rules: &[Rule], apply: bool, only: Option<&HashSet<Id>>) -> Vec<RuleReport> {
     let resolver = Resolver::new(store, entries, idmap);
     let mut plans = Vec::new();
     for rule in rules {
@@ -340,6 +344,9 @@ pub fn run(store: &Store, entries: &[Entry], idmap: &IdMap, rules: &[Rule], appl
         }
         matched.sort_unstable();
         matched.dedup();
+        if let Some(only) = only {
+            matched.retain(|&i| only.contains(&entries[i].id));
+        }
         plan.report.matched = matched.len();
         let payload: Result<Option<Vec<u8>>> = match &rule.action {
             Action::Invalid(why) => Err(anyhow::anyhow!("{why}")),
@@ -374,11 +381,14 @@ pub fn run(store: &Store, entries: &[Entry], idmap: &IdMap, rules: &[Rule], appl
     }
     if apply {
         for plan in &mut plans {
-            let Some(payload) = &plan.payload else { continue };
+            let Some(body) = &plan.payload else { continue };
             for &i in &plan.writes {
-                if let Err(e) = store.replace_body(&entries[i].id, payload) {
-                    plan.report.changed -= 1;
-                    plan.report.notes.push(format!("{}: {e:#}", entries[i].id_hex));
+                match store.replace_body(&entries[i].id, body) {
+                    Ok(entry) => plan.report.written.push(entry),
+                    Err(e) => {
+                        plan.report.changed -= 1;
+                        plan.report.notes.push(format!("{}: {e:#}", entries[i].id_hex));
+                    }
                 }
             }
         }

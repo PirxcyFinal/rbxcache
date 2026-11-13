@@ -8,16 +8,19 @@ use crate::format::{self, human_size};
 use crate::store::{self, category_name, format_time_ms, Entry, Id, Store};
 use crate::theme::{self, alpha};
 use crate::viewers;
+use crate::watch::{self, Change, Tracker, Verdict, Watcher};
 use anyhow::{anyhow, Context, Result};
 use eframe::egui::{self, Color32, CornerRadius, Margin, Rect, Shape, Stroke, Vec2};
 use egui_extras::{Column, TableBuilder};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 
 const ROW_HEIGHT: f32 = 24.0;
+/// Seconds a newly written entry keeps its marker in the table.
+const FRESH_SECONDS: f32 = 10.0;
 /// Seconds the detail panel takes to settle after the focused entry changes.
 const PANEL_TIME: f32 = 0.32;
 
@@ -68,6 +71,9 @@ enum Action {
     Tag,
     CopyId,
     SortBy(SortKey),
+    SetSource,
+    ReplaceFromSource,
+    StopConfig,
     PlayAudio,
     ForcePreview,
     ExportConverted,
@@ -183,6 +189,17 @@ struct App {
     delete_prompt: String,
     pending_config: Option<PendingConfig>,
     confirm_config: bool,
+    /// A config that is re-applied to whatever Roblox writes while watching.
+    active_config: Option<(String, Vec<config::Rule>)>,
+    /// Follow the cache as Roblox changes it.
+    live: bool,
+    /// Changes arriving from the watcher thread, and the flag that stops it.
+    watch: Option<(Receiver<Change>, Arc<AtomicBool>)>,
+    tracker: Tracker,
+    /// When each recently written entry arrived, for the marker beside it.
+    fresh: HashMap<Id, f64>,
+    /// The entry "Replace with source" copies from.
+    source: Option<Id>,
     show_about: bool,
     status: String,
 
@@ -239,6 +256,12 @@ impl App {
             delete_prompt: String::new(),
             pending_config: None,
             confirm_config: false,
+            active_config: None,
+            live: true,
+            watch: None,
+            tracker: Tracker::default(),
+            fresh: HashMap::new(),
+            source: None,
             show_about: false,
             motion: true,
             blob: Blob::default(),
@@ -266,12 +289,13 @@ impl App {
             let _ = tx.send(LoadMsg::Done(result.map_err(|e| format!("{e:#}"))));
             ctx.request_repaint();
         });
+        self.stop_watch();
         self.loading = Some(rx);
         self.progress = (0, 0);
         self.load_error = None;
     }
 
-    fn poll_load(&mut self) {
+    fn poll_load(&mut self, ctx: &egui::Context) {
         let Some(rx) = &self.loading else { return };
         let mut finished = None;
         for msg in rx.try_iter() {
@@ -288,6 +312,9 @@ impl App {
                 self.focus = None;
                 self.preview = None;
                 self.reindex();
+                if self.live {
+                    self.start_watch(ctx);
+                }
                 if self.status.is_empty() {
                     self.status = format!("Loaded {}", format::count(self.entries.len(), "entry", "entries"));
                 }
@@ -297,6 +324,90 @@ impl App {
                 self.load_error = Some(e);
             }
             None => {}
+        }
+    }
+
+    fn stop_watch(&mut self) {
+        if let Some((_, stop)) = self.watch.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Starts a thread that reports what Roblox does to the cache from here on.
+    fn start_watch(&mut self, ctx: &egui::Context) {
+        self.stop_watch();
+        let (tx, rx) = channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stamps: Vec<store::Stamp> = self.entries.iter().map(Entry::stamp).collect();
+        let (dir, ctx, flag) = (self.dir.clone(), ctx.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let Ok(mut watcher) = Watcher::new(&dir, stamps.into_iter()) else { return };
+            while !flag.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                // A failed poll (the index is briefly locked, say) is simply tried again.
+                if let Ok(Some(change)) = watcher.poll() {
+                    if tx.send(change).is_err() {
+                        return;
+                    }
+                    ctx.request_repaint();
+                }
+            }
+        });
+        self.watch = Some((rx, stop));
+    }
+
+    /// Folds in what the watcher saw, and re-applies the active config to it.
+    fn poll_watch(&mut self, ctx: &egui::Context) {
+        let changes: Vec<Change> = match &self.watch {
+            Some((rx, _)) => rx.try_iter().collect(),
+            None => return,
+        };
+        if changes.is_empty() {
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        let mut written: HashSet<Id> = HashSet::new();
+        for change in &changes {
+            for verdict in self.tracker.observe(change) {
+                match verdict {
+                    // The first read is the news; later ones only move the counter.
+                    Verdict::Read { id, reads: 1 } => {
+                        self.notify(ctx, format!("Roblox read the replacement in {} and kept it", &store::hex(&id)[..12]), false)
+                    }
+                    Verdict::Read { .. } => {}
+                    Verdict::Reverted { id, times } => {
+                        let text = format!("Roblox wrote {} again, discarding the replacement ({times}x)", &store::hex(&id)[..12]);
+                        self.notify(ctx, text, true);
+                    }
+                }
+            }
+            for entry in &change.written {
+                written.insert(entry.id);
+                self.fresh.insert(entry.id, now);
+            }
+            watch::merge(&mut self.entries, change);
+        }
+        if let Some((name, rules)) = &self.active_config {
+            let targets: HashSet<Id> = written.iter().filter(|id| self.tracker.may_replace(id)).copied().collect();
+            if !targets.is_empty() {
+                let reports = Store::open(&self.dir, true).map(|store| config::run(&store, &self.entries, &self.idmap, rules, true, Some(&targets)));
+                let rewritten: Vec<Entry> = reports.into_iter().flatten().flat_map(|r| r.written).collect();
+                if !rewritten.is_empty() {
+                    self.status = format!("{name}: re-applied to {}", format::count(rewritten.len(), "entry", "entries"));
+                    for entry in &rewritten {
+                        self.tracker.record(entry);
+                    }
+                    watch::merge(&mut self.entries, &Change { written: rewritten, ..Default::default() });
+                }
+            }
+        }
+        if self.focus.is_some_and(|id| written.contains(&id)) {
+            self.preview = None;
+        }
+        self.reindex();
+        self.selected.retain(|id| self.index.contains_key(id));
+        if self.focus.is_some_and(|id| !self.index.contains_key(&id)) {
+            self.focus = None;
         }
     }
 
@@ -479,8 +590,21 @@ impl App {
             Action::OpenExternally => self.open_externally(),
             Action::Replace => self.replace(),
             Action::Delete => self.delete_selected(),
+            Action::SetSource => match self.focused() {
+                Some(e) => {
+                    let text = format!("{} is now the replacement source", &e.id_hex[..12]);
+                    self.source = Some(e.id);
+                    Ok(text)
+                }
+                None => Ok(String::new()),
+            },
+            Action::ReplaceFromSource => self.replace_from_source(),
+            Action::StopConfig => match self.active_config.take() {
+                Some((name, _)) => Ok(format!("{name} is no longer re-applied")),
+                None => Ok(String::new()),
+            },
             Action::ApplyConfig => self.check_config(),
-            Action::ConfirmConfig => self.apply_config(ctx),
+            Action::ConfirmConfig => self.apply_config(),
             Action::Tag => self.tag_focused(),
             Action::PlayAudio => self.play_audio(),
             Action::ExportConverted => self.export_converted(),
@@ -561,12 +685,32 @@ impl App {
         let body = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         let updated = Store::open(&self.dir, true)?.replace_body(&id, &body)?;
         let msg = format!("Replaced {} with {} ({})", updated.id_hex, path.display(), human_size(updated.size));
-        if let Some(&i) = self.index.get(&id) {
+        self.replaced(updated);
+        Ok(msg)
+    }
+
+    /// Copies the source entry's content over the focused entry.
+    fn replace_from_source(&mut self) -> Result<String> {
+        let (Some(e), Some(source)) = (self.focused(), self.source) else { return Ok(String::new()) };
+        let id = e.id;
+        if id == source {
+            return Err(anyhow!("This entry is the replacement source itself"));
+        }
+        let store = Store::open(&self.dir, true)?;
+        let updated = store.replace_body(&id, &store.read_body(&source)?)?;
+        let msg = format!("Replaced {} with the content of {}", &updated.id_hex[..12], &store::hex(&source)[..12]);
+        self.replaced(updated);
+        Ok(msg)
+    }
+
+    /// Takes in an entry this tool has just rewritten.
+    fn replaced(&mut self, updated: Entry) {
+        self.tracker.record(&updated);
+        if let Some(&i) = self.index.get(&updated.id) {
             self.entries[i] = updated;
         }
         self.preview = None;
         self.reindex();
-        Ok(msg)
     }
 
     fn delete_selected(&mut self) -> Result<String> {
@@ -603,19 +747,29 @@ impl App {
             return Ok(String::new());
         };
         let rules = config::load(&path)?;
-        let reports = config::run(&Store::open(&self.dir, false)?, &self.entries, &self.idmap, &rules, false);
+        let reports = config::run(&Store::open(&self.dir, false)?, &self.entries, &self.idmap, &rules, false, None);
         let notes = reports.iter().flat_map(|r| r.notes.iter().map(move |n| format!("{}: {n}", r.name))).collect();
         self.pending_config = Some(PendingConfig { path, rules, summary: config::summarize(&reports, false), notes });
         self.confirm_config = true;
         Ok(String::new())
     }
 
-    fn apply_config(&mut self, ctx: &egui::Context) -> Result<String> {
+    fn apply_config(&mut self) -> Result<String> {
         let Some(pending) = self.pending_config.take() else { return Ok(String::new()) };
         let store = Store::open(&self.dir, true)?;
-        let reports = config::run(&store, &self.entries, &self.idmap, &pending.rules, true);
-        self.start_load(ctx);
-        Ok(config::summarize(&reports, true))
+        let reports = config::run(&store, &self.entries, &self.idmap, &pending.rules, true, None);
+        let summary = config::summarize(&reports, true);
+        let rewritten: Vec<Entry> = reports.into_iter().flat_map(|r| r.written).collect();
+        for entry in &rewritten {
+            self.tracker.record(entry);
+        }
+        watch::merge(&mut self.entries, &Change { written: rewritten, ..Default::default() });
+        self.preview = None;
+        self.reindex();
+        // From here on the config follows the cache: whatever Roblox writes is checked against it.
+        let name = pending.path.file_stem().map_or_else(|| "config".to_string(), |n| n.to_string_lossy().into_owned());
+        self.active_config = Some((name, pending.rules));
+        Ok(summary)
     }
 
     fn play_audio(&mut self) -> Result<String> {
@@ -662,12 +816,13 @@ impl App {
                 item(ui, actions, true, "Open cache folder", "", Action::OpenFolder);
                 ui.separator();
                 item(ui, actions, true, "Apply config...", "Ctrl+O", Action::ApplyConfig);
+                item(ui, actions, self.active_config.is_some(), "Stop re-applying config", "", Action::StopConfig);
                 ui.separator();
                 item(ui, actions, true, "Quit", "Alt+F4", Action::Quit);
             });
             ui.menu_button("Entry", |ui| {
                 ui.set_min_width(230.0);
-                entry_items(ui, actions, one, any);
+                entry_items(ui, actions, one, any, self.source.is_some());
             });
             ui.menu_button("View", |ui| {
                 ui.set_min_width(210.0);
@@ -675,6 +830,12 @@ impl App {
                     self.rebuild_view();
                 }
                 ui.checkbox(&mut self.motion, "Animations");
+                if ui.checkbox(&mut self.live, "Watch cache live").changed() {
+                    match self.live {
+                        true => self.start_watch(ui.ctx()),
+                        false => self.stop_watch(),
+                    }
+                }
                 ui.separator();
                 ui.menu_button("Sort by", |ui| {
                     for (title, key) in COLUMNS {
@@ -786,6 +947,11 @@ impl App {
                     theme::pill(ui, e.kind, theme::kind_color(e.kind));
                     ui.label(egui::RichText::new(human_size(e.size)).strong());
                     ui.label(egui::RichText::new(&e.id_hex[..12]).monospace().color(theme::MUTED));
+                    match self.tracker.reads(&e.id) {
+                        Some(0) => theme::pill(ui, "replaced, not read by Roblox yet", theme::WARN),
+                        Some(reads) => theme::pill(ui, &format!("replaced, read {reads}x by Roblox"), theme::OK),
+                        None => {}
+                    }
                 });
             }
             ui.horizontal_wrapped(|ui| {
@@ -921,6 +1087,7 @@ impl App {
 
     fn table(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         let mut clicked: Option<usize> = None;
+        let now = ui.input(|i| i.time);
         let mut context_row: Option<usize> = None;
         let mut focus_rect: Option<Rect> = None;
         let mut body_clip: Option<Rect> = None;
@@ -972,7 +1139,14 @@ impl App {
                     let is_focus = focus == Some(e.id);
                     // The focused row is highlighted by the animated blob instead.
                     row.set_selected(!is_focus && self.selected.contains(&e.id));
-                    row.col(|ui| theme::pill(ui, e.kind, theme::kind_color(e.kind)));
+                    row.col(|ui| {
+                        theme::pill(ui, e.kind, theme::kind_color(e.kind));
+                        // A dot that fades out marks what Roblox has just written.
+                        if let Some(age) = self.fresh.get(&e.id).map(|at| (now - at) as f32).filter(|age| *age < FRESH_SECONDS) {
+                            let (dot, _) = ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
+                            ui.painter().circle_filled(dot.center(), 3.5, alpha(theme::OK, 1.0 - age / FRESH_SECONDS));
+                        }
+                    });
                     row.col(|ui| {
                         ui.label(egui::RichText::new(format!("{} {}", e.category, category_name(e.category))).color(theme::MUTED));
                     });
@@ -1003,7 +1177,7 @@ impl App {
                     }
                     response.context_menu(|ui| {
                         ui.set_min_width(220.0);
-                        entry_items(ui, actions, one, any);
+                        entry_items(ui, actions, one, any, self.source.is_some());
                     });
                 });
             });
@@ -1345,12 +1519,14 @@ fn item(ui: &mut egui::Ui, actions: &mut Vec<Action>, enabled: bool, text: &str,
 }
 
 /// The per-entry commands, shared by the Entry menu and the row context menu.
-fn entry_items(ui: &mut egui::Ui, actions: &mut Vec<Action>, one: bool, any: bool) {
+fn entry_items(ui: &mut egui::Ui, actions: &mut Vec<Action>, one: bool, any: bool, source: bool) {
     item(ui, actions, one, "Export...", "Ctrl+E", Action::Export);
     item(ui, actions, any, "Export selected to folder...", "", Action::ExportMany);
     item(ui, actions, one, "Open", "Double-click", Action::OpenExternally);
     ui.separator();
     item(ui, actions, one, "Replace...", "", Action::Replace);
+    item(ui, actions, one, "Use as replacement source", "", Action::SetSource);
+    item(ui, actions, one && source, "Replace with source", "", Action::ReplaceFromSource);
     item(ui, actions, one, "Copy ID", "", Action::CopyId);
     ui.separator();
     let delete = egui::Button::new(egui::RichText::new("Delete").color(theme::DANGER)).shortcut_text(egui::RichText::new("Del").color(theme::MUTED));
@@ -1362,7 +1538,13 @@ fn entry_items(ui: &mut egui::Ui, actions: &mut Vec<Action>, one: bool, any: boo
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_load();
+        self.poll_load(ctx);
+        self.poll_watch(ctx);
+        let now = ctx.input(|i| i.time);
+        self.fresh.retain(|_, at| ((now - *at) as f32) < FRESH_SECONDS);
+        if !self.fresh.is_empty() {
+            ctx.request_repaint();
+        }
         self.roblox_running = self.roblox.load(Ordering::Relaxed);
         // A sound belongs to the entry it was started from.
         if let Some(audio) = self.audio.as_mut().filter(|a| a.current.is_some() && a.current != self.focus) {
@@ -1379,6 +1561,12 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(&self.status).color(theme::MUTED).small());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.watch.is_some() {
+                        theme::pill(ui, "Live", theme::OK);
+                    }
+                    if let Some((name, _)) = &self.active_config {
+                        theme::pill(ui, &format!("Applying {name}"), theme::ACCENT);
+                    }
                     if !self.selected.is_empty() {
                         let text = format!("{} selected  -  {}", self.selected.len(), human_size(self.selected_bytes()));
                         ui.label(egui::RichText::new(text).color(theme::ACCENT).small());

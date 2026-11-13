@@ -39,6 +39,15 @@ pub struct Entry {
     pub body_len: u64,
 }
 
+/// The columns of a row that change as Roblox uses the cache.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Stamp {
+    pub id: Id,
+    pub size: i64,
+    pub hits: i64,
+    pub atime: i64,
+}
+
 /// The columns of a `files` row that do not depend on the content.
 struct Row {
     id: Id,
@@ -68,6 +77,10 @@ impl Entry {
             asset_type: d.asset_type,
             body_len: d.body_len,
         }
+    }
+
+    pub fn stamp(&self) -> Stamp {
+        Stamp { id: self.id, size: self.size as i64, hits: self.hits, atime: self.atime }
     }
 
     fn describe(&mut self, d: Described) {
@@ -254,16 +267,44 @@ impl Store {
         }
     }
 
-    /// Loads one entry, reading its content to classify it.
+    /// Loads one entry, classifying it from the start of its content.
     pub fn entry(&self, id: &Id) -> Result<Entry> {
-        let row =
-            self.conn.query_row("SELECT size, hits, atime, category, ttl, content IS NOT NULL FROM files WHERE id = ?1", params![&id[..]], |r| {
-                Ok(Row { id: *id, size: r.get(0)?, hits: r.get(1)?, atime: r.get(2)?, category: r.get(3)?, ttl: r.get(4)?, inline: r.get(5)? })
-            });
-        let row = self.lookup(id, row)?;
-        let raw = self.read(id)?;
-        let d = describe(&raw, raw.len() as u64, row.category);
+        let found = self.conn.query_row("SELECT size, hits, atime, category, ttl, content FROM files WHERE id = ?1", params![&id[..]], |r| {
+            let content: Option<Vec<u8>> = r.get(5)?;
+            let row =
+                Row { id: *id, size: r.get(0)?, hits: r.get(1)?, atime: r.get(2)?, category: r.get(3)?, ttl: r.get(4)?, inline: content.is_some() };
+            Ok((row, content))
+        });
+        let (row, content) = self.lookup(id, found)?;
+        let d = match content {
+            Some(c) => describe(&c, c.len() as u64, row.category),
+            None => {
+                let path = self.blob_path(id);
+                match read_head(&path) {
+                    Ok(head) => describe(&head, std::fs::metadata(&path).map_or(row.size.max(0) as u64, |m| m.len()), row.category),
+                    Err(_) => Described { kind: "missing", ..describe(&[], 0, row.category) },
+                }
+            }
+        };
         Ok(Entry::new(row, d))
+    }
+
+    /// A number that changes whenever another process commits to the index.
+    pub fn data_version(&self) -> Result<i64> {
+        Ok(self.conn.query_row("PRAGMA data_version", [], |r| r.get(0))?)
+    }
+
+    /// The cheap, frequently changing columns of every row.
+    pub fn stamps(&self) -> Result<Vec<Stamp>> {
+        let mut stmt = self.conn.prepare("SELECT id, size, hits, atime FROM files")?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let Some(id) = row.get_ref(0)?.as_blob().ok().and_then(|b| Id::try_from(b).ok()) else { continue };
+            let number = |column: usize| row.get::<_, Option<i64>>(column).ok().flatten().unwrap_or(0);
+            out.push(Stamp { id, size: number(1), hits: number(2), atime: number(3) });
+        }
+        Ok(out)
     }
 
     /// Reads the stored bytes of an entry, wrapper included.

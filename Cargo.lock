@@ -3351,7 +3351,7 @@ dependencies = [
 
 [[package]]
 name = "rbxcache"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -3374,6 +3374,7 @@ dependencies = [
  "serde_json",
  "texture2ddecoder",
  "ureq",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -5283,6 +5284,12 @@ checksum = "c3a56132a0d6ecbe77352edc10232f788fc4ceefefff4cab784a98e0e16b6b51"
 dependencies = [
  "xml",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
 name = "yoke"

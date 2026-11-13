@@ -90,8 +90,25 @@ pub enum Cmd {
         #[arg(long)]
         kind: String,
     },
-    /// Replace the payload of an entry with the contents of a file
-    Replace { id: String, file: PathBuf },
+    /// Replace the payload of an entry with a file, or with another cached entry
+    Replace {
+        id: String,
+        /// File holding the new content
+        #[arg(required_unless_present = "from")]
+        file: Option<PathBuf>,
+        /// Copy the content of this cache entry instead
+        #[arg(long, conflicts_with = "file")]
+        from: Option<String>,
+    },
+    /// Follow the cache as Roblox uses it, optionally keeping a config applied
+    Watch {
+        /// Re-apply this replacement config to every entry Roblox writes
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Seconds between checks
+        #[arg(long, default_value_t = 1.0)]
+        interval: f32,
+    },
     /// Record that a cache entry is the content of a Roblox asset ID
     Tag { id: String, asset_id: u64 },
     /// Apply a Fleasion-style replacement config to the cache
@@ -229,15 +246,20 @@ pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Replace { id, file } => {
+        Cmd::Replace { id, file, from } => {
             let store = Store::open(dir, true)?;
             warn_if_running();
             let id = store.resolve(&id)?;
-            let body = std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
+            let body = match (file, from) {
+                (Some(file), _) => std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?,
+                (None, Some(from)) => store.read_body(&store.resolve(&from)?)?,
+                (None, None) => unreachable!("clap requires a file or --from"),
+            };
             let e = store.replace_body(&id, &body)?;
             println!("replaced {} - now {} ({})", e.id_hex, e.kind, human_size(e.size));
             Ok(())
         }
+        Cmd::Watch { config: file, interval } => watch(dir, idmap_path, file.as_deref(), interval),
         Cmd::Tag { id, asset_id } => {
             let store = Store::open(dir, false)?;
             let id = store.resolve(&id)?;
@@ -259,7 +281,7 @@ pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
             }
             let entries = store.list(|_, _| {})?;
             let idmap = IdMap::load(idmap_path)?;
-            let reports = config::run(&store, &entries, &idmap, &rules, !dry_run);
+            let reports = config::run(&store, &entries, &idmap, &rules, !dry_run, None);
             for r in &reports {
                 println!("{:<28} matched {:>5}  {} {:>5}", r.name, r.matched, if dry_run { "would change" } else { "changed" }, r.changed);
                 for note in &r.notes {
@@ -272,6 +294,19 @@ pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
         Cmd::Probe { kind, limit } => {
             let store = Store::open(dir, false)?;
             let entries = store.list(|_, _| {})?;
+            if kind.is_none() {
+                let (mut good, mut bad) = (0usize, 0usize);
+                for e in entries.iter().filter(|e| e.wrapped && e.kind != "missing").take(if limit == 0 { usize::MAX } else { limit }) {
+                    let Ok((raw, Some(h))) = store.read_parsed(&e.id) else { continue };
+                    let headers = &raw[h.body_offset - h.headers.len().min(h.body_offset)..h.body_offset];
+                    if format::checksum(&raw[h.body_offset..]) == h.body_sum && format::checksum(headers) == h.header_sum {
+                        good += 1;
+                    } else {
+                        bad += 1;
+                    }
+                }
+                println!("checksums {good:>6} match, {bad:>5} differ");
+            }
             for want in ["ktx2", "mesh", "rbxm", "rbxmx"] {
                 if kind.as_deref().is_some_and(|k| k != want) {
                     continue;
@@ -326,6 +361,61 @@ pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
                 bail!("{failed} of {} entries could not be deleted", ids.len());
             }
             Ok(())
+        }
+    }
+}
+
+/// Prints cache activity until interrupted, re-applying `config` to what Roblox writes.
+fn watch(dir: &Path, idmap_path: &Path, config: Option<&Path>, interval: f32) -> Result<()> {
+    use crate::watch::{merge, Tracker, Verdict, Watcher};
+    let rules = config.map(config::load).transpose()?;
+    let idmap = IdMap::load(idmap_path)?;
+    let store = Store::open(dir, rules.is_some())?;
+    let mut entries = store.list(|_, _| {})?;
+    let mut tracker = Tracker::default();
+    if let Some(rules) = &rules {
+        for report in config::run(&store, &entries, &idmap, rules, true, None) {
+            for entry in &report.written {
+                println!("= applied   {:<12} {}  ({})", entry.kind, entry.id_hex, report.name);
+                tracker.record(entry);
+            }
+        }
+        entries = store.list(|_, _| {})?;
+    }
+    let mut watcher = Watcher::new(dir, entries.iter().map(Entry::stamp))?;
+    println!("watching {} ({}); Ctrl+C to stop", dir.display(), format::count(entries.len(), "entry", "entries"));
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs_f32(interval.clamp(0.2, 60.0)));
+        let Some(change) = watcher.poll()? else { continue };
+        let known: std::collections::HashSet<store::Id> = entries.iter().map(|e| e.id).collect();
+        for verdict in tracker.observe(&change) {
+            match verdict {
+                Verdict::Read { id, reads } => println!("  read      {} replacement read {reads} time(s) and kept", store::hex(&id)),
+                Verdict::Reverted { id, times } => println!("! reverted  {} Roblox wrote this entry again ({times}x)", store::hex(&id)),
+            }
+        }
+        // Our own replacements come back as writes too; those were already reported.
+        for e in change.written.iter().filter(|e| !tracker.holds(e)) {
+            let mark = if known.contains(&e.id) { "~ rewritten" } else { "+ new      " };
+            println!("{mark} {:<12} {:>10}  {}", e.kind, human_size(e.size), e.id_hex);
+        }
+        for id in &change.removed {
+            println!("- removed   {}", store::hex(id));
+        }
+        merge(&mut entries, &change);
+        let Some(rules) = &rules else { continue };
+        let fresh: std::collections::HashSet<store::Id> = change.written.iter().map(|e| e.id).filter(|id| tracker.may_replace(id)).collect();
+        if fresh.is_empty() {
+            continue;
+        }
+        for report in config::run(&store, &entries, &idmap, rules, true, Some(&fresh)) {
+            for entry in &report.written {
+                println!("= applied   {:<12} {}  ({})", entry.kind, entry.id_hex, report.name);
+                tracker.record(entry);
+            }
+            for note in report.notes.iter().filter(|_| report.matched > 0) {
+                println!("  ! {}: {note}", report.name);
+            }
         }
     }
 }

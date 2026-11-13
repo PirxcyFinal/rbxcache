@@ -24,6 +24,9 @@ Windows only.
 - Replace an asset's content with a file of your own, or delete it so Roblox
   downloads it again.
 - Apply replacement configs in the JSON format Fleasion uses.
+- Follow the cache live while Roblox runs: new and rewritten entries appear as
+  they are written, an applied config is re-applied to them, and the tool
+  reports whether Roblox read a replacement or wrote over it.
 
 ## Getting it
 
@@ -53,8 +56,22 @@ details and preview on the right; right-click a row for the entry menu.
 | Delete | Delete the selection |
 | F5 | Reload the cache |
 
-Close Roblox before changing anything. While it runs it may overwrite or ignore
-edits, and the window shows a warning when it detects the client.
+An asset Roblox has already loaded stays in its memory, so a replacement shows
+up the next time the asset is loaded: after rejoining, or after restarting the
+client. The window shows a warning while the client is running.
+
+### Watching the cache
+
+The window follows the cache while it is open (View > Watch cache live). Entries
+Roblox has just written are marked with a dot that fades, and a replaced entry
+shows whether Roblox has read it since. After a config is applied it stays
+active: anything Roblox writes that matches a rule is replaced again, until you
+choose File > Stop re-applying config. An entry Roblox overwrites three times is
+left alone.
+
+To copy one cached asset over another, right-click the first and choose "Use as
+replacement source", then right-click the target and choose "Replace with
+source".
 
 ### Command line
 
@@ -69,6 +86,8 @@ rbxcache export <id> --convert         KTX2 to PNG, mesh to OBJ
 rbxcache export-all <dir> --kind ogg   export every entry of one type
 rbxcache render <id> [--time 1.5]      picture of a mesh or an animation frame
 rbxcache replace <id> <file>           swap the payload for a file
+rbxcache replace <id> --from <id2>     copy another entry's payload over it
+rbxcache watch [--config <file>]       follow the cache, keeping a config applied
 rbxcache delete <id>...                remove entries
 rbxcache tag <id> <assetId>            record which asset an entry is
 rbxcache apply-config <file>           apply a replacement config
@@ -132,12 +151,15 @@ are wrapped in an `RBXH` header:
 | response headers | body
 ```
 
+`headerSum` and `bodySum` are XXH32 with seed `0x00C4E564` over the response
+headers and the body, and zero when those are empty. `rbxcache probe` checks
+this against every entry.
+
 ## Limitations
 
-- The two checksums in the `RBXH` header use an algorithm this tool does not
-  know. A replaced entry keeps its old checksum, so Roblox may reject the edit
-  and download the original again. Check a replacement in game before relying
-  on it.
+- Whether a replacement takes effect in game has only been checked as far as
+  the cache goes: the entry is rewritten with a valid checksum. Use the watch
+  view to see whether Roblox reads it or writes over it.
 - `remove` rules write an empty payload rather than a valid empty asset.
 - Curve animations (`CurveAnimation`) and animations for custom rigs are shown
   as a tree only. The R15 rig uses the proportions of the default blocky
