@@ -92,6 +92,14 @@ To copy one cached asset over another, right-click the first and choose "Use as
 replacement source", then right-click the target and choose "Replace with
 source".
 
+### Clearing the cache
+
+File > Clear cache empties the whole cache so Roblox downloads everything
+again: it deletes the index and the blob folders, after closing Roblox if it is
+running (the dialog says so before you confirm). Other files kept in the cache
+folder are left alone. `rbxcache clear` does the same and refuses while Roblox
+is running unless `--close-roblox` is given.
+
 ### Updates
 
 On start the window asks GitHub once whether a newer release exists and, if so,

@@ -129,6 +129,12 @@ pub enum Cmd {
         #[arg(long, default_value_t = 0)]
         limit: usize,
     },
+    /// Empty the whole cache, so Roblox downloads everything again
+    Clear {
+        /// Close Roblox first if it is running
+        #[arg(long)]
+        close_roblox: bool,
+    },
     /// Delete entries (Roblox downloads them again when needed)
     Delete {
         #[arg(required = true)]
@@ -352,6 +358,12 @@ pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
                 for (message, (n, example)) in errors {
                     println!("    {n:>5} x {message}  e.g. {example}");
                 }
+            }
+            Ok(())
+        }
+        Cmd::Clear { close_roblox } => {
+            for step in store::clear_cache(dir, close_roblox)? {
+                println!("{step}");
             }
             Ok(())
         }

@@ -78,6 +78,8 @@ enum Action {
     Replace,
     OpenExternally,
     AskDelete,
+    AskClear,
+    Clear,
     Delete,
     ApplyConfig,
     ConfirmConfig,
@@ -209,6 +211,9 @@ struct App {
     anchor: Option<usize>,
     preview: Option<Preview>,
     confirm_delete: bool,
+    confirm_clear: bool,
+    /// The outcome of a cache clear that is under way.
+    clearing: Option<Receiver<Result<Vec<String>, String>>>,
     delete_prompt: String,
     pending_config: Option<PendingConfig>,
     confirm_config: bool,
@@ -284,6 +289,8 @@ impl App {
             anchor: None,
             preview: None,
             confirm_delete: false,
+            confirm_clear: false,
+            clearing: None,
             delete_prompt: String::new(),
             pending_config: None,
             confirm_config: false,
@@ -399,6 +406,43 @@ impl App {
         }
     }
 
+    /// Empties the cache on a worker thread; closing Roblox and deleting tens of
+    /// thousands of files takes a moment.
+    fn start_clear(&mut self, ctx: &egui::Context) {
+        // The watcher holds the index open, which would keep it from being deleted.
+        self.stop_watch();
+        let (tx, rx) = channel();
+        let (dir, ctx) = (self.dir.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(store::clear_cache(&dir, true).map_err(|e| format!("{e:#}")));
+            ctx.request_repaint();
+        });
+        self.clearing = Some(rx);
+    }
+
+    fn poll_clear(&mut self, ctx: &egui::Context) {
+        let Some(result) = self.clearing.as_ref().and_then(|rx| rx.try_recv().ok()) else { return };
+        self.clearing = None;
+        match result {
+            Ok(steps) => {
+                self.entries.clear();
+                self.arrivals.clear();
+                self.selected.clear();
+                self.fresh.clear();
+                self.tracker = Tracker::default();
+                (self.focus, self.preview, self.source) = (None, None, None);
+                self.reindex();
+                self.notify(ctx, format!("Cache cleared: {}", steps.join(", ").to_lowercase()), false);
+            }
+            Err(e) => self.notify(ctx, format!("The cache was not cleared: {e}"), true),
+        }
+        // Whatever is in the cache now is read again; after a clear that is nothing
+        // until Roblox starts and writes a new index, which the watcher waits for.
+        if self.live {
+            self.start_watch(ctx);
+        }
+    }
+
     fn stop_watch(&mut self) {
         if let Some((_, stop)) = self.watch.take() {
             stop.store(true, Ordering::Relaxed);
@@ -413,7 +457,14 @@ impl App {
         let stamps: Vec<store::Stamp> = self.entries.iter().map(Entry::stamp).collect();
         let (dir, ctx, flag) = (self.dir.clone(), ctx.clone(), stop.clone());
         std::thread::spawn(move || {
-            let Ok(mut watcher) = Watcher::new(&dir, stamps.into_iter()) else { return };
+            // After the cache is cleared there is no index until Roblox makes a new one.
+            let mut watcher = loop {
+                match Watcher::new(&dir, stamps.iter().copied()) {
+                    Ok(watcher) => break watcher,
+                    Err(_) if flag.load(Ordering::Relaxed) => return,
+                    Err(_) => std::thread::sleep(std::time::Duration::from_secs(2)),
+                }
+            };
             while !flag.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(1000));
                 // A failed poll (the index is briefly locked, say) is simply tried again.
@@ -649,7 +700,8 @@ impl App {
         // While the cache is being read the list is stale, so nothing may act on it.
         let harmless =
             matches!(action, Action::About | Action::Quit | Action::OpenFolder | Action::ShowTab(_) | Action::CheckUpdate | Action::OpenUpdate);
-        if self.loading.is_some() && !harmless {
+        // While the cache is being read or cleared the list is stale, so nothing may act on it.
+        if (self.loading.is_some() || self.clearing.is_some()) && !harmless {
             return;
         }
         let result = match action {
@@ -666,6 +718,14 @@ impl App {
                 }
                 None => Ok(String::new()),
             },
+            Action::AskClear => {
+                self.confirm_clear = true;
+                Ok(String::new())
+            }
+            Action::Clear => {
+                self.start_clear(ctx);
+                Ok(String::new())
+            }
             Action::AskDelete => {
                 if !self.selected.is_empty() {
                     let entries = format::count(self.selected.len(), "cache entry", "cache entries");
@@ -950,6 +1010,7 @@ impl App {
                 ui.set_min_width(230.0);
                 item(ui, actions, true, "Reload cache", "F5", Action::Reload);
                 item(ui, actions, true, "Open cache folder", "", Action::OpenFolder);
+                item(ui, actions, true, "Clear cache...", "", Action::AskClear);
                 ui.separator();
                 item(ui, actions, true, "Apply config...", "Ctrl+O", Action::ApplyConfig);
                 item(ui, actions, self.active_config.is_some(), "Stop re-applying config", "", Action::StopConfig);
@@ -1482,6 +1543,39 @@ impl App {
         open && response.should_close()
     }
 
+    fn clear_dialog(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let mut close = false;
+        let dismissed = self.modal(ctx, "clear", self.confirm_clear, |ui| {
+            ui.label(egui::RichText::new("Clear the cache").size(18.0));
+            ui.add_space(4.0);
+            ui.label(format!("Delete all {}?", format::count(self.entries.len(), "cached entry", "cached entries")));
+            ui.label(
+                egui::RichText::new("Roblox downloads everything again as it needs it. Replacements made here are lost with the rest.")
+                    .color(theme::MUTED),
+            );
+            if self.roblox_running {
+                ui.add_space(4.0);
+                ui.colored_label(theme::WARN, "Roblox is running and will be closed first.");
+            }
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let label = if self.roblox_running { "Close Roblox and clear" } else { "Clear" };
+                if ui.add(egui::Button::new(egui::RichText::new(label).color(Color32::WHITE)).fill(alpha(theme::DANGER, 0.75))).clicked()
+                    && self.confirm_clear
+                {
+                    actions.push(Action::Clear);
+                    close = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close || dismissed {
+            self.confirm_clear = false;
+        }
+    }
+
     fn delete_dialog(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         let mut close = false;
         let dismissed = self.modal(ctx, "delete", self.confirm_delete, |ui| {
@@ -1643,7 +1737,7 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
-        if self.confirm_delete || self.confirm_config || self.show_about {
+        if self.confirm_delete || self.confirm_clear || self.confirm_config || self.show_about {
             return;
         }
         let typing = ctx.wants_keyboard_input();
@@ -1726,6 +1820,7 @@ impl eframe::App for App {
         self.poll_load(ctx);
         self.poll_watch(ctx);
         self.poll_update(ctx);
+        self.poll_clear(ctx);
         let now = ctx.input(|i| i.time);
         self.fresh.retain(|_, at| ((now - *at) as f32) < FRESH_SECONDS);
         if !self.fresh.is_empty() {
@@ -1776,6 +1871,12 @@ impl eframe::App for App {
                         actions.push(Action::Reload);
                     }
                 });
+            } else if self.clearing.is_some() {
+                ui.add_space(ui.available_height() * 0.4);
+                ui.vertical_centered(|ui| {
+                    ui.spinner();
+                    ui.label(egui::RichText::new("Clearing the cache").size(20.0));
+                });
             } else if self.loading.is_some() {
                 self.loading_card(ui);
             } else if self.tab == Tab::Live && self.arrivals.is_empty() {
@@ -1785,6 +1886,7 @@ impl eframe::App for App {
             }
         });
         self.delete_dialog(ctx, &mut actions);
+        self.clear_dialog(ctx, &mut actions);
         self.config_dialog(ctx, &mut actions);
         self.about_dialog(ctx);
         self.show_toast(ctx);

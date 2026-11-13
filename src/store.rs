@@ -445,10 +445,127 @@ pub fn roblox_running() -> bool {
     NAMES.iter().any(|name| std::process::Command::new("pgrep").args(["-x", name]).output().is_ok_and(|o| o.status.success()))
 }
 
+/// Asks the Roblox client to exit, forcibly. Studio is left alone.
+fn close_roblox() {
+    #[cfg(windows)]
+    let mut commands = {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/F", "/IM", "RobloxPlayerBeta.exe"]).creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        vec![cmd]
+    };
+    #[cfg(not(windows))]
+    let mut commands: Vec<std::process::Command> = {
+        let names: &[&str] = if cfg!(target_os = "macos") { &["RobloxPlayer"] } else { &["sober", "Sober"] };
+        names
+            .iter()
+            .map(|name| {
+                let mut cmd = std::process::Command::new("pkill");
+                cmd.args(["-x", name]);
+                cmd
+            })
+            .collect()
+    };
+    for cmd in &mut commands {
+        let _ = cmd.output();
+    }
+}
+
+/// Deletes `path`, retrying for a few seconds while another process still has it open.
+fn remove_when_free(path: &Path) -> std::io::Result<bool> {
+    for attempt in 0.. {
+        match std::fs::remove_file(path) {
+            Ok(()) => return Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) if attempt >= 40 => return Err(e),
+            Err(_) => std::thread::sleep(Duration::from_millis(250)),
+        }
+    }
+    unreachable!("the loop only ends by returning")
+}
+
+/// Empties the cache in `dir`: the index, its journal files and every blob
+/// folder, so Roblox downloads everything again. Returns one line per step.
+///
+/// Roblox keeps the index open while it runs. With `close_client` it is closed
+/// first; without, a running client is an error. Only the two-hex-digit blob
+/// folders are removed, so anything else kept in the cache folder survives.
+pub fn clear_cache(dir: &Path, close_client: bool) -> Result<Vec<String>> {
+    let mut steps = Vec::new();
+    if roblox_running() {
+        if !close_client {
+            bail!("Roblox is running; close it first");
+        }
+        close_roblox();
+        steps.push("Closed Roblox".to_string());
+    }
+    steps.extend(clear_files(dir)?);
+    Ok(steps)
+}
+
+/// Deletes the index, its journal files and the blob folders of the cache in `dir`.
+fn clear_files(dir: &Path) -> Result<Vec<String>> {
+    let mut steps = Vec::new();
+    let mut index_found = false;
+    for name in ["rbx-storage.db", "rbx-storage.db-wal", "rbx-storage.db-shm"] {
+        let path = dir.join(name);
+        index_found |= remove_when_free(&path).with_context(|| format!("deleting {} (is Roblox or Studio still running?)", path.display()))?;
+    }
+    steps.push(if index_found { "Deleted the index" } else { "There was no index" }.to_string());
+
+    let blobs = blob_dir(dir);
+    let (mut folders, mut failed) = (0usize, 0usize);
+    for entry in std::fs::read_dir(&blobs).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let is_blob_folder = name.len() == 2 && name.to_string_lossy().bytes().all(|c| c.is_ascii_hexdigit());
+        if is_blob_folder && entry.path().is_dir() {
+            match std::fs::remove_dir_all(entry.path()) {
+                Ok(()) => folders += 1,
+                Err(_) => failed += 1,
+            }
+        }
+    }
+    steps.push(format!("Deleted {}", format::count(folders, "blob folder", "blob folders")));
+    if failed > 0 {
+        steps.push(format!("{} could not be deleted", format::count(failed, "blob folder", "blob folders")));
+    }
+    Ok(steps)
+}
+
 pub fn format_time_ms(ms: i64) -> String {
     use chrono::TimeZone;
     match chrono::Local.timestamp_millis_opt(ms).single() {
         Some(t) if ms > 0 => t.format("%Y-%m-%d %H:%M:%S").to_string(),
         _ => "-".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clearing_removes_the_cache_and_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("rbxcache-clear-test-{}", std::process::id()));
+        let blobs = dir.join("rbx-storage");
+        std::fs::create_dir_all(blobs.join("ab")).unwrap();
+        std::fs::create_dir_all(blobs.join("0F")).unwrap();
+        std::fs::create_dir_all(blobs.join("tools")).unwrap();
+        std::fs::write(blobs.join("ab").join("ab00"), b"blob").unwrap();
+        std::fs::write(blobs.join("tools").join("keep.txt"), b"mine").unwrap();
+        std::fs::write(blobs.join("zz"), b"a file, not a folder").unwrap();
+        for name in ["rbx-storage.db", "rbx-storage.db-wal", "rbx-storage.id"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+
+        let steps = clear_files(&dir).unwrap();
+        assert_eq!(steps, ["Deleted the index", "Deleted 2 blob folders"]);
+        assert!(!dir.join("rbx-storage.db").exists() && !dir.join("rbx-storage.db-wal").exists());
+        assert!(!blobs.join("ab").exists() && !blobs.join("0F").exists());
+        // Unrelated things in the cache folder are not this tool's to delete.
+        assert!(blobs.join("tools").join("keep.txt").exists() && blobs.join("zz").exists() && dir.join("rbx-storage.id").exists());
+
+        assert_eq!(clear_files(&dir).unwrap(), ["There was no index", "Deleted 0 blob folders"]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
