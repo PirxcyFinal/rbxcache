@@ -7,6 +7,7 @@ mod gui;
 mod protection;
 mod store;
 mod theme;
+mod update;
 mod viewers;
 mod watch;
 

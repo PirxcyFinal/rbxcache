@@ -92,6 +92,14 @@ To copy one cached asset over another, right-click the first and choose "Use as
 replacement source", then right-click the target and choose "Replace with
 source".
 
+### Updates
+
+On start the window asks GitHub once whether a newer release exists and, if so,
+shows an "Update to ..." button that opens the release page. Help > Check for
+updates asks again, and `rbxcache update` does the same from a terminal. Nothing
+is downloaded or installed automatically. The check reads the public releases
+of this repository, so it finds nothing while the repository is private.
+
 ### Command line
 
 The same binary takes commands. Entry IDs can be shortened to any unique prefix.

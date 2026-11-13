@@ -31,6 +31,8 @@ pub struct Args {
 pub enum Cmd {
     /// Open the graphical explorer (the default)
     Gui,
+    /// Check GitHub for a newer release
+    Update,
     /// Summarise the cache by category and content type
     Stats,
     /// List entries
@@ -145,6 +147,15 @@ pub enum Sort {
 pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
     match cmd {
         Cmd::Gui => unreachable!("handled by main"),
+        Cmd::Update => {
+            let release = crate::update::latest()?;
+            if release.is_newer() {
+                println!("rbxcache {} is available (this is {}): {}", release.version, crate::update::CURRENT, release.url);
+            } else {
+                println!("rbxcache {} is the latest release", crate::update::CURRENT);
+            }
+            Ok(())
+        }
         Cmd::Stats => stats(&Store::open(dir, false)?),
         Cmd::List { kind, category, search, min_size, redirects, sort, limit } => {
             let store = Store::open(dir, false)?;

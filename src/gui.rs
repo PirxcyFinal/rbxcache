@@ -8,6 +8,7 @@ use crate::format::{self, human_size};
 use crate::protection::Protections;
 use crate::store::{self, category_name, format_time_ms, Entry, Id, Store};
 use crate::theme::{self, alpha};
+use crate::update::{self, Release};
 use crate::viewers;
 use crate::watch::{self, Change, Tracker, Verdict, Watcher};
 use anyhow::{anyhow, Context, Result};
@@ -93,6 +94,8 @@ enum Action {
     ForcePreview,
     ExportConverted,
     About,
+    CheckUpdate,
+    OpenUpdate,
     Quit,
 }
 
@@ -222,6 +225,10 @@ struct App {
     /// The entry "Replace with source" copies from.
     source: Option<Id>,
     show_about: bool,
+    /// A newer release, once a check has found one.
+    update: Option<Release>,
+    /// The answer of a check in progress, and whether the user asked for it.
+    update_check: Option<(Receiver<Result<Release, String>>, bool)>,
     status: String,
 
     /// Animations on. Off draws every change instantly.
@@ -288,6 +295,8 @@ impl App {
             fresh: HashMap::new(),
             source: None,
             show_about: false,
+            update: None,
+            update_check: None,
             motion: true,
             blob: Blob::default(),
             panel_time: 0.0,
@@ -298,6 +307,7 @@ impl App {
             force_preview: false,
         };
         app.start_load(&cc.egui_ctx);
+        app.check_update(&cc.egui_ctx, false);
         app
     }
 
@@ -358,6 +368,34 @@ impl App {
                 self.load_error = Some(e);
             }
             None => {}
+        }
+    }
+
+    /// Asks GitHub for the latest release without holding up the window.
+    /// `asked` is true when the user requested it and wants to hear the result either way.
+    fn check_update(&mut self, ctx: &egui::Context, asked: bool) {
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(update::latest().map_err(|e| format!("{e:#}")));
+            ctx.request_repaint();
+        });
+        self.update_check = Some((rx, asked));
+    }
+
+    fn poll_update(&mut self, ctx: &egui::Context) {
+        let Some((rx, asked)) = &self.update_check else { return };
+        let (Ok(result), asked) = (rx.try_recv(), *asked) else { return };
+        self.update_check = None;
+        match result {
+            Ok(release) if release.is_newer() => {
+                self.notify(ctx, format!("rbxcache {} is available", release.version), false);
+                self.update = Some(release);
+            }
+            Ok(_) if asked => self.notify(ctx, format!("rbxcache {} is the latest release", update::CURRENT), false),
+            Err(e) if asked => self.notify(ctx, format!("Could not check for updates: {e}"), true),
+            // A check made at startup stays quiet unless there is something to install.
+            _ => {}
         }
     }
 
@@ -609,7 +647,9 @@ impl App {
 
     fn run_action(&mut self, action: Action, ctx: &egui::Context) {
         // While the cache is being read the list is stale, so nothing may act on it.
-        if self.loading.is_some() && !matches!(action, Action::About | Action::Quit | Action::OpenFolder | Action::ShowTab(_)) {
+        let harmless =
+            matches!(action, Action::About | Action::Quit | Action::OpenFolder | Action::ShowTab(_) | Action::CheckUpdate | Action::OpenUpdate);
+        if self.loading.is_some() && !harmless {
             return;
         }
         let result = match action {
@@ -658,6 +698,14 @@ impl App {
                 self.rebuild_view();
                 Ok(String::new())
             }
+            Action::CheckUpdate => {
+                self.check_update(ctx, true);
+                Ok(String::new())
+            }
+            Action::OpenUpdate => match &self.update {
+                Some(release) => open::that(&release.url).map(|()| String::new()).map_err(Into::into),
+                None => Ok(String::new()),
+            },
             Action::About => {
                 self.show_about = true;
                 Ok(String::new())
@@ -947,10 +995,17 @@ impl App {
             });
             ui.menu_button("Help", |ui| {
                 item(ui, actions, true, "About and shortcuts", "F1", Action::About);
+                item(ui, actions, self.update_check.is_none(), "Check for updates", "", Action::CheckUpdate);
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.roblox_running {
                     theme::pill(ui, "Roblox is running - changes may be overwritten", theme::WARN);
+                }
+                if let Some(release) = &self.update {
+                    let label = egui::RichText::new(format!("Update to {}", release.version)).color(theme::OK);
+                    if ui.button(label).on_hover_text("Open the release page").clicked() {
+                        actions.push(Action::OpenUpdate);
+                    }
                 }
                 ui.label(egui::RichText::new(self.dir.display().to_string()).color(theme::MUTED).small());
             });
@@ -1497,7 +1552,7 @@ impl App {
         let mut close = false;
         let dismissed = self.modal(ctx, "about", self.show_about, |ui| {
             ui.label(egui::RichText::new("Roblox Cache Explorer").size(20.0));
-            ui.label(egui::RichText::new(format!("rbxcache {}", env!("CARGO_PKG_VERSION"))).color(theme::MUTED));
+            ui.label(egui::RichText::new(format!("rbxcache {}", update::CURRENT)).color(theme::MUTED));
             ui.add_space(10.0);
             egui::Grid::new("shortcuts").num_columns(2).spacing([18.0, 6.0]).show(ui, |ui| {
                 for (keys, what) in [
@@ -1670,6 +1725,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_load(ctx);
         self.poll_watch(ctx);
+        self.poll_update(ctx);
         let now = ctx.input(|i| i.time);
         self.fresh.retain(|_, at| ((now - *at) as f32) < FRESH_SECONDS);
         if !self.fresh.is_empty() {
