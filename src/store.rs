@@ -109,8 +109,24 @@ pub fn hex(id: &[u8]) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn blob_path(dir: &Path, id_hex: &str) -> PathBuf {
-    dir.join("rbx-storage").join(&id_hex[..2]).join(id_hex)
+fn blob_path(blobs: &Path, id_hex: &str) -> PathBuf {
+    blobs.join(&id_hex[..2]).join(id_hex)
+}
+
+/// The folder holding the blob files of the cache whose index is in `dir`.
+/// It normally sits beside the index. Sober on Linux may keep it under the
+/// Flatpak cache folder instead, so that is used when the sibling is absent.
+pub fn blob_dir(dir: &Path) -> PathBuf {
+    let beside = dir.join("rbx-storage");
+    if beside.is_dir() {
+        return beside;
+    }
+    // .../org.vinegarhq.Sober/data/sober/appData -> .../org.vinegarhq.Sober/cache/sober/rbx-storage
+    let sober = dir.ancestors().nth(3).map(|root| root.join("cache").join("sober").join("rbx-storage"));
+    match sober {
+        Some(path) if dir.ends_with("data/sober/appData") && path.is_dir() => path,
+        _ => beside,
+    }
 }
 
 struct Described {
@@ -168,13 +184,21 @@ fn read_head(path: &Path) -> std::io::Result<Vec<u8>> {
 
 pub struct Store {
     pub dir: PathBuf,
+    blobs: PathBuf,
     conn: Connection,
 }
 
 impl Store {
-    /// `%LOCALAPPDATA%\Roblox`
+    /// Where the Roblox client keeps its cache index: `%LOCALAPPDATA%\Roblox` on
+    /// Windows, `~/Library/Roblox` on macOS, and Sober's data folder on Linux.
     pub fn default_dir() -> Option<PathBuf> {
-        std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("Roblox"))
+        #[cfg(windows)]
+        let dir = std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("Roblox"));
+        #[cfg(target_os = "macos")]
+        let dir = std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Roblox"));
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let dir = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".var/app/org.vinegarhq.Sober/data/sober/appData"));
+        dir
     }
 
     /// Opens the cache in `dir` (the folder holding `rbx-storage.db` and `rbx-storage`).
@@ -186,11 +210,11 @@ impl Store {
         let flags = if write { OpenFlags::SQLITE_OPEN_READ_WRITE } else { OpenFlags::SQLITE_OPEN_READ_ONLY };
         let conn = Connection::open_with_flags(&db, flags | OpenFlags::SQLITE_OPEN_NO_MUTEX).with_context(|| format!("opening {}", db.display()))?;
         conn.busy_timeout(Duration::from_secs(5))?;
-        Ok(Self { dir: dir.to_path_buf(), conn })
+        Ok(Self { dir: dir.to_path_buf(), blobs: blob_dir(dir), conn })
     }
 
     pub fn blob_path(&self, id: &Id) -> PathBuf {
-        blob_path(&self.dir, &hex(id))
+        blob_path(&self.blobs, &hex(id))
     }
 
     /// Lists every entry. `progress(done, total)` reports the on-disk blobs being classified.
@@ -225,12 +249,12 @@ impl Store {
             let handles: Vec<_> = on_disk
                 .chunks(chunk)
                 .map(|part| {
-                    let (entries, done, dir) = (&entries, &done, &self.dir);
+                    let (entries, done, blobs) = (&entries, &done, &self.blobs);
                     s.spawn(move || {
                         let mut out = Vec::with_capacity(part.len());
                         for &i in part {
                             let e = &entries[i];
-                            let path = blob_path(dir, &e.id_hex);
+                            let path = blob_path(blobs, &e.id_hex);
                             let d = match read_head(&path) {
                                 Ok(head) => {
                                     let len = std::fs::metadata(&path).map_or(e.size, |m| m.len());
@@ -404,15 +428,21 @@ impl Store {
 }
 
 /// True when a Roblox client or Studio process is running (it may be using the cache).
+#[cfg(windows)]
 pub fn roblox_running() -> bool {
+    use std::os::windows::process::CommandExt;
     let mut cmd = std::process::Command::new("tasklist");
     cmd.args(["/FI", "IMAGENAME eq Roblox*", "/FO", "CSV", "/NH"]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     cmd.output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).to_ascii_lowercase().contains("roblox"))
+}
+
+/// True when a Roblox client is running (it may be using the cache): the
+/// Roblox app on macOS, Sober on Linux.
+#[cfg(not(windows))]
+pub fn roblox_running() -> bool {
+    const NAMES: &[&str] = if cfg!(target_os = "macos") { &["RobloxPlayer", "RobloxStudio"] } else { &["sober", "Sober"] };
+    NAMES.iter().any(|name| std::process::Command::new("pgrep").args(["-x", name]).output().is_ok_and(|o| o.status.success()))
 }
 
 pub fn format_time_ms(ms: i64) -> String {

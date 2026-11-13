@@ -17,10 +17,10 @@ use std::path::{Path, PathBuf};
     about = "Explore, export, replace and delete entries of the Roblox asset cache.\nRun without a command to open the window."
 )]
 pub struct Args {
-    /// Folder holding rbx-storage.db and rbx-storage [default: %LOCALAPPDATA%\Roblox]
+    /// Folder holding rbx-storage.db [default: the Roblox client's own folder]
     #[arg(long, global = true)]
     pub dir: Option<PathBuf>,
-    /// Asset ID map file [default: %APPDATA%\rbxcache\idmap.json]
+    /// Asset ID map file [default: idmap.json in the app's data folder]
     #[arg(long, global = true)]
     pub idmap: Option<PathBuf>,
     #[command(subcommand)]

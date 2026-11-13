@@ -33,8 +33,19 @@ pub fn run(dir: PathBuf, idmap_path: PathBuf) -> Result<()> {
     eframe::run_native("Roblox Cache Explorer", options, Box::new(move |cc| Ok(Box::new(App::new(cc, dir, idmap_path))))).map_err(|e| anyhow!("{e}"))
 }
 
+/// Which list the table shows.
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    /// Everything in the cache.
+    All,
+    /// Only what Roblox has written since the window opened or the list was cleared.
+    Live,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum SortKey {
+    /// Order of arrival on the Live tab, newest first unless ascending.
+    Arrival,
     Kind,
     Category,
     Size,
@@ -72,6 +83,9 @@ enum Action {
     Tag,
     CopyId,
     SortBy(SortKey),
+    ShowTab(Tab),
+    ClearLive,
+    SortByArrival,
     SetSource,
     ReplaceFromSource,
     StopConfig,
@@ -181,6 +195,11 @@ struct App {
     show_redirects: bool,
     sort: SortKey,
     ascending: bool,
+    tab: Tab,
+    /// The sort order of the tab that is not showing, restored when switching back.
+    other_sort: (SortKey, bool),
+    /// Entries Roblox wrote while watching, oldest first.
+    arrivals: Vec<Id>,
 
     selected: BTreeSet<Id>,
     focus: Option<Id>,
@@ -250,6 +269,9 @@ impl App {
             show_redirects: false,
             sort: SortKey::Size,
             ascending: false,
+            tab: Tab::All,
+            other_sort: (SortKey::Arrival, false),
+            arrivals: Vec::new(),
             selected: BTreeSet::new(),
             focus: None,
             anchor: None,
@@ -380,6 +402,16 @@ impl App {
         let now = ctx.input(|i| i.time);
         let mut written: HashSet<Id> = HashSet::new();
         for change in &changes {
+            // Replacements this tool wrote come back as writes too; they are not arrivals.
+            let roblox: Vec<Id> = change.written.iter().filter(|e| !self.tracker.holds(e)).map(|e| e.id).collect();
+            if !roblox.is_empty() {
+                // An entry written again moves to the end, so it shows as the newest.
+                self.arrivals.retain(|id| !roblox.contains(id));
+                self.arrivals.extend(roblox);
+            }
+            if !change.removed.is_empty() {
+                self.arrivals.retain(|id| !change.removed.contains(id));
+            }
             for verdict in self.tracker.observe(change) {
                 match verdict {
                     // The first read is the news; later ones only move the counter.
@@ -452,7 +484,13 @@ impl App {
         let needle = self.search.trim().to_lowercase();
         let redirects = self.show_redirects || self.kind_filter == Some("redirect") || self.category_filter == Some(11);
         let entries = &self.entries;
+        // Position of each arrival, which doubles as the Live tab's membership test.
+        let arrived: HashMap<Id, usize> = match self.tab {
+            Tab::Live => self.arrivals.iter().enumerate().map(|(n, id)| (*id, n)).collect(),
+            Tab::All => HashMap::new(),
+        };
         let mut view: Vec<usize> = (0..entries.len())
+            .filter(|&i| self.tab == Tab::All || arrived.contains_key(&entries[i].id))
             .filter(|&i| {
                 let e = &entries[i];
                 (redirects || e.kind != "redirect")
@@ -465,6 +503,7 @@ impl App {
         view.sort_by(|&a, &b| {
             let (a, b) = (&entries[a], &entries[b]);
             match key {
+                SortKey::Arrival => arrived.get(&a.id).cmp(&arrived.get(&b.id)),
                 SortKey::Kind => a.kind.cmp(b.kind).then(b.size.cmp(&a.size)),
                 SortKey::Category => a.category.cmp(&b.category).then(b.size.cmp(&a.size)),
                 SortKey::Size => a.size.cmp(&b.size),
@@ -570,7 +609,7 @@ impl App {
 
     fn run_action(&mut self, action: Action, ctx: &egui::Context) {
         // While the cache is being read the list is stale, so nothing may act on it.
-        if self.loading.is_some() && !matches!(action, Action::About | Action::Quit | Action::OpenFolder) {
+        if self.loading.is_some() && !matches!(action, Action::About | Action::Quit | Action::OpenFolder | Action::ShowTab(_)) {
             return;
         }
         let result = match action {
@@ -579,7 +618,7 @@ impl App {
                 self.start_load(ctx);
                 Ok(String::new())
             }
-            Action::OpenFolder => open::that(self.dir.join("rbx-storage")).map(|()| String::new()).map_err(Into::into),
+            Action::OpenFolder => open::that(store::blob_dir(&self.dir)).map(|()| String::new()).map_err(Into::into),
             Action::CopyId => match self.focused() {
                 Some(e) => {
                     ctx.copy_text(e.id_hex.clone());
@@ -597,6 +636,26 @@ impl App {
             }
             Action::SortBy(key) => {
                 self.sort_by(key);
+                Ok(String::new())
+            }
+            Action::ShowTab(tab) => {
+                if self.tab != tab {
+                    self.tab = tab;
+                    // Each tab keeps its own sort order.
+                    let current = (self.sort, self.ascending);
+                    (self.sort, self.ascending) = std::mem::replace(&mut self.other_sort, current);
+                    self.rebuild_view();
+                }
+                Ok(String::new())
+            }
+            Action::ClearLive => {
+                self.arrivals.clear();
+                self.rebuild_view();
+                Ok(String::new())
+            }
+            Action::SortByArrival => {
+                (self.sort, self.ascending) = (SortKey::Arrival, false);
+                self.rebuild_view();
                 Ok(String::new())
             }
             Action::About => {
@@ -898,8 +957,23 @@ impl App {
         });
     }
 
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
+    fn toolbar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
+            for (tab, label) in [(Tab::All, format!("All  {}", self.entries.len())), (Tab::Live, format!("Live  {}", self.arrivals.len()))] {
+                if ui.selectable_label(self.tab == tab, label).clicked() {
+                    actions.push(Action::ShowTab(tab));
+                }
+            }
+            if self.tab == Tab::Live
+                && ui.add_enabled(!self.arrivals.is_empty(), egui::Button::new("Clear")).on_hover_text("Empty the Live list").clicked()
+            {
+                actions.push(Action::ClearLive);
+            }
+            if self.tab == Tab::Live && self.sort != SortKey::Arrival && ui.button("Newest first").on_hover_text("Go back to arrival order").clicked()
+            {
+                actions.push(Action::SortByArrival);
+            }
+            ui.separator();
             let search_id = egui::Id::new("search");
             let mut changed = ui
                 .add(egui::TextEdit::singleline(&mut self.search).id(search_id).hint_text("Search id, type or URL   (Ctrl+F)").desired_width(300.0))
@@ -1274,6 +1348,33 @@ impl App {
         painter.with_clip_rect(clip).set(slot, Shape::Vec(shapes));
     }
 
+    /// Shown on the Live tab until Roblox writes something.
+    fn live_placeholder(&self, ui: &mut egui::Ui) {
+        ui.add_space(ui.available_height() * 0.36);
+        ui.vertical_centered(|ui| {
+            if self.watch.is_none() {
+                ui.label(egui::RichText::new("Live watching is off").size(20.0));
+                ui.label(egui::RichText::new("Turn on View > Watch cache live to fill this list.").color(theme::MUTED));
+                return;
+            }
+            // A dot that pulses while waiting.
+            let (dot, _) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::hover());
+            let pulse = if self.motion { (ui.input(|i| i.time) * 2.2).sin() as f32 * 0.5 + 0.5 } else { 1.0 };
+            ui.painter().circle_filled(dot.center(), 4.0 + 2.0 * pulse, alpha(theme::OK, 0.45 + 0.55 * pulse));
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Waiting for Roblox").size(20.0));
+            let state = if self.roblox_running {
+                "Assets appear here as Roblox downloads them."
+            } else {
+                "Roblox is not running. Assets appear here as it downloads them."
+            };
+            ui.label(egui::RichText::new(state).color(theme::MUTED));
+            if self.motion {
+                ui.ctx().request_repaint();
+            }
+        });
+    }
+
     fn loading_card(&self, ui: &mut egui::Ui) {
         let (done, total) = self.progress;
         let fraction = if total > 0 { done as f32 / total as f32 } else { 0.0 };
@@ -1585,7 +1686,7 @@ impl eframe::App for App {
 
         let bar = egui::Frame::new().fill(theme::PANEL).inner_margin(Margin::symmetric(10, 6));
         egui::TopBottomPanel::top("menu").frame(bar).show(ctx, |ui| self.menu_bar(ui, &mut actions));
-        egui::TopBottomPanel::top("toolbar").frame(bar.inner_margin(Margin::symmetric(10, 8))).show(ctx, |ui| self.toolbar(ui));
+        egui::TopBottomPanel::top("toolbar").frame(bar.inner_margin(Margin::symmetric(10, 8))).show(ctx, |ui| self.toolbar(ui, &mut actions));
         egui::TopBottomPanel::bottom("status").frame(bar).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(&self.status).color(theme::MUTED).small());
@@ -1621,6 +1722,8 @@ impl eframe::App for App {
                 });
             } else if self.loading.is_some() {
                 self.loading_card(ui);
+            } else if self.tab == Tab::Live && self.arrivals.is_empty() {
+                self.live_placeholder(ui);
             } else {
                 self.table(ui, &mut actions);
             }

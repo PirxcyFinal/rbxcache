@@ -1,12 +1,22 @@
 # rbxcache
 
 A viewer and editor for the asset cache the Roblox client keeps on disk
-(`%LOCALAPPDATA%\Roblox\rbx-storage` and `rbx-storage.db`). It lists every cached
+(`rbx-storage.db` and the `rbx-storage` folder). It lists every cached
 asset, previews most of them, exports them, and can replace or delete them in
 place. It works on the files directly: there is no proxy, no certificate and no
 network traffic to intercept.
 
-Windows, macOS and Linux.
+Windows, macOS and Linux. The cache is looked for in the client's own folder:
+
+| Platform | Folder |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%\Roblox` |
+| macOS | `~/Library/Roblox` |
+| Linux (Sober) | `~/.var/app/org.vinegarhq.Sober/data/sober/appData` |
+
+Pass `--dir <folder>` to use another one. Development and testing so far have
+been on Windows; the macOS and Linux builds compile and pass the unit tests in
+CI but have not been run against a real cache.
 
 ## Features
 
@@ -31,18 +41,22 @@ Windows, macOS and Linux.
 
 ## Getting it
 
-Download the Windows, macOS or Linux artifact from the releases page, or build it:
+Download the file for your platform from the releases page
+(`rbxcache-windows-x86_64.exe`, `rbxcache-macos-arm64`, `rbxcache-macos-x86_64`
+or `rbxcache-linux-x86_64`). On macOS and Linux, make it executable first with
+`chmod +x`. Or build it:
 
 ```
 cargo build --release
 ```
 
-The binary is `target\release\rbxcache.exe`. Building needs a Rust toolchain and
-the MSVC build tools.
+The binary is `target/release/rbxcache` (`rbxcache.exe` on Windows). Building
+needs a Rust toolchain, plus the MSVC build tools on Windows or the ALSA and
+GTK 3 development packages on Linux (`libasound2-dev libgtk-3-dev`).
 
 ## Using it
 
-Run `rbxcache.exe` with no arguments to open the window. Select a row to see its
+Run `rbxcache` with no arguments to open the window. Select a row to see its
 details and preview on the right; right-click a row for the entry menu.
 
 | Keys | Action |
@@ -63,12 +77,14 @@ client. The window shows a warning while the client is running.
 
 ### Watching the cache
 
-The window follows the cache while it is open (View > Watch cache live). Entries
-Roblox has just written are marked with a dot that fades, and a replaced entry
-shows whether Roblox has read it since. After a config is applied it stays
+The window follows the cache while it is open (View > Watch cache live). The
+Live tab starts empty and fills with what Roblox writes from then on, newest
+first; Clear empties it again. On either tab, entries Roblox has just written
+are marked with a dot that fades, and a replaced entry shows whether Roblox has
+read it since. After a config is applied it stays
 active: anything Roblox writes that matches a rule is replaced again, until you
-choose File > Stop re-applying config. Protected entries are monitored and restored indefinitely, including after
-`rbxcache` restarts. Durable replacement bodies and metadata are stored in
+choose File > Stop re-applying config. Protected entries are monitored and
+restored indefinitely, including after `rbxcache` restarts. Durable replacement bodies and metadata are stored in
 `%LOCALAPPDATA%\\rbxcache` on Windows, `~/Library/Application Support/rbxcache`
 on macOS, and `$XDG_DATA_HOME/rbxcache` (or `~/.local/share/rbxcache`) on Linux.
 
@@ -132,7 +148,8 @@ Each entry of `replace_ids` can be:
 The cache does not record which asset ID an entry belongs to, and its entry
 names cannot be derived from an ID. Fleasion learns the mapping by watching
 requests through its proxy; this tool has no such view. Instead it keeps an ID
-map at `%APPDATA%\rbxcache\idmap.json`: select an entry, type its asset ID and
+map (`%APPDATA%\rbxcache\idmap.json` on Windows, `idmap.json` in the data
+folder above elsewhere): select an entry, type its asset ID and
 press Tag (or use `rbxcache tag`). The map stores a fingerprint of the content
 rather than the cache key, so it still matches after the cache is cleared and
 can be shared between machines.

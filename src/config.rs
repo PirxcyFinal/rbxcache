@@ -175,10 +175,13 @@ pub struct IdMap {
 }
 
 impl IdMap {
-    /// `%APPDATA%\rbxcache\idmap.json`
+    /// `%APPDATA%\rbxcache\idmap.json` on Windows; elsewhere `idmap.json` in the app's data folder.
     pub fn default_path() -> PathBuf {
-        let base = std::env::var_os("APPDATA").map_or_else(|| PathBuf::from("."), PathBuf::from);
-        base.join("rbxcache").join("idmap.json")
+        #[cfg(windows)]
+        let folder = std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("rbxcache"));
+        #[cfg(not(windows))]
+        let folder = crate::protection::data_dir().ok();
+        folder.unwrap_or_else(|| PathBuf::from(".")).join("idmap.json")
     }
 
     pub fn load(path: &Path) -> Result<Self> {
