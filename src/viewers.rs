@@ -500,7 +500,7 @@ mod tests {
         let mesh = parse_mesh(&v2_mesh()).unwrap();
         assert_eq!((mesh.positions.len(), mesh.faces.len()), (3, 1));
         let image = mesh.render(&View::new(mesh.bounds(), (0.0, 0.0)), 64, 64, [1.0, 1.0, 1.0]);
-        let covered = image.pixels.chunks_exact(4).filter(|p| p[3] == 255).count();
+        let covered = image.pixels.as_chunks::<4>().0.iter().filter(|p| p[3] == 255).count();
         assert!(covered > 200 && covered < 64 * 64, "covered {covered}");
     }
 

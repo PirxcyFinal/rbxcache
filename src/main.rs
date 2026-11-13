@@ -4,6 +4,7 @@ mod cli;
 mod config;
 mod format;
 mod gui;
+mod protection;
 mod store;
 mod theme;
 mod viewers;

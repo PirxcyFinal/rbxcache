@@ -6,7 +6,7 @@ asset, previews most of them, exports them, and can replace or delete them in
 place. It works on the files directly: there is no proxy, no certificate and no
 network traffic to intercept.
 
-Windows only.
+Windows, macOS and Linux.
 
 ## Features
 
@@ -24,13 +24,14 @@ Windows only.
 - Replace an asset's content with a file of your own, or delete it so Roblox
   downloads it again.
 - Apply replacement configs in the JSON format Fleasion uses.
-- Follow the cache live while Roblox runs: new and rewritten entries appear as
+- Follow the cache live while Roblox runs: newly fetched and rewritten entries appear as
   they are written, an applied config is re-applied to them, and the tool
-  reports whether Roblox read a replacement or wrote over it.
+  reports whether Roblox read a replacement or wrote over it. Manual replacements
+  are stored outside Roblox's cache and restored whenever Roblox overwrites them.
 
 ## Getting it
 
-Download `rbxcache.exe` from the releases page, or build it:
+Download the Windows, macOS or Linux artifact from the releases page, or build it:
 
 ```
 cargo build --release
@@ -66,8 +67,10 @@ The window follows the cache while it is open (View > Watch cache live). Entries
 Roblox has just written are marked with a dot that fades, and a replaced entry
 shows whether Roblox has read it since. After a config is applied it stays
 active: anything Roblox writes that matches a rule is replaced again, until you
-choose File > Stop re-applying config. An entry Roblox overwrites three times is
-left alone.
+choose File > Stop re-applying config. Protected entries are monitored and restored indefinitely, including after
+`rbxcache` restarts. Durable replacement bodies and metadata are stored in
+`%LOCALAPPDATA%\\rbxcache` on Windows, `~/Library/Application Support/rbxcache`
+on macOS, and `$XDG_DATA_HOME/rbxcache` (or `~/.local/share/rbxcache`) on Linux.
 
 To copy one cached asset over another, right-click the first and choose "Use as
 replacement source", then right-click the target and choose "Replace with

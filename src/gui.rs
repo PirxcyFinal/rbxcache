@@ -5,6 +5,7 @@ use crate::audio::{self, Audio};
 use crate::cli::{describe, export_name, matches};
 use crate::config::{self, IdMap};
 use crate::format::{self, human_size};
+use crate::protection::Protections;
 use crate::store::{self, category_name, format_time_ms, Entry, Id, Store};
 use crate::theme::{self, alpha};
 use crate::viewers;
@@ -196,6 +197,7 @@ struct App {
     /// Changes arriving from the watcher thread, and the flag that stops it.
     watch: Option<(Receiver<Change>, Arc<AtomicBool>)>,
     tracker: Tracker,
+    protections: Option<Protections>,
     /// When each recently written entry arrived, for the marker beside it.
     fresh: HashMap<Id, f64>,
     /// The entry "Replace with source" copies from.
@@ -260,6 +262,7 @@ impl App {
             live: true,
             watch: None,
             tracker: Tracker::default(),
+            protections: Protections::load_default().ok(),
             fresh: HashMap::new(),
             source: None,
             show_about: false,
@@ -308,6 +311,15 @@ impl App {
             Some(Ok(entries)) => {
                 self.loading = None;
                 self.entries = entries;
+                if let (Some(protections), Ok(store)) = (&mut self.protections, Store::open(&self.dir, true)) {
+                    let ids: Vec<Id> = protections.entries().collect();
+                    if let Ok(restored) = protections.restore(&store, ids) {
+                        for entry in &restored {
+                            self.tracker.record(entry);
+                        }
+                        watch::merge(&mut self.entries, &Change { written: restored, ..Default::default() });
+                    }
+                }
                 self.selected.clear();
                 self.focus = None;
                 self.preview = None;
@@ -386,6 +398,16 @@ impl App {
                 self.fresh.insert(entry.id, now);
             }
             watch::merge(&mut self.entries, change);
+        }
+        if !written.is_empty() {
+            if let (Some(protections), Ok(store)) = (&mut self.protections, Store::open(&self.dir, true)) {
+                if let Ok(restored) = protections.restore(&store, written.iter().copied()) {
+                    for entry in &restored {
+                        self.tracker.record(entry);
+                    }
+                    watch::merge(&mut self.entries, &Change { written: restored, ..Default::default() });
+                }
+            }
         }
         if let Some((name, rules)) = &self.active_config {
             let targets: HashSet<Id> = written.iter().filter(|id| self.tracker.may_replace(id)).copied().collect();
@@ -684,6 +706,9 @@ impl App {
         };
         let body = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         let updated = Store::open(&self.dir, true)?.replace_body(&id, &body)?;
+        if let Some(protections) = &mut self.protections {
+            protections.remember(&id, &body)?;
+        }
         let msg = format!("Replaced {} with {} ({})", updated.id_hex, path.display(), human_size(updated.size));
         self.replaced(updated);
         Ok(msg)
@@ -697,7 +722,11 @@ impl App {
             return Err(anyhow!("This entry is the replacement source itself"));
         }
         let store = Store::open(&self.dir, true)?;
-        let updated = store.replace_body(&id, &store.read_body(&source)?)?;
+        let body = store.read_body(&source)?;
+        let updated = store.replace_body(&id, &body)?;
+        if let Some(protections) = &mut self.protections {
+            protections.remember(&id, &body)?;
+        }
         let msg = format!("Replaced {} with the content of {}", &updated.id_hex[..12], &store::hex(&source)[..12]);
         self.replaced(updated);
         Ok(msg)

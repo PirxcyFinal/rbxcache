@@ -110,10 +110,6 @@ pub struct Tracker {
     applied: HashMap<Id, Applied>,
 }
 
-/// After this many reverts an entry is left alone, so a replacement Roblox
-/// keeps rejecting is not rewritten forever.
-const MAX_REVERTS: u32 = 3;
-
 impl Tracker {
     /// Notes that `entry` now holds a replacement.
     pub fn record(&mut self, entry: &Entry) {
@@ -126,9 +122,10 @@ impl Tracker {
         self.applied.get(&entry.id).is_some_and(|a| a.size == entry.size)
     }
 
-    /// False once Roblox has discarded the replacement of `id` too often to try again.
+    /// Protected replacements are retried indefinitely.
     pub fn may_replace(&self, id: &Id) -> bool {
-        self.applied.get(id).is_none_or(|a| a.reverts < MAX_REVERTS)
+        let _ = id;
+        true
     }
 
     /// How often Roblox has read the replacement in `id`, if it holds one.
@@ -208,12 +205,12 @@ mod tests {
         assert!(tracker.observe(&Change { written: vec![entry(1, 50, 4)], ..Default::default() }).is_empty());
         let read = Change { touched: vec![Stamp { id: [1; 16], size: 50, hits: 6, atime: 1 }], ..Default::default() };
         assert_eq!(tracker.observe(&read), [Verdict::Read { id: [1; 16], reads: 2 }]);
-        for times in 1..=MAX_REVERTS {
+        for times in 1..=5 {
             assert!(tracker.may_replace(&[1; 16]));
             let rewritten = Change { written: vec![entry(1, 900 + times as u64, 6)], ..Default::default() };
             assert_eq!(tracker.observe(&rewritten), [Verdict::Reverted { id: [1; 16], times }]);
             tracker.record(&entry(1, 50, 6));
         }
-        assert!(!tracker.may_replace(&[1; 16]));
+        assert!(tracker.may_replace(&[1; 16]));
     }
 }
