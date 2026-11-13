@@ -13,8 +13,10 @@ pub type Id = [u8; 16];
 /// Roblox keeps entries up to this size inside the database and larger ones as files.
 pub const INLINE_MAX: usize = 7000;
 
-/// How much of an on-disk blob is read to classify it when listing.
+/// How much of an on-disk blob is read at first to classify it when listing.
 const HEAD_BYTES: usize = 4096;
+/// Upper bound on a wrapper (URL plus response headers) worth reading in full.
+const MAX_WRAPPER: usize = 1 << 20;
 
 #[derive(Clone, Debug)]
 pub struct Entry {
@@ -37,6 +39,47 @@ pub struct Entry {
     pub body_len: u64,
 }
 
+/// The columns of a `files` row that do not depend on the content.
+struct Row {
+    id: Id,
+    size: i64,
+    hits: i64,
+    atime: i64,
+    category: i64,
+    ttl: i64,
+    inline: bool,
+}
+
+impl Entry {
+    fn new(row: Row, d: Described) -> Self {
+        Self {
+            id: row.id,
+            id_hex: hex(&row.id),
+            size: row.size.max(0) as u64,
+            hits: row.hits,
+            atime: row.atime,
+            category: row.category,
+            ttl: row.ttl,
+            inline: row.inline,
+            kind: d.kind,
+            wrapped: d.wrapped,
+            url: d.url,
+            status: d.status,
+            asset_type: d.asset_type,
+            body_len: d.body_len,
+        }
+    }
+
+    fn describe(&mut self, d: Described) {
+        self.kind = d.kind;
+        self.wrapped = d.wrapped;
+        self.url = d.url;
+        self.status = d.status;
+        self.asset_type = d.asset_type;
+        self.body_len = d.body_len;
+    }
+}
+
 pub fn category_name(category: i64) -> &'static str {
     match category {
         1 => "meta",
@@ -51,6 +94,10 @@ pub fn category_name(category: i64) -> &'static str {
 
 pub fn hex(id: &[u8]) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn blob_path(dir: &Path, id_hex: &str) -> PathBuf {
+    dir.join("rbx-storage").join(&id_hex[..2]).join(id_hex)
 }
 
 struct Described {
@@ -68,11 +115,7 @@ fn describe(head: &[u8], total: u64, category: i64) -> Described {
         Some(h) => {
             let body = &head[h.body_offset..];
             let body_len = total.saturating_sub(h.body_offset as u64);
-            let kind = if body_len == 0 && (300..400).contains(&h.status) {
-                "redirect"
-            } else {
-                format::sniff(body)
-            };
+            let kind = if body_len == 0 && (300..400).contains(&h.status) { "redirect" } else { format::sniff(body) };
             Described { kind, wrapped: true, asset_type: format::asset_type_id(&h.headers), url: h.url, status: h.status, body_len }
         }
         None => {
@@ -87,9 +130,26 @@ fn describe(head: &[u8], total: u64, category: i64) -> Described {
     }
 }
 
+/// Reads the start of a blob: `HEAD_BYTES`, or more when its wrapper is longer
+/// than that, so the wrapper and the first bytes of the body are both covered.
 fn read_head(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(path)?;
     let mut buf = Vec::with_capacity(HEAD_BYTES);
-    std::fs::File::open(path)?.take(HEAD_BYTES as u64).read_to_end(&mut buf)?;
+    file.by_ref().take(HEAD_BYTES as u64).read_to_end(&mut buf)?;
+    // Each pass can reveal one more length field: first the URL's, then the headers'.
+    for _ in 0..2 {
+        let wanted = match format::wrapper_len(&buf) {
+            Some(len) => len.saturating_add(64).min(MAX_WRAPPER),
+            None => break,
+        };
+        if wanted <= buf.len() {
+            break;
+        }
+        let more = (wanted - buf.len()) as u64;
+        if file.by_ref().take(more).read_to_end(&mut buf)? < more as usize {
+            break;
+        }
+    }
     Ok(buf)
 }
 
@@ -111,15 +171,13 @@ impl Store {
             bail!("no rbx-storage.db in {}", dir.display());
         }
         let flags = if write { OpenFlags::SQLITE_OPEN_READ_WRITE } else { OpenFlags::SQLITE_OPEN_READ_ONLY };
-        let conn = Connection::open_with_flags(&db, flags | OpenFlags::SQLITE_OPEN_NO_MUTEX)
-            .with_context(|| format!("opening {}", db.display()))?;
+        let conn = Connection::open_with_flags(&db, flags | OpenFlags::SQLITE_OPEN_NO_MUTEX).with_context(|| format!("opening {}", db.display()))?;
         conn.busy_timeout(Duration::from_secs(5))?;
         Ok(Self { dir: dir.to_path_buf(), conn })
     }
 
     pub fn blob_path(&self, id: &Id) -> PathBuf {
-        let h = hex(id);
-        self.dir.join("rbx-storage").join(&h[..2]).join(h)
+        blob_path(&self.dir, &hex(id))
     }
 
     /// Lists every entry. `progress(done, total)` reports the on-disk blobs being classified.
@@ -129,10 +187,11 @@ impl Store {
         let mut stmt = self.conn.prepare("SELECT id, size, hits, atime, category, ttl, content FROM files")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
-            let Ok(id) = Id::try_from(row.get_ref(0)?.as_blob()?) else { continue };
-            let size: i64 = row.get(1)?;
-            let category: i64 = row.get(4)?;
-            let content = row.get_ref(6)?.as_blob_or_null()?;
+            // A row that does not have the expected shape is skipped rather than failing the listing.
+            let Some(id) = row.get_ref(0)?.as_blob().ok().and_then(|b| Id::try_from(b).ok()) else { continue };
+            let number = |column: usize| row.get::<_, Option<i64>>(column).ok().flatten().unwrap_or(0);
+            let category = number(4);
+            let content = row.get_ref(6)?.as_blob_or_null().ok().flatten();
             let d = match content {
                 Some(c) => describe(c, c.len() as u64, category),
                 None => {
@@ -140,22 +199,8 @@ impl Store {
                     describe(&[], 0, category)
                 }
             };
-            entries.push(Entry {
-                id,
-                id_hex: hex(&id),
-                size: size.max(0) as u64,
-                hits: row.get(2)?,
-                atime: row.get(3)?,
-                category,
-                ttl: row.get(5)?,
-                inline: content.is_some(),
-                kind: d.kind,
-                wrapped: d.wrapped,
-                url: d.url,
-                status: d.status,
-                asset_type: d.asset_type,
-                body_len: d.body_len,
-            });
+            let row = Row { id, size: number(1), hits: number(2), atime: number(3), category, ttl: number(5), inline: content.is_some() };
+            entries.push(Entry::new(row, d));
         }
 
         // Classifying the large blobs means opening each file, so spread it over threads.
@@ -172,7 +217,7 @@ impl Store {
                         let mut out = Vec::with_capacity(part.len());
                         for &i in part {
                             let e = &entries[i];
-                            let path = self_blob_path(dir, &e.id_hex);
+                            let path = blob_path(dir, &e.id_hex);
                             let d = match read_head(&path) {
                                 Ok(head) => {
                                     let len = std::fs::metadata(&path).map_or(e.size, |m| m.len());
@@ -194,55 +239,37 @@ impl Store {
             handles.into_iter().flat_map(|h| h.join().expect("classifier thread panicked")).collect()
         });
         for (i, d) in described {
-            let e = &mut entries[i];
-            e.kind = d.kind;
-            e.wrapped = d.wrapped;
-            e.url = d.url;
-            e.status = d.status;
-            e.asset_type = d.asset_type;
-            e.body_len = d.body_len;
+            entries[i].describe(d);
         }
         progress(total, total);
         Ok(entries)
     }
 
-    /// Loads the metadata of a single entry.
+    /// Turns "no such row" into a clear message and keeps the cause of anything else.
+    fn lookup<T>(&self, id: &Id, result: rusqlite::Result<T>) -> Result<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Err(anyhow!("no entry {}", hex(id))),
+            Err(e) => Err(e).with_context(|| format!("reading entry {} from the index", hex(id))),
+        }
+    }
+
+    /// Loads one entry, reading its content to classify it.
     pub fn entry(&self, id: &Id) -> Result<Entry> {
-        let (size, hits, atime, category, ttl, inline): (i64, i64, i64, i64, i64, bool) = self
-            .conn
-            .query_row(
-                "SELECT size, hits, atime, category, ttl, content IS NOT NULL FROM files WHERE id = ?1",
-                params![&id[..]],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
-            )
-            .map_err(|_| anyhow!("no entry {}", hex(id)))?;
+        let row =
+            self.conn.query_row("SELECT size, hits, atime, category, ttl, content IS NOT NULL FROM files WHERE id = ?1", params![&id[..]], |r| {
+                Ok(Row { id: *id, size: r.get(0)?, hits: r.get(1)?, atime: r.get(2)?, category: r.get(3)?, ttl: r.get(4)?, inline: r.get(5)? })
+            });
+        let row = self.lookup(id, row)?;
         let raw = self.read(id)?;
-        let d = describe(&raw, raw.len() as u64, category);
-        Ok(Entry {
-            id: *id,
-            id_hex: hex(id),
-            size: size.max(0) as u64,
-            hits,
-            atime,
-            category,
-            ttl,
-            inline,
-            kind: d.kind,
-            wrapped: d.wrapped,
-            url: d.url,
-            status: d.status,
-            asset_type: d.asset_type,
-            body_len: d.body_len,
-        })
+        let d = describe(&raw, raw.len() as u64, row.category);
+        Ok(Entry::new(row, d))
     }
 
     /// Reads the stored bytes of an entry, wrapper included.
     pub fn read(&self, id: &Id) -> Result<Vec<u8>> {
-        let content: Option<Vec<u8>> = self
-            .conn
-            .query_row("SELECT content FROM files WHERE id = ?1", params![&id[..]], |r| r.get(0))
-            .map_err(|_| anyhow!("no entry {}", hex(id)))?;
-        match content {
+        let content = self.conn.query_row("SELECT content FROM files WHERE id = ?1", params![&id[..]], |r| r.get::<_, Option<Vec<u8>>>(0));
+        match self.lookup(id, content)? {
             Some(c) => Ok(c),
             None => {
                 let path = self.blob_path(id);
@@ -259,7 +286,7 @@ impl Store {
         Ok((raw, header))
     }
 
-    /// Reads just the payload of an entry.
+    /// The content of an entry with any wrapper removed.
     pub fn read_body(&self, id: &Id) -> Result<Vec<u8>> {
         let (mut raw, header) = self.read_parsed(id)?;
         if let Some(h) = header {
@@ -268,21 +295,23 @@ impl Store {
         Ok(raw)
     }
 
-    /// Removes an entry from the index and deletes its blob file, if any.
+    /// Deletes an entry's blob file, if it has one, and then its index row. The
+    /// file goes first so a blob Roblox still holds open leaves the entry intact.
     pub fn delete(&self, id: &Id) -> Result<()> {
-        let n = self.conn.execute("DELETE FROM files WHERE id = ?1", params![&id[..]])?;
-        if n == 0 {
-            bail!("no entry {}", hex(id));
-        }
+        let exists = self.conn.query_row("SELECT 1 FROM files WHERE id = ?1", params![&id[..]], |_| Ok(()));
+        self.lookup(id, exists)?;
         let path = self.blob_path(id);
         match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(anyhow!("entry removed from the index, but {} could not be deleted: {e}", path.display())),
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("deleting {}", path.display())),
         }
+        self.conn.execute("DELETE FROM files WHERE id = ?1", params![&id[..]])?;
+        Ok(())
     }
 
-    /// Swaps the payload of an entry for `body`, keeping the wrapper (URL, status, headers).
+    /// Swaps the payload of an entry for `body`, keeping the wrapper (URL, status,
+    /// headers). The index is only committed once the blob file is in place.
     pub fn replace_body(&self, id: &Id, body: &[u8]) -> Result<Entry> {
         if body.len() > u32::MAX as usize {
             bail!("replacement is too large");
@@ -293,27 +322,27 @@ impl Store {
             None => body.to_vec(),
         };
         let path = self.blob_path(id);
+        let tx = self.conn.unchecked_transaction()?;
         if new.len() > INLINE_MAX {
-            let parent = path.parent().expect("blob path has a parent");
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(path.parent().expect("blob path has a parent"))?;
             let tmp = path.with_extension("tmp");
-            std::fs::write(&tmp, &new).with_context(|| format!("writing {}", tmp.display()))?;
-            std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
-            self.conn.execute(
-                "UPDATE files SET content = NULL, size = ?2 WHERE id = ?1",
-                params![&id[..], new.len() as i64],
-            )?;
+            let written = std::fs::write(&tmp, &new)
+                .with_context(|| format!("writing {}", tmp.display()))
+                .and_then(|()| Ok(tx.execute("UPDATE files SET content = NULL, size = ?2 WHERE id = ?1", params![&id[..], new.len() as i64])?))
+                .and_then(|_| std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display())));
+            if let Err(e) = written {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
         } else {
-            self.conn.execute(
-                "UPDATE files SET content = ?2, size = ?3 WHERE id = ?1",
-                params![&id[..], &new, new.len() as i64],
-            )?;
-            if let Err(e) = std::fs::remove_file(&path) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    return Err(anyhow!("index updated, but old file {} could not be deleted: {e}", path.display()));
-                }
+            tx.execute("UPDATE files SET content = ?2, size = ?3 WHERE id = ?1", params![&id[..], &new, new.len() as i64])?;
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("deleting the old file {}", path.display())),
             }
         }
+        tx.commit()?;
         self.entry(id)
     }
 
@@ -331,10 +360,6 @@ impl Store {
             _ => bail!("'{prefix}' matches more than one entry; give more digits"),
         }
     }
-}
-
-fn self_blob_path(dir: &Path, id_hex: &str) -> PathBuf {
-    dir.join("rbx-storage").join(&id_hex[..2]).join(id_hex)
 }
 
 /// True when a Roblox client or Studio process is running (it may be using the cache).

@@ -1,15 +1,21 @@
-//! Command-line interface.
+//! The `rbxcache` subcommands, and the entry description shared with the window.
 
 use crate::config::{self, IdMap};
 use crate::format::{self, human_size};
 use crate::store::{self, category_name, format_time_ms, Entry, Store};
+use crate::viewers::View;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
-#[command(name = "rbxcache", version, about = "Explore, export, replace and delete entries of the Roblox asset cache.\nRun without a command to open the window.")]
+#[command(
+    name = "rbxcache",
+    version,
+    about = "Explore, export, replace and delete entries of the Roblox asset cache.\nRun without a command to open the window."
+)]
 pub struct Args {
     /// Folder holding rbx-storage.db and rbx-storage [default: %LOCALAPPDATA%\Roblox]
     #[arg(long, global = true)]
@@ -61,6 +67,22 @@ pub enum Cmd {
         /// Keep the RBXH wrapper instead of extracting the payload
         #[arg(long)]
         raw: bool,
+        /// Convert to a common format: KTX2 textures to PNG, meshes to OBJ
+        #[arg(long, conflicts_with = "raw")]
+        convert: bool,
+    },
+    /// Render a picture of a mesh, or one moment of an animation, to a PNG file
+    Render {
+        id: String,
+        /// Output file [default: <id>.png in the current folder]
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Image width and height in pixels
+        #[arg(long, default_value_t = 512)]
+        size: usize,
+        /// For animations: the moment to draw, in seconds
+        #[arg(long, default_value_t = 0.0)]
+        time: f32,
     },
     /// Export the payload of every entry of one content type into a folder
     ExportAll {
@@ -78,6 +100,15 @@ pub enum Cmd {
         /// Only report what would change
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Try to decode every texture, mesh and model, and report how many can be previewed
+    Probe {
+        /// Only this content type (ktx2, mesh, rbxm, rbxmx)
+        #[arg(long)]
+        kind: Option<String>,
+        /// Stop after this many entries per type (0 = all)
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
     },
     /// Delete entries (Roblox downloads them again when needed)
     Delete {
@@ -111,13 +142,13 @@ pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
                     && search.as_deref().is_none_or(|s| matches(e, s))
             });
             match sort {
-                Sort::Size => entries.sort_by(|a, b| b.size.cmp(&a.size)),
-                Sort::Hits => entries.sort_by(|a, b| b.hits.cmp(&a.hits)),
-                Sort::Recent => entries.sort_by(|a, b| b.atime.cmp(&a.atime)),
-                Sort::Id => entries.sort_by(|a, b| a.id.cmp(&b.id)),
+                Sort::Size => entries.sort_by_key(|e| Reverse(e.size)),
+                Sort::Hits => entries.sort_by_key(|e| Reverse(e.hits)),
+                Sort::Recent => entries.sort_by_key(|e| Reverse(e.atime)),
+                Sort::Id => entries.sort_by_key(|e| e.id),
             }
             let shown = if limit == 0 { entries.len() } else { limit.min(entries.len()) };
-            println!("{:<32}  {:<12} {:>10} {:>7}  {}", "ID", "TYPE", "SIZE", "HITS", "LAST USED");
+            println!("{:<32}  {:<12} {:>10} {:>7}  LAST USED", "ID", "TYPE", "SIZE", "HITS");
             for e in &entries[..shown] {
                 println!("{:<32}  {:<12} {:>10} {:>7}  {}", e.id_hex, e.kind, human_size(e.size), e.hits, format_time_ms(e.atime));
             }
@@ -134,28 +165,68 @@ pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Export { id, output, raw } => {
+        Cmd::Export { id, output, raw, convert } => {
             let store = Store::open(dir, false)?;
             let id = store.resolve(&id)?;
             let e = store.entry(&id)?;
-            let data = if raw { store.read(&id)? } else { store.read_body(&id)? };
-            let out = output.unwrap_or_else(|| export_name(&e, raw).into());
+            let mut data = if raw { store.read(&id)? } else { store.read_body(&id)? };
+            let mut name = export_name(&e, raw);
+            if convert {
+                let (converted, extension) = crate::viewers::convert(e.kind, &data)?;
+                (data, name) = (converted, format!("{}.{extension}", e.id_hex));
+            }
+            let out = output.unwrap_or_else(|| name.into());
             std::fs::write(&out, &data).with_context(|| format!("writing {}", out.display()))?;
             println!("wrote {} ({})", out.display(), human_size(data.len() as u64));
+            Ok(())
+        }
+        Cmd::Render { id, output, size, time } => {
+            let store = Store::open(dir, false)?;
+            let id = store.resolve(&id)?;
+            let e = store.entry(&id)?;
+            let body = store.read_body(&id)?;
+            let size = size.clamp(16, 4096);
+            let (picture, what) = if matches!(e.kind, "rbxm" | "rbxmx") {
+                let model = crate::viewers::parse_model(&body, e.kind == "rbxmx")?;
+                let animation = model.animation.context("this model holds no R6 or R15 keyframe animation")?;
+                let figure = animation.pose(time.clamp(0.0, animation.length));
+                let picture = figure.render(&View::new(animation.bounds(), crate::viewers::FIGURE_ANGLES), size, size, crate::viewers::MESH_TINT);
+                (picture, format!("{} animation, {} keyframes, {:.2}s", animation.rig.name(), animation.keyframes, animation.length))
+            } else {
+                let mesh = crate::viewers::parse_mesh(&body)?;
+                let picture = mesh.render(&View::new(mesh.bounds(), crate::viewers::MESH_ANGLES), size, size, crate::viewers::MESH_TINT);
+                (picture, format!("{} vertices, {} triangles, version {}", mesh.positions.len(), mesh.faces.len(), mesh.version))
+            };
+            let out = output.unwrap_or_else(|| format!("{}.png", store::hex(&id)).into());
+            image::RgbaImage::from_raw(size as u32, size as u32, picture.pixels)
+                .context("rendered picture has the wrong size")?
+                .save(&out)
+                .with_context(|| format!("writing {}", out.display()))?;
+            println!("wrote {} ({what})", out.display());
             Ok(())
         }
         Cmd::ExportAll { out_dir, kind } => {
             let store = Store::open(dir, false)?;
             let entries = store.list(|_, _| {})?;
             std::fs::create_dir_all(&out_dir)?;
-            let (mut n, mut bytes) = (0usize, 0u64);
+            let (mut n, mut bytes, mut failed) = (0usize, 0u64, 0usize);
             for e in entries.iter().filter(|e| e.kind == kind) {
-                let data = store.read_body(&e.id)?;
-                std::fs::write(out_dir.join(export_name(e, false)), &data)?;
-                n += 1;
-                bytes += data.len() as u64;
+                let path = out_dir.join(export_name(e, false));
+                match store.read_body(&e.id).and_then(|data| Ok((std::fs::write(&path, &data)?, data.len()))) {
+                    Ok(((), len)) => {
+                        n += 1;
+                        bytes += len as u64;
+                    }
+                    Err(err) => {
+                        eprintln!("{}: {err:#}", e.id_hex);
+                        failed += 1;
+                    }
+                }
             }
             println!("exported {n} {kind} entries ({}) to {}", human_size(bytes), out_dir.display());
+            if failed > 0 {
+                bail!("{failed} entries could not be exported");
+            }
             Ok(())
         }
         Cmd::Replace { id, file } => {
@@ -196,6 +267,46 @@ pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
                 }
             }
             println!("{}", config::summarize(&reports, !dry_run));
+            Ok(())
+        }
+        Cmd::Probe { kind, limit } => {
+            let store = Store::open(dir, false)?;
+            let entries = store.list(|_, _| {})?;
+            for want in ["ktx2", "mesh", "rbxm", "rbxmx"] {
+                if kind.as_deref().is_some_and(|k| k != want) {
+                    continue;
+                }
+                let (mut ok, mut failed) = (0usize, 0usize);
+                let mut animations: BTreeMap<&str, usize> = BTreeMap::new();
+                let mut errors: BTreeMap<String, (usize, String)> = BTreeMap::new();
+                let started = std::time::Instant::now();
+                for e in entries.iter().filter(|e| e.kind == want).take(if limit == 0 { usize::MAX } else { limit }) {
+                    let result = store.read_body(&e.id).and_then(|body| match want {
+                        "ktx2" => crate::viewers::decode_ktx2(&body, 1024).map(|_| ()),
+                        "mesh" => crate::viewers::parse_mesh(&body).map(|_| ()),
+                        _ => crate::viewers::parse_model(&body, want == "rbxmx").map(|model| {
+                            if let Some(animation) = model.animation {
+                                *animations.entry(animation.rig.name()).or_insert(0usize) += 1;
+                            }
+                        }),
+                    });
+                    match result {
+                        Ok(()) => ok += 1,
+                        Err(err) => {
+                            failed += 1;
+                            let slot = errors.entry(format!("{err:#}").chars().take(70).collect()).or_insert((0, e.id_hex.clone()));
+                            slot.0 += 1;
+                        }
+                    }
+                }
+                println!("{want:<6} {ok:>6} decoded, {failed:>5} failed  ({:.1}s)", started.elapsed().as_secs_f32());
+                for (rig, n) in animations {
+                    println!("    {n:>5} playable {rig} animations");
+                }
+                for (message, (n, example)) in errors {
+                    println!("    {n:>5} x {message}  e.g. {example}");
+                }
+            }
             Ok(())
         }
         Cmd::Delete { ids } => {
@@ -264,7 +375,7 @@ pub fn describe(store: &Store, e: &Entry, raw: &[u8], header: Option<&format::He
             if !h.headers.trim().is_empty() {
                 out.push(("Headers", h.headers.trim().replace("\r\n", "; ")));
             }
-            out.push(("Checksum", format!("{:08x} (stored length {})", h.body_sum, h.body_len)));
+            out.push(("Checksums", format!("headers {:08x}, body {:08x} (stored length {})", h.header_sum, h.body_sum, h.body_len)));
         }
         None => out.push(("Wrapper", "none (raw blob)".into())),
     }
@@ -288,7 +399,13 @@ fn payload_details(kind: &str, body: &[u8]) -> Option<String> {
                 3 => "ZLIB",
                 _ => "unknown",
             };
-            Some(format!("{} x {} px, {} mip level(s), vkFormat {}, supercompression {compression}", u32at(20)?, u32at(24)?, u32at(40)?.max(1), u32at(12)?))
+            Some(format!(
+                "{} x {} px, {} mip level(s), vkFormat {}, supercompression {compression}",
+                u32at(20)?,
+                u32at(24)?,
+                u32at(40)?.max(1),
+                u32at(12)?
+            ))
         }
         "mesh" => {
             let line = body.split(|&c| c == b'\n').next()?;
@@ -322,11 +439,10 @@ fn stats(store: &Store) -> Result<()> {
         println!("{:<22} {n:>8} {:>12}", format!("{c} ({})", category_name(*c)), human_size(*s));
     }
     let mut kinds: Vec<_> = by_kind.into_iter().collect();
-    kinds.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+    kinds.sort_by_key(|(_, (_, size))| Reverse(*size));
     println!("\n{:<22} {:>8} {:>12}", "TYPE", "ENTRIES", "SIZE");
     for (k, (n, s)) in kinds {
         println!("{k:<22} {n:>8} {:>12}", human_size(s));
     }
     Ok(())
 }
-

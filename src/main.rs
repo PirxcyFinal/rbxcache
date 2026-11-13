@@ -1,8 +1,12 @@
+mod anim;
+mod audio;
 mod cli;
 mod config;
 mod format;
 mod gui;
 mod store;
+mod theme;
+mod viewers;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -15,22 +19,24 @@ extern "system" {
 
 fn main() -> Result<()> {
     let args = cli::Args::parse();
-    let dir = args
-        .dir
-        .or_else(store::Store::default_dir)
-        .context("could not locate the Roblox folder; pass --dir")?;
+    let dir = args.dir.or_else(store::Store::default_dir).context("could not locate the Roblox folder; pass --dir")?;
     let idmap = args.idmap.unwrap_or_else(config::IdMap::default_path);
     match args.cmd {
         None | Some(cli::Cmd::Gui) => {
-            // Started by double-click: drop the console window that Windows opened for us.
+            // Started with no arguments, usually by double-click: drop the console
+            // window Windows opened for us. With it gone, a failure to start has
+            // nowhere to print, so it is shown in a dialog instead.
+            let detached = std::env::args().len() == 1;
             #[cfg(windows)]
-            if std::env::args().len() == 1 {
+            if detached {
                 unsafe { FreeConsole() };
             }
-            gui::run(dir, idmap)
+            let result = gui::run(dir, idmap);
+            if let (true, Err(error)) = (detached, &result) {
+                rfd::MessageDialog::new().set_level(rfd::MessageLevel::Error).set_title("rbxcache").set_description(format!("{error:#}")).show();
+            }
+            result
         }
         Some(cmd) => cli::run(&dir, &idmap, cmd),
     }
 }
-
-

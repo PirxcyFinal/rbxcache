@@ -11,7 +11,6 @@ pub const MAGIC: &[u8; 4] = b"RBXH";
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Header {
-    pub version: u32,
     pub url: String,
     pub url_len: usize,
     pub status: u32,
@@ -46,7 +45,6 @@ pub fn parse_header(buf: &[u8]) -> Option<Header> {
         return None;
     }
     Some(Header {
-        version: u32le(buf, 4),
         url: String::from_utf8_lossy(&buf[12..o]).into_owned(),
         url_len,
         status: u32le(buf, o + 1),
@@ -56,6 +54,20 @@ pub fn parse_header(buf: &[u8]) -> Option<Header> {
         body_sum: u32le(buf, o + 17),
         body_offset,
     })
+}
+
+/// Total length of the wrapper (everything before the body) as far as `buf`
+/// reveals it, or `None` if `buf` is not wrapped. When `buf` is too short to
+/// hold the response-header length, the result only covers up to that field.
+pub fn wrapper_len(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 12 || &buf[..4] != MAGIC {
+        return None;
+    }
+    let fixed = 12usize.checked_add(u32le(buf, 8) as usize)?.checked_add(25)?;
+    if buf.len() < fixed {
+        return Some(fixed);
+    }
+    fixed.checked_add(u32le(buf, fixed - 20) as usize)
 }
 
 /// Rebuilds a wrapped blob around a new body, keeping URL, status and headers.
@@ -223,7 +235,16 @@ pub fn extension(kind: &str) -> &'static str {
 }
 
 pub fn is_image(kind: &str) -> bool {
-    matches!(kind, "png" | "jpeg" | "gif" | "webp")
+    matches!(kind, "png" | "jpeg" | "gif" | "webp" | "ktx2" | "ktx")
+}
+
+pub fn is_audio(kind: &str) -> bool {
+    matches!(kind, "ogg" | "mp3" | "wav")
+}
+
+/// `n` followed by the right form of a noun, e.g. `count(1, "entry", "entries")`.
+pub fn count(n: usize, singular: &str, plural: &str) -> String {
+    format!("{n} {}", if n == 1 { singular } else { plural })
 }
 
 pub fn is_text(kind: &str) -> bool {

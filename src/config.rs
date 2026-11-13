@@ -10,6 +10,7 @@
 //! size) of the asset's content. Fingerprints do not depend on the machine, so an
 //! ID map can be shared.
 
+use crate::format;
 use crate::store::{hex, Entry, Id, Store};
 use anyhow::{bail, Context, Result};
 use md5::{Digest, Md5};
@@ -48,6 +49,8 @@ pub enum Action {
     Local(PathBuf),
     Cdn(String),
     With(Target),
+    /// The rule is malformed; it is reported with this reason and changes nothing.
+    Invalid(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -104,11 +107,12 @@ fn collect_rules(entries: &[Value], base: &Path, out: &mut Vec<Rule>) {
         let text = |key: &str| obj.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
         // Older configs use a `remove` flag instead of a mode.
         let mode = match (text("mode"), obj.get("remove").and_then(Value::as_bool)) {
-            (Some(m), _) => m,
-            (None, Some(true)) => "remove",
-            _ => "id",
+            (Some(m), _) => m.to_ascii_lowercase(),
+            (None, Some(true)) => "remove".to_string(),
+            _ => "id".to_string(),
         };
-        let action = match mode {
+        // As in Fleasion, a rule with no replacement given removes its targets.
+        let action = match mode.as_str() {
             "remove" => Action::Remove,
             "local" => match text("local_path") {
                 Some(p) => {
@@ -118,15 +122,17 @@ fn collect_rules(entries: &[Value], base: &Path, out: &mut Vec<Rule>) {
                 None => Action::Remove,
             },
             "cdn" => text("cdn_url").map_or(Action::Remove, |u| Action::Cdn(u.to_string())),
-            _ => match obj.get("with_id") {
+            "id" => match obj.get("with_id") {
                 None | Some(Value::Null) => Action::Remove,
+                Some(Value::String(s)) if s.trim().is_empty() => Action::Remove,
                 // 0 and 1 are placeholder IDs in Fleasion configs: the rule does nothing.
                 Some(v) if matches!(v.as_u64(), Some(0 | 1)) || matches!(v.as_str().map(str::trim), Some("0" | "1")) => continue,
                 Some(v) => match parse_target(v) {
-                    Some(t) => Action::With(t),
-                    None => Action::Remove,
+                    Some(t @ (Target::Asset(_) | Target::Entry(_))) => Action::With(t),
+                    _ => Action::Invalid(format!("with_id {v} is not an asset ID or a cache entry")),
                 },
             },
+            other => Action::Invalid(format!("unknown mode '{other}'")),
         };
         let name = text("name").map_or_else(|| format!("rule {}", out.len() + 1), str::to_string);
         out.push(Rule { name, targets, action });
@@ -187,7 +193,10 @@ impl IdMap {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, serde_json::to_string_pretty(self)?).with_context(|| format!("writing {}", path.display()))
+        // Written beside the map and renamed over it, so a failed write cannot truncate it.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(self)?).with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
     }
 
     /// Records that `asset` has this content. Returns false if it was already known.
@@ -205,14 +214,14 @@ impl IdMap {
     }
 }
 
-/// Content kinds covered by a Fleasion asset-type name.
-fn kinds_for_type(name: &str) -> Option<&'static [&'static str]> {
+/// Test for the content kinds covered by a Fleasion asset-type name.
+fn kinds_for_type(name: &str) -> Option<fn(&str) -> bool> {
     Some(match name {
-        "image" | "decal" | "texture" => &["png", "jpeg", "gif", "webp", "ktx2", "ktx"],
-        "audio" | "sound" => &["ogg", "mp3", "wav"],
-        "mesh" | "meshpart" => &["mesh"],
-        "video" => &["webm", "mp4"],
-        "font" | "fontface" => &["ttf", "otf"],
+        "image" | "decal" | "texture" => format::is_image,
+        "audio" | "sound" => format::is_audio,
+        "mesh" | "meshpart" => |kind| kind == "mesh",
+        "video" => |kind| matches!(kind, "webm" | "mp4"),
+        "font" | "fontface" => |kind| matches!(kind, "ttf" | "otf"),
         _ => return None,
     })
 }
@@ -254,8 +263,8 @@ impl<'a> Resolver<'a> {
                 None => Err(format!("{target} is not in the cache")),
             },
             Target::Type(name) => {
-                let kinds = kinds_for_type(name).ok_or_else(|| format!("asset type '{name}' cannot be recognised from cached content"))?;
-                Ok((0..self.entries.len()).filter(|&i| replaceable(&self.entries[i]) && kinds.contains(&self.entries[i].kind)).collect())
+                let covers = kinds_for_type(name).ok_or_else(|| format!("asset type '{name}' cannot be recognised from cached content"))?;
+                Ok((0..self.entries.len()).filter(|&i| replaceable(&self.entries[i]) && covers(self.entries[i].kind)).collect())
             }
             Target::Asset(n) => {
                 let prints = self.idmap.assets.get(&n.to_string()).ok_or_else(|| format!("{target} is not in the ID map"))?;
@@ -295,68 +304,86 @@ pub struct RuleReport {
 fn fetch(url: &str) -> Result<Vec<u8>> {
     use std::io::Read;
     let response = ureq::get(url).timeout(std::time::Duration::from_secs(60)).call().with_context(|| format!("downloading {url}"))?;
+    const LIMIT: u64 = 256 << 20;
     let mut body = Vec::new();
-    response.into_reader().take(256 << 20).read_to_end(&mut body)?;
+    response.into_reader().take(LIMIT + 1).read_to_end(&mut body)?;
+    if body.len() as u64 > LIMIT {
+        bail!("{url} is larger than {} MB", LIMIT >> 20);
+    }
     Ok(body)
+}
+
+/// What one rule will do, worked out before anything is written.
+struct Plan {
+    report: RuleReport,
+    /// Entries whose content differs from `payload`.
+    writes: Vec<usize>,
+    payload: Option<Vec<u8>>,
 }
 
 /// Runs `rules` against the cache. With `apply` false nothing is written (and
 /// `cdn` rules are not downloaded); the report shows what would happen.
+///
+/// Every rule is resolved against the cache as it was at the start, so rules
+/// that swap two assets with each other see the original content of both.
 pub fn run(store: &Store, entries: &[Entry], idmap: &IdMap, rules: &[Rule], apply: bool) -> Vec<RuleReport> {
     let resolver = Resolver::new(store, entries, idmap);
-    let mut reports = Vec::new();
+    let mut plans = Vec::new();
     for rule in rules {
-        let mut report = RuleReport { name: rule.name.clone(), ..Default::default() };
+        let mut plan = Plan { report: RuleReport { name: rule.name.clone(), ..Default::default() }, writes: Vec::new(), payload: None };
         let mut matched: Vec<usize> = Vec::new();
         for target in &rule.targets {
             match resolver.resolve(target) {
                 Ok(found) => matched.extend(found),
-                Err(why) => report.notes.push(why),
+                Err(why) => plan.report.notes.push(why),
             }
         }
         matched.sort_unstable();
         matched.dedup();
-        report.matched = matched.len();
-        if matched.is_empty() {
-            reports.push(report);
-            continue;
-        }
+        plan.report.matched = matched.len();
         let payload: Result<Option<Vec<u8>>> = match &rule.action {
+            Action::Invalid(why) => Err(anyhow::anyhow!("{why}")),
+            _ if matched.is_empty() => Ok(None),
             Action::Remove => Ok(Some(Vec::new())),
             Action::Local(path) => std::fs::read(path).map(Some).with_context(|| format!("reading {}", path.display())),
             Action::Cdn(url) if apply => fetch(url).map(Some),
             Action::Cdn(_) => Ok(None),
-            Action::With(target) => match resolver.resolve(target) {
-                Ok(found) => store.read_body(&entries[found[0]].id).map(Some),
+            Action::With(target) => match resolver.resolve(target).map(|found| found.first().copied()) {
+                Ok(Some(source)) => store.read_body(&entries[source].id).map(Some),
+                Ok(None) => Err(anyhow::anyhow!("replacement {target} matches nothing in the cache")),
                 Err(why) => Err(anyhow::anyhow!("replacement {why}")),
             },
         };
         match payload {
-            Err(e) => report.notes.push(format!("{e:#}")),
-            Ok(None) => report.changed = matched.len(),
+            Err(e) => plan.report.notes.push(format!("{e:#}")),
+            // A download that a dry run skips is assumed to differ from what is cached.
+            Ok(None) => plan.report.changed = matched.len(),
             Ok(Some(payload)) => {
                 for &i in &matched {
-                    let e = &entries[i];
-                    let outcome = store.read_body(&e.id).and_then(|current| {
-                        if current == payload {
-                            return Ok(false);
-                        }
-                        if apply {
-                            store.replace_body(&e.id, &payload)?;
-                        }
-                        Ok(true)
-                    });
-                    match outcome {
-                        Ok(true) => report.changed += 1,
-                        Ok(false) => {}
-                        Err(err) => report.notes.push(format!("{}: {err:#}", e.id_hex)),
+                    match store.read_body(&entries[i].id) {
+                        Ok(current) if current == payload => {}
+                        Ok(_) => plan.writes.push(i),
+                        Err(e) => plan.report.notes.push(format!("{}: {e:#}", entries[i].id_hex)),
                     }
+                }
+                plan.report.changed = plan.writes.len();
+                plan.payload = Some(payload);
+            }
+        }
+        plans.push(plan);
+    }
+    if apply {
+        for plan in &mut plans {
+            let Some(payload) = &plan.payload else { continue };
+            for &i in &plan.writes {
+                if let Err(e) = store.replace_body(&entries[i].id, payload) {
+                    plan.report.changed -= 1;
+                    plan.report.notes.push(format!("{}: {e:#}", entries[i].id_hex));
                 }
             }
         }
-        reports.push(report);
     }
-    reports
+    plans.into_iter().map(|plan| plan.report).collect()
 }
 
 /// One-line summary of a run, for status bars.
@@ -365,9 +392,12 @@ pub fn summarize(reports: &[RuleReport], apply: bool) -> String {
     let idle = reports.iter().filter(|r| r.matched == 0).count();
     let problems: usize = reports.iter().map(|r| r.notes.len()).sum();
     format!(
-        "{} rules: {changed} entries {}, {idle} rules matched nothing, {problems} problems",
-        reports.len(),
-        if apply { "changed" } else { "would change" }
+        "{}: {} {}, {} matched nothing, {}",
+        format::count(reports.len(), "rule", "rules"),
+        format::count(changed, "entry", "entries"),
+        if apply { "changed" } else { "would change" },
+        format::count(idle, "rule", "rules"),
+        format::count(problems, "problem", "problems"),
     )
 }
 
@@ -402,6 +432,21 @@ mod tests {
         assert_eq!(rules[4].action, Action::Remove);
         assert_eq!(rules[5].targets, [Target::Unsupported("7547298786:1".into())]);
         assert_eq!(rules[6].action, Action::Remove);
+    }
+
+    #[test]
+    fn malformed_rules_never_fall_back_to_removing() {
+        let text = r#"[
+            {"name": "caps", "replace_ids": [5], "mode": "LOCAL", "local_path": "a.png"},
+            {"name": "typo", "replace_ids": [5], "mode": "locl", "local_path": "a.png"},
+            {"name": "type source", "replace_ids": [5], "with_id": "Mesh"},
+            {"name": "negative", "replace_ids": [5], "with_id": -3}
+        ]"#;
+        let rules = parse(text, Path::new("C:/cfg")).unwrap();
+        assert_eq!(rules[0].action, Action::Local(PathBuf::from("C:/cfg").join("a.png")));
+        for rule in &rules[1..] {
+            assert!(matches!(rule.action, Action::Invalid(_)), "{} parsed as {:?}", rule.name, rule.action);
+        }
     }
 
     #[test]
