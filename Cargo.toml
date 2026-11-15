@@ -1,6 +1,6 @@
 [package]
 name = "rbxcache"
-version = "0.8.0"
+version = "1.0.0"
 edition = "2021"
 description = "Viewer and editor for the Roblox client asset cache (rbx-storage)"
 
