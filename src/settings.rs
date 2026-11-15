@@ -12,11 +12,21 @@ pub struct Settings {
     pub animations: bool,
     /// Follow the cache while Roblox uses it.
     pub watch: bool,
+    /// The configs that were loaded when the app last ran.
+    pub configs: Vec<SavedConfig>,
+}
+
+/// A loaded config as it is remembered between runs.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedConfig {
+    pub path: PathBuf,
+    /// Whether it is re-applied to what Roblox writes.
+    pub enabled: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { close_to_tray: true, animations: true, watch: true }
+        Self { close_to_tray: true, animations: true, watch: true, configs: Vec::new() }
     }
 }
 

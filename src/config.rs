@@ -171,6 +171,35 @@ pub fn asset_ids(rules: &[Rule]) -> Vec<u64> {
     ids
 }
 
+/// The name a config goes by: its file name without the extension.
+pub fn name_of(path: &Path) -> String {
+    path.file_stem().map_or_else(|| "config".to_string(), |n| n.to_string_lossy().into_owned())
+}
+
+/// Joins the rules of several configs into one list, in order, so they can be
+/// run together. Rules later in the list win where two change the same entry.
+/// With more than one config, each rule's name is prefixed with its config's.
+pub fn combine<'a>(configs: impl IntoIterator<Item = (&'a str, &'a [Rule])>) -> Vec<Rule> {
+    let configs: Vec<_> = configs.into_iter().collect();
+    let several = configs.len() > 1;
+    let mut rules = Vec::new();
+    for (name, config) in configs {
+        rules.extend(config.iter().cloned().map(|mut rule| {
+            if several {
+                rule.name = format!("{name} / {}", rule.name);
+            }
+            rule
+        }));
+    }
+    rules
+}
+
+/// Loads several config files as one list of rules; see [`combine`].
+pub fn load_all(paths: &[PathBuf]) -> Result<Vec<Rule>> {
+    let loaded: Vec<(String, Vec<Rule>)> = paths.iter().map(|p| Ok((name_of(p), load(p)?))).collect::<Result<_>>()?;
+    Ok(combine(loaded.iter().map(|(name, rules)| (name.as_str(), rules.as_slice()))))
+}
+
 pub fn load(path: &Path) -> Result<Vec<Rule>> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     parse(&text, path.parent().unwrap_or(Path::new(".")))
@@ -494,6 +523,16 @@ mod tests {
         for rule in &rules[1..] {
             assert!(matches!(rule.action, Action::Invalid(_)), "{} parsed as {:?}", rule.name, rule.action);
         }
+    }
+
+    #[test]
+    fn combining_keeps_order_and_names_the_source() {
+        let rule = |name: &str| Rule { name: name.to_string(), targets: vec![Target::Asset(1)], action: Action::Remove };
+        let (a, b) = (vec![rule("one"), rule("two")], vec![rule("three")]);
+        let names = |rules: Vec<Rule>| rules.into_iter().map(|r| r.name).collect::<Vec<_>>();
+        assert_eq!(names(combine([("first", a.as_slice()), ("second", b.as_slice())])), ["first / one", "first / two", "second / three"]);
+        assert_eq!(names(combine([("only", a.as_slice())])), ["one", "two"]);
+        assert_eq!(name_of(Path::new("C:/packs/My Pack.json")), "My Pack");
     }
 
     #[test]

@@ -104,18 +104,20 @@ pub enum Cmd {
     },
     /// Follow the cache as Roblox uses it, optionally keeping a config applied
     Watch {
-        /// Re-apply this replacement config to every entry Roblox writes
+        /// Re-apply this replacement config to every entry Roblox writes; may be given several times
         #[arg(long)]
-        config: Option<PathBuf>,
+        config: Vec<PathBuf>,
         /// Seconds between checks
         #[arg(long, default_value_t = 1.0)]
         interval: f32,
     },
     /// Record that a cache entry is the content of a Roblox asset ID
     Tag { id: String, asset_id: u64 },
-    /// Apply a Fleasion-style replacement config to the cache
+    /// Apply one or more Fleasion-style replacement configs to the cache
     ApplyConfig {
-        file: PathBuf,
+        /// One or more config files; later ones win where they overlap
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
         /// Only report what would change
         #[arg(long)]
         dry_run: bool,
@@ -123,9 +125,10 @@ pub enum Cmd {
         #[arg(long)]
         offline: bool,
     },
-    /// Look up a config's asset IDs and match them to cached entries
+    /// Look up the asset IDs in one or more configs and match them to cached entries
     Identify {
-        file: PathBuf,
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
         /// Ask Roblox again about IDs that were already looked up
         #[arg(long)]
         refresh: bool,
@@ -286,7 +289,7 @@ pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
             println!("replaced {} - now {} ({})", e.id_hex, e.kind, human_size(e.size));
             Ok(())
         }
-        Cmd::Watch { config: file, interval } => watch(dir, idmap_path, file.as_deref(), interval),
+        Cmd::Watch { config, interval } => watch(dir, idmap_path, &config, interval),
         Cmd::Tag { id, asset_id } => {
             let store = Store::open(dir, false)?;
             let id = store.resolve(&id)?;
@@ -300,8 +303,8 @@ pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Identify { file, refresh } => {
-            let rules = config::load(&file)?;
+        Cmd::Identify { files, refresh } => {
+            let rules = config::load_all(&files)?;
             let store = Store::open(dir, false)?;
             let entries = store.list(|_, _| {})?;
             let mut idmap = IdMap::load(idmap_path)?;
@@ -310,8 +313,8 @@ pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::ApplyConfig { file, dry_run, offline } => {
-            let rules = config::load(&file)?;
+        Cmd::ApplyConfig { files, dry_run, offline } => {
+            let rules = config::load_all(&files)?;
             let store = Store::open(dir, !dry_run)?;
             if !dry_run {
                 warn_if_running();
@@ -412,9 +415,9 @@ pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
 }
 
 /// Prints cache activity until interrupted, re-applying `config` to what Roblox writes.
-fn watch(dir: &Path, idmap_path: &Path, config: Option<&Path>, interval: f32) -> Result<()> {
+fn watch(dir: &Path, idmap_path: &Path, configs: &[PathBuf], interval: f32) -> Result<()> {
     use crate::watch::{merge, Tracker, Verdict, Watcher};
-    let rules = config.map(config::load).transpose()?;
+    let rules = if configs.is_empty() { None } else { Some(config::load_all(configs)?) };
     let mut idmap = IdMap::load(idmap_path)?;
     let store = Store::open(dir, rules.is_some())?;
     let mut entries = store.list(|_, _| {})?;

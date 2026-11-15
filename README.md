@@ -6,6 +6,17 @@ asset, previews most of them, exports them, and can replace or delete them in
 place. It works on the files directly: there is no proxy, no certificate and no
 network traffic to intercept.
 
+This is the safest way to do what [Fleasion](https://github.com/fleasion/Fleasion)
+does. Fleasion swaps assets by routing Roblox's traffic through a local proxy,
+which means installing a certificate, relaunching the client and reading your
+Roblox login. rbxcache does none of that: it never touches the client or its
+traffic, never asks for or reads a login, and only edits files Roblox has
+already saved to disk, which Roblox replaces by itself when the cache is
+cleared. It reads the same config files Fleasion does.
+
+"Safest" is not "risk free". Changing how a game looks on your own machine may
+still be against Roblox's rules or a game's, and that is yours to judge.
+
 Windows, macOS and Linux. The cache is looked for in the client's own folder:
 
 | Platform | Folder |
@@ -67,7 +78,7 @@ details and preview on the right; right-click a row for the entry menu.
 | Space | Play or pause a sound or animation |
 | Ctrl+F | Search |
 | Ctrl+E | Export |
-| Ctrl+O | Apply a config |
+| Ctrl+O | Add configs |
 | Delete | Delete the selection |
 | F5 | Reload the cache |
 
@@ -77,16 +88,33 @@ client. The window shows a warning while the client is running.
 
 ### Watching the cache
 
-The window follows the cache while it is open (View > Watch cache live). The
-Live tab starts empty and fills with what Roblox writes from then on, newest
-first; Clear empties it again. On either tab, entries Roblox has just written
-are marked with a dot that fades, and a replaced entry shows whether Roblox has
-read it since. After a config is applied it stays
-active: anything Roblox writes that matches a rule is replaced again, until you
-choose File > Stop re-applying config. Protected entries are monitored and
-restored indefinitely, including after `rbxcache` restarts. Durable replacement bodies and metadata are stored in
-`%LOCALAPPDATA%\\rbxcache` on Windows, `~/Library/Application Support/rbxcache`
+The window follows the cache while it is open; the Live menu turns that on and
+off. The Live tab starts empty and fills with what Roblox writes from then on,
+newest first, and the Live menu can switch to it, clear it, or put it back in
+arrival order. On either tab, entries Roblox has just written are marked with a
+dot that fades, and a replaced entry shows whether Roblox has read it since.
+
+Protected entries are monitored and restored indefinitely, including after
+`rbxcache` restarts. Durable replacement bodies and metadata are stored in
+`%LOCALAPPDATA%\rbxcache` on Windows, `~/Library/Application Support/rbxcache`
 on macOS, and `$XDG_DATA_HOME/rbxcache` (or `~/.local/share/rbxcache`) on Linux.
+
+### Loading configs
+
+Configs > Add configs opens one or more config files. They are checked together
+against the cache, and a dialog shows what they would change before anything is
+written. Once applied they stay loaded and are listed in the Configs menu:
+
+- A ticked config is re-applied to whatever Roblox writes from then on.
+  Untick one to pause it; Remove takes it out of the list. Neither undoes
+  what was already replaced. Delete those entries, or clear the cache, to get
+  the originals back.
+- Where two configs change the same entry, the one lower in the list wins.
+- Apply enabled configs now reads the files again and applies them to the
+  whole cache, which picks up edits made to them since.
+- The list is remembered. When the app next starts, the configs are loaded
+  again and re-applied to new arrivals; nothing already in the cache is
+  touched until you apply them.
 
 To copy one cached asset over another, right-click the first and choose "Use as
 replacement source", then right-click the target and choose "Replace with
@@ -133,11 +161,11 @@ rbxcache export-all <dir> --kind ogg   export every entry of one type
 rbxcache render <id> [--time 1.5]      picture of a mesh or an animation frame
 rbxcache replace <id> <file>           swap the payload for a file
 rbxcache replace <id> --from <id2>     copy another entry's payload over it
-rbxcache watch [--config <file>]       follow the cache, keeping a config applied
+rbxcache watch [--config <file>]...    follow the cache, keeping configs applied
 rbxcache delete <id>...                remove entries
 rbxcache tag <id> <assetId>            record which asset an entry is
-rbxcache apply-config <file>           apply a replacement config
-rbxcache identify <file>               look up a config's asset IDs
+rbxcache apply-config <file>...        apply one or more replacement configs
+rbxcache identify <file>...            look up the asset IDs in configs
 rbxcache probe                         test-decode every texture, mesh and model
 ```
 

@@ -7,7 +7,7 @@ use crate::config::{self, IdMap};
 use crate::format::{self, human_size};
 use crate::protection::Protections;
 use crate::resolve;
-use crate::settings::Settings;
+use crate::settings::{SavedConfig, Settings};
 use crate::store::{self, category_name, format_time_ms, Entry, Id, Store};
 use crate::theme::{self, alpha};
 use crate::tray::{Tray, TrayEvent};
@@ -92,8 +92,12 @@ enum Action {
     AskClear,
     Clear,
     Delete,
-    ApplyConfig,
+    AddConfigs,
+    ReapplyConfigs,
     ConfirmConfig,
+    ToggleConfig(usize),
+    RemoveConfig(usize),
+    RemoveAllConfigs,
     Tag,
     CopyId,
     SortBy(SortKey),
@@ -102,7 +106,6 @@ enum Action {
     SortByArrival,
     SetSource,
     ReplaceFromSource,
-    StopConfig,
     PlayAudio,
     ForcePreview,
     ExportConverted,
@@ -159,18 +162,30 @@ struct AnimView {
 
 /// A config that has been checked against the cache and awaits confirmation.
 struct PendingConfig {
-    path: PathBuf,
-    rules: Vec<config::Rule>,
+    configs: Vec<LoadedConfig>,
     summary: String,
-    /// How looking up the config's asset IDs went; empty when it names none.
+    /// How looking up the configs' asset IDs went; empty when they name none.
     lookup: String,
     notes: Vec<String>,
 }
 
-/// What applying a config on a worker thread produced.
-struct AppliedConfig {
+/// A config that is loaded and, while enabled, re-applied to what Roblox writes.
+#[derive(Clone)]
+struct LoadedConfig {
     name: String,
+    path: PathBuf,
     rules: Vec<config::Rule>,
+    enabled: bool,
+}
+
+/// The rules of `configs` as one list; see [`config::combine`].
+fn combined<'a>(configs: impl IntoIterator<Item = &'a LoadedConfig>) -> Vec<config::Rule> {
+    config::combine(configs.into_iter().map(|c| (c.name.as_str(), c.rules.as_slice())))
+}
+
+/// What applying configs on a worker thread produced.
+struct AppliedConfig {
+    configs: Vec<LoadedConfig>,
     summary: String,
     /// The entries as they are after being rewritten.
     rewritten: Vec<Entry>,
@@ -267,8 +282,8 @@ struct App {
     /// When the current stretch of work began, for deciding whether it merits a splash.
     busy_since: Option<f64>,
     confirm_config: bool,
-    /// A config that is re-applied to whatever Roblox writes while watching.
-    active_config: Option<(String, Vec<config::Rule>)>,
+    /// The loaded configs; the enabled ones are re-applied to whatever Roblox writes while watching.
+    configs: Vec<LoadedConfig>,
     /// Changes arriving from the watcher thread, and the flag that stops it.
     watch: Option<(Receiver<Change>, Arc<AtomicBool>)>,
     tracker: Tracker,
@@ -351,7 +366,7 @@ impl App {
             splash: None,
             busy_since: None,
             confirm_config: false,
-            active_config: None,
+            configs: Vec::new(),
             watch: None,
             tracker: Tracker::default(),
             protections: Protections::load_default().ok(),
@@ -371,6 +386,7 @@ impl App {
             audio: None,
             force_preview: false,
         };
+        app.restore_configs();
         app.start_load(&cc.egui_ctx);
         app.check_update(&cc.egui_ctx, false);
         app
@@ -625,18 +641,17 @@ impl App {
                 }
             }
         }
-        if let Some((name, rules)) = &self.active_config {
-            let targets: HashSet<Id> = written.iter().filter(|id| self.tracker.may_replace(id)).copied().collect();
-            if !targets.is_empty() {
-                let reports = Store::open(&self.dir, true).map(|store| config::run(&store, &self.entries, &self.idmap, rules, true, Some(&targets)));
-                let rewritten: Vec<Entry> = reports.into_iter().flatten().flat_map(|r| r.written).collect();
-                if !rewritten.is_empty() {
-                    self.status = format!("{name}: re-applied to {}", format::count(rewritten.len(), "entry", "entries"));
-                    for entry in &rewritten {
-                        self.tracker.record(entry);
-                    }
-                    watch::merge(&mut self.entries, &Change { written: rewritten, ..Default::default() });
+        let rules = combined(self.configs.iter().filter(|c| c.enabled));
+        let targets: HashSet<Id> = written.iter().filter(|id| self.tracker.may_replace(id)).copied().collect();
+        if !rules.is_empty() && !targets.is_empty() {
+            let reports = Store::open(&self.dir, true).map(|store| config::run(&store, &self.entries, &self.idmap, &rules, true, Some(&targets)));
+            let rewritten: Vec<Entry> = reports.into_iter().flatten().flat_map(|r| r.written).collect();
+            if !rewritten.is_empty() {
+                self.status = format!("Re-applied configs to {}", format::count(rewritten.len(), "entry", "entries"));
+                for entry in &rewritten {
+                    self.tracker.record(entry);
                 }
+                watch::merge(&mut self.entries, &Change { written: rewritten, ..Default::default() });
             }
         }
         if self.focus.is_some_and(|id| written.contains(&id)) {
@@ -887,11 +902,32 @@ impl App {
                 None => Ok(String::new()),
             },
             Action::ReplaceFromSource => self.replace_from_source(),
-            Action::StopConfig => match self.active_config.take() {
-                Some((name, _)) => Ok(format!("{name} is no longer re-applied")),
+            Action::AddConfigs => match rfd::FileDialog::new().set_title("Choose replacement configs").add_filter("Config", &["json"]).pick_files() {
+                Some(paths) => self.check_configs(ctx, paths),
                 None => Ok(String::new()),
             },
-            Action::ApplyConfig => self.check_config(ctx),
+            // Read from disk again, so edits made to the files since are picked up.
+            Action::ReapplyConfigs => self.check_configs(ctx, self.configs.iter().filter(|c| c.enabled).map(|c| c.path.clone()).collect()),
+            Action::ToggleConfig(i) => {
+                if let Some(config) = self.configs.get_mut(i) {
+                    config.enabled = !config.enabled;
+                    self.save_configs();
+                }
+                Ok(String::new())
+            }
+            Action::RemoveConfig(i) => {
+                if i < self.configs.len() {
+                    let removed = self.configs.remove(i);
+                    self.save_configs();
+                    return self.notify(ctx, format!("{} removed; what it already replaced stays replaced", removed.name), false);
+                }
+                Ok(String::new())
+            }
+            Action::RemoveAllConfigs => {
+                self.configs.clear();
+                self.save_configs();
+                Ok(String::new())
+            }
             Action::ConfirmConfig => self.apply_config(ctx),
             Action::Tag => self.tag_focused(),
             Action::PlayAudio => self.play_audio(),
@@ -1036,16 +1072,39 @@ impl App {
         }
     }
 
-    /// Picks a config, then on a worker thread looks up the asset IDs it names
-    /// and works out what it would change. The result is put up for confirmation.
-    fn check_config(&mut self, ctx: &egui::Context) -> Result<String> {
-        if self.config_job.is_some() {
+    /// Remembers which configs are loaded for the next run.
+    fn save_configs(&mut self) {
+        self.settings.configs = self.configs.iter().map(|c| SavedConfig { path: c.path.clone(), enabled: c.enabled }).collect();
+        self.settings.save();
+    }
+
+    /// Loads the configs that were loaded last time. They are re-applied to what
+    /// Roblox writes from now on; nothing already in the cache is touched.
+    fn restore_configs(&mut self) {
+        let mut unreadable = Vec::new();
+        for saved in self.settings.configs.clone() {
+            match config::load(&saved.path) {
+                Ok(rules) => self.configs.push(LoadedConfig { name: config::name_of(&saved.path), path: saved.path, rules, enabled: saved.enabled }),
+                Err(_) => unreadable.push(config::name_of(&saved.path)),
+            }
+        }
+        if !unreadable.is_empty() {
+            self.status = format!("Could not load {}: {}", format::count(unreadable.len(), "config", "configs"), unreadable.join(", "));
+            self.save_configs();
+        }
+    }
+
+    /// On a worker thread, looks up the asset IDs the configs at `paths` name and
+    /// works out what they would change together. The result is put up for confirmation.
+    fn check_configs(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) -> Result<String> {
+        if self.config_job.is_some() || paths.is_empty() {
             return Ok(String::new());
         }
-        let Some(path) = rfd::FileDialog::new().set_title("Choose a replacement config").add_filter("Config", &["json"]).pick_file() else {
-            return Ok(String::new());
-        };
-        let rules = config::load(&path)?;
+        let configs = paths
+            .into_iter()
+            .map(|path| Ok(LoadedConfig { name: config::name_of(&path), rules: config::load(&path)?, path, enabled: true }))
+            .collect::<Result<Vec<_>>>()?;
+        let rules = combined(&configs);
         let ids = config::asset_ids(&rules);
         let (tx, rx) = channel();
         let (dir, entries, mut idmap, ctx) = (self.dir.clone(), self.entries.clone(), self.idmap.clone(), ctx.clone());
@@ -1061,7 +1120,7 @@ impl App {
                 }
                 let reports = config::run(&store, &entries, &idmap, &rules, false, None);
                 let notes = reports.iter().flat_map(|r| r.notes.iter().map(move |n| format!("{}: {n}", r.name))).collect();
-                (PendingConfig { path, rules, summary: config::summarize(&reports, false), lookup, notes }, idmap)
+                (PendingConfig { configs, summary: config::summarize(&reports, false), lookup, notes }, idmap)
             });
             let _ = tx.send(ConfigMsg::Done(result.map_err(|e| format!("{e:#}"))));
             ctx.request_repaint();
@@ -1109,23 +1168,21 @@ impl App {
         }
     }
 
-    /// Applies the confirmed config on a worker thread. Matching rules to
+    /// Applies the confirmed configs on a worker thread. Matching rules to
     /// entries hashes their content and `cdn` rules download files, which is
     /// too slow to do while drawing.
     fn apply_config(&mut self, ctx: &egui::Context) -> Result<String> {
         let Some(pending) = self.pending_config.take() else { return Ok(String::new()) };
-        // The watcher would take the worker's writes for Roblox's, and an earlier
-        // config would be re-applied on top of them; both wait until this is done.
+        // The watcher would take the worker's writes for Roblox's and re-apply
+        // the loaded configs on top of them; it waits until this is done.
         self.stop_watch();
-        self.active_config = None;
         let (tx, rx) = channel();
         let (dir, entries, idmap, ctx) = (self.dir.clone(), self.entries.clone(), self.idmap.clone(), ctx.clone());
         std::thread::spawn(move || {
             let result = Store::open(&dir, true).map(|store| {
-                let reports = config::run(&store, &entries, &idmap, &pending.rules, true, None);
+                let reports = config::run(&store, &entries, &idmap, &combined(&pending.configs), true, None);
                 let summary = config::summarize(&reports, true);
-                let name = pending.path.file_stem().map_or_else(|| "config".to_string(), |n| n.to_string_lossy().into_owned());
-                AppliedConfig { name, rules: pending.rules, summary, rewritten: reports.into_iter().flat_map(|r| r.written).collect() }
+                AppliedConfig { configs: pending.configs, summary, rewritten: reports.into_iter().flat_map(|r| r.written).collect() }
             });
             let _ = tx.send(result.map_err(|e| format!("{e:#}")));
             ctx.request_repaint();
@@ -1145,8 +1202,15 @@ impl App {
                 watch::merge(&mut self.entries, &Change { written: applied.rewritten, ..Default::default() });
                 self.preview = None;
                 self.reindex();
-                // From here on the config follows the cache: whatever Roblox writes is checked against it.
-                self.active_config = Some((applied.name, applied.rules));
+                // From here on the configs follow the cache: whatever Roblox writes is checked
+                // against them. One that was already loaded is replaced by what was just read.
+                for config in applied.configs {
+                    match self.configs.iter_mut().find(|c| c.path == config.path) {
+                        Some(loaded) => *loaded = config,
+                        None => self.configs.push(config),
+                    }
+                }
+                self.save_configs();
                 self.notify(ctx, applied.summary, false);
             }
             Err(e) => self.notify(ctx, e, true),
@@ -1204,9 +1268,6 @@ impl App {
                 item(ui, actions, true, "Open cache folder", "", Action::OpenFolder);
                 item(ui, actions, true, "Clear cache...", "", Action::AskClear);
                 ui.separator();
-                item(ui, actions, true, "Apply config...", "Ctrl+O", Action::ApplyConfig);
-                item(ui, actions, self.active_config.is_some(), "Stop re-applying config", "", Action::StopConfig);
-                ui.separator();
                 if self.tray.is_some() {
                     item(ui, actions, true, "Hide to tray", "", Action::HideToTray);
                 }
@@ -1216,19 +1277,58 @@ impl App {
                 ui.set_min_width(230.0);
                 entry_items(ui, actions, one, any, self.source.is_some());
             });
+            ui.menu_button("Configs", |ui| {
+                ui.set_min_width(280.0);
+                item(ui, actions, true, "Add configs...", "Ctrl+O", Action::AddConfigs);
+                ui.separator();
+                if self.configs.is_empty() {
+                    ui.weak("No configs loaded");
+                }
+                for (i, config) in self.configs.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let mut enabled = config.enabled;
+                        let hint = format!("{}\nTicked: re-applied to whatever Roblox writes", config.path.display());
+                        if ui.checkbox(&mut enabled, &config.name).on_hover_text(hint).changed() {
+                            actions.push(Action::ToggleConfig(i));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Remove").on_hover_text("Stop using this config. What it already replaced stays replaced.").clicked() {
+                                actions.push(Action::RemoveConfig(i));
+                                ui.close_menu();
+                            }
+                        });
+                    });
+                }
+                ui.separator();
+                let enabled = self.configs.iter().any(|c| c.enabled);
+                item(ui, actions, enabled, "Apply enabled configs now", "", Action::ReapplyConfigs);
+                item(ui, actions, !self.configs.is_empty(), "Remove all", "", Action::RemoveAllConfigs);
+            });
+            ui.menu_button("Live", |ui| {
+                ui.set_min_width(240.0);
+                if ui.checkbox(&mut self.settings.watch, "Watch cache live").changed() {
+                    match self.settings.watch {
+                        true => self.start_watch(ui.ctx()),
+                        false => self.stop_watch(),
+                    }
+                    self.settings.save();
+                }
+                ui.separator();
+                let (tab, label) = if self.tab == Tab::Live { (Tab::All, "Show all entries") } else { (Tab::Live, "Show the Live list") };
+                item(ui, actions, true, label, "", Action::ShowTab(tab));
+                item(ui, actions, self.tab == Tab::Live && self.sort != SortKey::Arrival, "Newest first", "", Action::SortByArrival);
+                item(ui, actions, !self.arrivals.is_empty(), "Clear the Live list", "", Action::ClearLive);
+                ui.separator();
+                let applying = self.configs.iter().filter(|c| c.enabled).count();
+                ui.weak(format!("{} since the list was last cleared", format::count(self.arrivals.len(), "arrival", "arrivals")));
+                ui.weak(format!("{} re-applied to new arrivals", format::count(applying, "config", "configs")));
+            });
             ui.menu_button("View", |ui| {
                 ui.set_min_width(210.0);
                 if ui.checkbox(&mut self.show_redirects, "Show redirect records").changed() {
                     self.rebuild_view();
                 }
                 let mut changed = ui.checkbox(&mut self.settings.animations, "Animations").changed();
-                if ui.checkbox(&mut self.settings.watch, "Watch cache live").changed() {
-                    changed = true;
-                    match self.settings.watch {
-                        true => self.start_watch(ui.ctx()),
-                        false => self.stop_watch(),
-                    }
-                }
                 if self.tray.is_some() {
                     let hint = "Closing the window keeps rbxcache running in the notification area";
                     changed |= ui.checkbox(&mut self.settings.close_to_tray, "Close to tray").on_hover_text(hint).changed();
@@ -1913,9 +2013,11 @@ impl App {
         let Some(pending) = &self.pending_config else { return };
         let mut close = false;
         let dismissed = self.modal(ctx, "config", self.confirm_config, |ui| {
-            ui.label(egui::RichText::new("Apply config").size(18.0));
+            ui.label(egui::RichText::new("Apply configs").size(18.0));
             ui.add_space(4.0);
-            ui.label(egui::RichText::new(pending.path.display().to_string()).color(theme::MUTED).small());
+            for config in &pending.configs {
+                ui.label(egui::RichText::new(config.path.display().to_string()).color(theme::MUTED).small());
+            }
             if !pending.lookup.is_empty() {
                 ui.label(egui::RichText::new(&pending.lookup).color(theme::MUTED));
             }
@@ -1966,7 +2068,7 @@ impl App {
                     ("Space", "Play or pause a sound or animation"),
                     ("Ctrl+F", "Search"),
                     ("Ctrl+E", "Export"),
-                    ("Ctrl+O", "Apply config"),
+                    ("Ctrl+O", "Add configs"),
                     ("Delete", "Delete the selection"),
                     ("F5", "Reload the cache"),
                     ("F1", "This window"),
@@ -2054,7 +2156,7 @@ impl App {
                 self.focus_search = true;
             }
             if i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::O)) {
-                actions.push(Action::ApplyConfig);
+                actions.push(Action::AddConfigs);
             }
             if i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::E)) {
                 actions.push(if self.selected.len() > 1 { Action::ExportMany } else { Action::Export });
@@ -2159,8 +2261,10 @@ impl eframe::App for App {
                     if self.watch.is_some() {
                         theme::pill(ui, "Live", theme::OK);
                     }
-                    if let Some((name, _)) = &self.active_config {
-                        theme::pill(ui, &format!("Applying {name}"), theme::ACCENT);
+                    match self.configs.iter().filter(|c| c.enabled).collect::<Vec<_>>().as_slice() {
+                        [] => {}
+                        [only] => theme::pill(ui, &format!("Applying {}", only.name), theme::ACCENT),
+                        several => theme::pill(ui, &format!("Applying {} configs", several.len()), theme::ACCENT),
                     }
                     if !self.selected.is_empty() {
                         let text = format!("{} selected  -  {}", self.selected.len(), human_size(self.selected_bytes()));
