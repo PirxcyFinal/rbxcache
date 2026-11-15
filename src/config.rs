@@ -177,7 +177,7 @@ pub fn name_of(path: &Path) -> String {
 }
 
 /// Joins the rules of several configs into one list, in order, so they can be
-/// run together. Rules later in the list win where two change the same entry.
+/// run together. Where two rules set the same entry, the later one has it.
 /// With more than one config, each rule's name is prefixed with its config's.
 pub fn combine<'a>(configs: impl IntoIterator<Item = (&'a str, &'a [Rule])>) -> Vec<Rule> {
     let configs: Vec<_> = configs.into_iter().collect();
@@ -194,15 +194,30 @@ pub fn combine<'a>(configs: impl IntoIterator<Item = (&'a str, &'a [Rule])>) -> 
     rules
 }
 
-/// Loads several config files as one list of rules; see [`combine`].
+/// True when the two paths name the same file, however each is spelled.
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// Loads several config files as one list of rules; see [`combine`]. A file
+/// given more than once counts once, at its first place.
 pub fn load_all(paths: &[PathBuf]) -> Result<Vec<Rule>> {
-    let loaded: Vec<(String, Vec<Rule>)> = paths.iter().map(|p| Ok((name_of(p), load(p)?))).collect::<Result<_>>()?;
+    let mut unique: Vec<&PathBuf> = Vec::new();
+    for path in paths {
+        if !unique.iter().any(|seen| same_file(seen, path)) {
+            unique.push(path);
+        }
+    }
+    let loaded: Vec<(String, Vec<Rule>)> = unique.into_iter().map(|p| Ok((name_of(p), load(p)?))).collect::<Result<_>>()?;
     Ok(combine(loaded.iter().map(|(name, rules)| (name.as_str(), rules.as_slice()))))
 }
 
 pub fn load(path: &Path) -> Result<Vec<Rule>> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    parse(&text, path.parent().unwrap_or(Path::new(".")))
+    parse(&text, path.parent().unwrap_or(Path::new("."))).with_context(|| format!("in {}", path.display()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -373,7 +388,9 @@ fn fetch(url: &str) -> Result<Vec<u8>> {
 /// What one rule will do, worked out before anything is written.
 struct Plan {
     report: RuleReport,
-    /// Entries whose content differs from `payload`.
+    /// Every entry the rule would set, whether or not it already holds the payload.
+    claims: Vec<usize>,
+    /// The claimed entries whose content differs from `payload`.
     writes: Vec<usize>,
     payload: Option<Vec<u8>>,
 }
@@ -389,7 +406,8 @@ pub fn run(store: &Store, entries: &[Entry], idmap: &IdMap, rules: &[Rule], appl
     let resolver = Resolver::new(store, entries, idmap);
     let mut plans = Vec::new();
     for rule in rules {
-        let mut plan = Plan { report: RuleReport { name: rule.name.clone(), ..Default::default() }, writes: Vec::new(), payload: None };
+        let mut plan =
+            Plan { report: RuleReport { name: rule.name.clone(), ..Default::default() }, claims: Vec::new(), writes: Vec::new(), payload: None };
         let mut matched: Vec<usize> = Vec::new();
         for target in &rule.targets {
             match resolver.resolve(target) {
@@ -430,7 +448,7 @@ pub fn run(store: &Store, entries: &[Entry], idmap: &IdMap, rules: &[Rule], appl
         match payload {
             Err(e) => plan.report.notes.push(format!("{e:#}")),
             // A download that a dry run skips is assumed to differ from what is cached.
-            Ok(None) => plan.report.changed = matched.len(),
+            Ok(None) => plan.claims = matched,
             Ok(Some(payload)) => {
                 for &i in &matched {
                     match store.read_body(&entries[i].id) {
@@ -439,11 +457,21 @@ pub fn run(store: &Store, entries: &[Entry], idmap: &IdMap, rules: &[Rule], appl
                         Err(e) => plan.report.notes.push(format!("{}: {e:#}", entries[i].id_hex)),
                     }
                 }
-                plan.report.changed = plan.writes.len();
+                plan.claims = matched;
                 plan.payload = Some(payload);
             }
         }
         plans.push(plan);
+    }
+    // Where several rules set the same entry, the last one has it. An earlier rule
+    // must not write there even when the entry already holds the last rule's
+    // content, or the two would undo each other on every run.
+    let mut taken: HashSet<usize> = HashSet::new();
+    for plan in plans.iter_mut().rev() {
+        plan.writes.retain(|i| !taken.contains(i));
+        let kept = plan.claims.iter().filter(|i| !taken.contains(i)).count();
+        plan.report.changed = if plan.payload.is_some() { plan.writes.len() } else { kept };
+        taken.extend(plan.claims.iter().copied());
     }
     if apply {
         for plan in &mut plans {
@@ -533,6 +561,60 @@ mod tests {
         assert_eq!(names(combine([("first", a.as_slice()), ("second", b.as_slice())])), ["first / one", "first / two", "second / three"]);
         assert_eq!(names(combine([("only", a.as_slice())])), ["one", "two"]);
         assert_eq!(name_of(Path::new("C:/packs/My Pack.json")), "My Pack");
+    }
+
+    /// A cache holding one wrapped entry, in a fresh folder under the temp directory.
+    fn one_entry_cache(tag: &str, body: &[u8]) -> (PathBuf, Id) {
+        let dir = std::env::temp_dir().join(format!("rbxcache-config-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("rbx-storage")).unwrap();
+        let mut blob = b"RBXH".to_vec();
+        for v in [2u32, 0] {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        blob.push(0);
+        for v in [200u32, 0, 0, body.len() as u32, format::checksum(body), 0] {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        blob.extend_from_slice(body);
+        let id = [7u8; 16];
+        let db = rusqlite::Connection::open(dir.join("rbx-storage.db")).unwrap();
+        db.execute_batch("CREATE TABLE files (id BLOB PRIMARY KEY NOT NULL, content BLOB, size INTEGER DEFAULT 0 NOT NULL, hits INTEGER DEFAULT 0 NOT NULL, atime INTEGER DEFAULT 0 NOT NULL, category INTEGER DEFAULT 0 NOT NULL, score INTEGER DEFAULT 0 NOT NULL, ttl INTEGER DEFAULT 0 NOT NULL)").unwrap();
+        db.execute("INSERT INTO files (id, content, size, category) VALUES (?1, ?2, ?3, 10)", rusqlite::params![&id[..], blob, blob.len() as i64])
+            .unwrap();
+        (dir, id)
+    }
+
+    #[test]
+    fn the_last_rule_keeps_an_entry_however_often_the_rules_run() {
+        let (dir, id) = one_entry_cache("order", b"OggS original");
+        std::fs::write(dir.join("first.bin"), b"OggS first, and longer").unwrap();
+        std::fs::write(dir.join("second.bin"), b"OggS second").unwrap();
+        let rule = |name: &str, file: &str| Rule { name: name.into(), targets: vec![Target::Entry(id)], action: Action::Local(dir.join(file)) };
+        let rules = [rule("first", "first.bin"), rule("second", "second.bin")];
+        let store = Store::open(&dir, true).unwrap();
+        for round in 0..3 {
+            let entries = store.list(|_, _| {}).unwrap();
+            let reports = run(&store, &entries, &IdMap::default(), &rules, true, None);
+            assert_eq!(store.read_body(&id).unwrap(), b"OggS second", "round {round}");
+            // The entry is counted for the rule that has it, and only while it still needs writing.
+            assert_eq!((reports[0].changed, reports[1].changed), (0, usize::from(round == 0)), "round {round}");
+        }
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_given_twice_is_loaded_once() {
+        let dir = std::env::temp_dir().join(format!("rbxcache-config-test-twice-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pack.json");
+        std::fs::write(&path, r#"[{"name": "r", "replace_ids": [5], "mode": "remove"}]"#).unwrap();
+        assert_eq!(load_all(&[path.clone(), path.clone()]).unwrap().len(), 1);
+        std::fs::write(&path, "not json").unwrap();
+        let error = format!("{:#}", load(&path).unwrap_err());
+        assert!(error.contains("pack.json"), "{error}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -21,7 +21,12 @@ pub struct Settings {
 pub struct SavedConfig {
     pub path: PathBuf,
     /// Whether it is re-applied to what Roblox writes.
+    #[serde(default = "enabled_by_default")]
     pub enabled: bool,
+}
+
+fn enabled_by_default() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -59,5 +64,7 @@ mod tests {
         let settings: Settings = serde_json::from_str(r#"{"animations": false}"#).unwrap();
         assert_eq!(settings, Settings { animations: false, ..Settings::default() });
         assert!(Settings::default().close_to_tray);
+        let listed: Settings = serde_json::from_str(r#"{"configs": [{"path": "a.json"}]}"#).unwrap();
+        assert_eq!(listed.configs, [SavedConfig { path: "a.json".into(), enabled: true }]);
     }
 }

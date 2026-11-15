@@ -7,15 +7,20 @@ place. It works on the files directly: there is no proxy, no certificate and no
 network traffic to intercept.
 
 This is the safest way to do what [Fleasion](https://github.com/fleasion/Fleasion)
-does. Fleasion swaps assets by routing Roblox's traffic through a local proxy,
-which means installing a certificate, relaunching the client and reading your
-Roblox login. rbxcache does none of that: it never touches the client or its
-traffic, never asks for or reads a login, and only edits files Roblox has
-already saved to disk, which Roblox replaces by itself when the cache is
-cleared. It reads the same config files Fleasion does.
+does. Fleasion swaps assets by routing Roblox's traffic through a local proxy:
+it adds its own certificate to the client's trusted list, relaunches the client
+through the proxy, and uses your Roblox login to fetch assets. rbxcache does
+none of that. It never modifies the client or sits in its traffic, and it never
+asks for or reads a login. It only edits files Roblox has already saved to
+disk, and it reads the same config format, with the exceptions listed under
+[How asset IDs are matched](#how-asset-ids-are-matched).
 
 "Safest" is not "risk free". Changing how a game looks on your own machine may
 still be against Roblox's rules or a game's, and that is yours to judge.
+
+To undo everything, remove or untick your configs and clear the cache: Roblox
+downloads the originals again. Entries you replaced by hand are protected and
+are put back after a clear, so delete those first if you want them gone.
 
 Windows, macOS and Linux. The cache is looked for in the client's own folder:
 
@@ -46,7 +51,7 @@ CI but have not been run against a real cache.
   downloads it again.
 - Apply replacement configs in the JSON format Fleasion uses.
 - Follow the cache live while Roblox runs: newly fetched and rewritten entries appear as
-  they are written, an applied config is re-applied to them, and the tool
+  they are written, loaded configs are re-applied to them, and the tool
   reports whether Roblox read a replacement or wrote over it. Manual replacements
   are stored outside Roblox's cache and restored whenever Roblox overwrites them.
 
@@ -90,8 +95,8 @@ client. The window shows a warning while the client is running.
 
 The window follows the cache while it is open; the Live menu turns that on and
 off. The Live tab starts empty and fills with what Roblox writes from then on,
-newest first, and the Live menu can switch to it, clear it, or put it back in
-arrival order. On either tab, entries Roblox has just written are marked with a
+newest first, and the Live menu can switch to it, clear it, or sort it newest
+first again. On either tab, entries Roblox has just written are marked with a
 dot that fades, and a replaced entry shows whether Roblox has read it since.
 
 Protected entries are monitored and restored indefinitely, including after
@@ -105,11 +110,16 @@ Configs > Add configs opens one or more config files. They are checked together
 against the cache, and a dialog shows what they would change before anything is
 written. Once applied they stay loaded and are listed in the Configs menu:
 
-- A ticked config is re-applied to whatever Roblox writes from then on.
-  Untick one to pause it; Remove takes it out of the list. Neither undoes
-  what was already replaced. Delete those entries, or clear the cache, to get
-  the originals back.
-- Where two configs change the same entry, the one lower in the list wins.
+- A ticked config is re-applied to whatever Roblox writes, for as long as
+  rbxcache is running and Live > Watch cache live is on. Untick one to pause
+  it; Remove takes it out of the list. Neither undoes what was already
+  replaced. Delete those entries, or clear the cache, to get the originals
+  back.
+- Where two configs set the same entry, the one lower in the list has it.
+  Adding a config that is already loaded moves it to the bottom.
+- Cancelling the dialog leaves the configs out of the list.
+- A config whose file cannot be read is kept in the list, marked unreadable,
+  until the file is back or you remove it.
 - Apply enabled configs now reads the files again and applies them to the
   whole cache, which picks up edits made to them since.
 - The list is remembered. When the app next starts, the configs are loaded

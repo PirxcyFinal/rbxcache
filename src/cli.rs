@@ -102,7 +102,7 @@ pub enum Cmd {
         #[arg(long, conflicts_with = "file")]
         from: Option<String>,
     },
-    /// Follow the cache as Roblox uses it, optionally keeping a config applied
+    /// Follow the cache as Roblox uses it, optionally keeping configs applied
     Watch {
         /// Re-apply this replacement config to every entry Roblox writes; may be given several times
         #[arg(long)]
@@ -115,13 +115,13 @@ pub enum Cmd {
     Tag { id: String, asset_id: u64 },
     /// Apply one or more Fleasion-style replacement configs to the cache
     ApplyConfig {
-        /// One or more config files; later ones win where they overlap
+        /// One or more config files; where two set the same entry, the later one has it
         #[arg(required = true)]
         files: Vec<PathBuf>,
         /// Only report what would change
         #[arg(long)]
         dry_run: bool,
-        /// Do not look up the config's asset IDs online first
+        /// Do not look up the configs' asset IDs online first
         #[arg(long)]
         offline: bool,
     },
@@ -414,7 +414,7 @@ pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
     }
 }
 
-/// Prints cache activity until interrupted, re-applying `config` to what Roblox writes.
+/// Prints cache activity until interrupted, re-applying `configs` to what Roblox writes.
 fn watch(dir: &Path, idmap_path: &Path, configs: &[PathBuf], interval: f32) -> Result<()> {
     use crate::watch::{merge, Tracker, Verdict, Watcher};
     let rules = if configs.is_empty() { None } else { Some(config::load_all(configs)?) };
