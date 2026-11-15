@@ -5,6 +5,7 @@ mod config;
 mod format;
 mod gui;
 mod protection;
+mod resolve;
 mod store;
 mod theme;
 mod update;

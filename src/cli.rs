@@ -119,6 +119,16 @@ pub enum Cmd {
         /// Only report what would change
         #[arg(long)]
         dry_run: bool,
+        /// Do not look up the config's asset IDs online first
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Look up a config's asset IDs and match them to cached entries
+    Identify {
+        file: PathBuf,
+        /// Ask Roblox again about IDs that were already looked up
+        #[arg(long)]
+        refresh: bool,
     },
     /// Try to decode every texture, mesh and model, and report how many can be previewed
     Probe {
@@ -290,14 +300,27 @@ pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::ApplyConfig { file, dry_run } => {
+        Cmd::Identify { file, refresh } => {
+            let rules = config::load(&file)?;
+            let store = Store::open(dir, false)?;
+            let entries = store.list(|_, _| {})?;
+            let mut idmap = IdMap::load(idmap_path)?;
+            for (id, outcome) in identify(&store, &entries, &mut idmap, idmap_path, &rules, refresh)? {
+                println!("{id:<18} {outcome}");
+            }
+            Ok(())
+        }
+        Cmd::ApplyConfig { file, dry_run, offline } => {
             let rules = config::load(&file)?;
             let store = Store::open(dir, !dry_run)?;
             if !dry_run {
                 warn_if_running();
             }
             let entries = store.list(|_, _| {})?;
-            let idmap = IdMap::load(idmap_path)?;
+            let mut idmap = IdMap::load(idmap_path)?;
+            if !offline {
+                identify(&store, &entries, &mut idmap, idmap_path, &rules, false)?;
+            }
             let reports = config::run(&store, &entries, &idmap, &rules, !dry_run, None);
             for r in &reports {
                 println!("{:<28} matched {:>5}  {} {:>5}", r.name, r.matched, if dry_run { "would change" } else { "changed" }, r.changed);
@@ -392,9 +415,12 @@ pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
 fn watch(dir: &Path, idmap_path: &Path, config: Option<&Path>, interval: f32) -> Result<()> {
     use crate::watch::{merge, Tracker, Verdict, Watcher};
     let rules = config.map(config::load).transpose()?;
-    let idmap = IdMap::load(idmap_path)?;
+    let mut idmap = IdMap::load(idmap_path)?;
     let store = Store::open(dir, rules.is_some())?;
     let mut entries = store.list(|_, _| {})?;
+    if let Some(rules) = &rules {
+        identify(&store, &entries, &mut idmap, idmap_path, rules, false)?;
+    }
     let mut tracker = Tracker::default();
     if let Some(rules) = &rules {
         for report in config::run(&store, &entries, &idmap, rules, true, None) {
@@ -441,6 +467,27 @@ fn watch(dir: &Path, idmap_path: &Path, config: Option<&Path>, interval: f32) ->
             }
         }
     }
+}
+
+/// Looks up the asset IDs `rules` mention, saves what was learned to the ID map
+/// and prints a one-line summary. Returns what happened to each ID.
+fn identify(
+    store: &Store,
+    entries: &[Entry],
+    idmap: &mut IdMap,
+    idmap_path: &Path,
+    rules: &[config::Rule],
+    refresh: bool,
+) -> Result<Vec<(u64, crate::resolve::Outcome)>> {
+    let ids = config::asset_ids(rules);
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    eprintln!("looking up {}...", format::count(ids.len(), "asset ID", "asset IDs"));
+    let outcomes = crate::resolve::identify(store, entries, idmap, &ids, refresh, &|_, _| {});
+    idmap.save(idmap_path)?;
+    println!("{}", crate::resolve::summarize(&outcomes));
+    Ok(outcomes)
 }
 
 fn warn_if_running() {

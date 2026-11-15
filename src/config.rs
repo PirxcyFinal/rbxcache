@@ -152,6 +152,25 @@ pub fn parse(text: &str, base: &Path) -> Result<Vec<Rule>> {
     Ok(rules)
 }
 
+/// Every asset ID the rules mention, as targets or as replacements, once each.
+pub fn asset_ids(rules: &[Rule]) -> Vec<u64> {
+    let mut ids = Vec::new();
+    for rule in rules {
+        let replacement = match &rule.action {
+            Action::With(target) => Some(target),
+            _ => None,
+        };
+        for target in rule.targets.iter().chain(replacement) {
+            if let Target::Asset(id) = target {
+                if !ids.contains(id) {
+                    ids.push(*id);
+                }
+            }
+        }
+    }
+    ids
+}
+
 pub fn load(path: &Path) -> Result<Vec<Rule>> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     parse(&text, path.parent().unwrap_or(Path::new(".")))
@@ -168,7 +187,7 @@ pub fn fingerprint(body: &[u8]) -> Fingerprint {
 }
 
 /// Asset ID -> content fingerprints. One asset can have several (image formats, etc).
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct IdMap {
     #[serde(flatten)]
     pub assets: BTreeMap<String, Vec<Fingerprint>>,
@@ -270,7 +289,11 @@ impl<'a> Resolver<'a> {
                 Ok((0..self.entries.len()).filter(|&i| replaceable(&self.entries[i]) && covers(self.entries[i].kind)).collect())
             }
             Target::Asset(n) => {
-                let prints = self.idmap.assets.get(&n.to_string()).ok_or_else(|| format!("{target} is not in the ID map"))?;
+                let prints = self
+                    .idmap
+                    .assets
+                    .get(&n.to_string())
+                    .ok_or_else(|| format!("{target} has not been identified (it is not public, or was never looked up)"))?;
                 let mut found = Vec::new();
                 for fp in prints {
                     for &i in self.by_size.get(&fp.size).map_or(&[][..], Vec::as_slice) {
@@ -360,8 +383,19 @@ pub fn run(store: &Store, entries: &[Entry], idmap: &IdMap, rules: &[Rule], appl
             Action::Cdn(_) => Ok(None),
             Action::With(target) => match resolver.resolve(target).map(|found| found.first().copied()) {
                 Ok(Some(source)) => store.read_body(&entries[source].id).map(Some),
-                Ok(None) => Err(anyhow::anyhow!("replacement {target} matches nothing in the cache")),
-                Err(why) => Err(anyhow::anyhow!("replacement {why}")),
+                // A replacement asset that is not cached can still be downloaded, if it is public.
+                _ => match target {
+                    Target::Asset(_) if !apply => Ok(None),
+                    Target::Asset(id) => match crate::resolve::fetch(*id, false) {
+                        Ok(crate::resolve::Fetched::Body(body)) => Ok(Some(body)),
+                        Ok(crate::resolve::Fetched::Denied(_)) => {
+                            Err(anyhow::anyhow!("replacement {target} is not in the cache and cannot be downloaded without a login"))
+                        }
+                        Ok(crate::resolve::Fetched::Gone) => Err(anyhow::anyhow!("replacement {target} does not exist")),
+                        Err(e) => Err(e),
+                    },
+                    _ => Err(anyhow::anyhow!("replacement {target} matches nothing in the cache")),
+                },
             },
         };
         match payload {
@@ -371,7 +405,7 @@ pub fn run(store: &Store, entries: &[Entry], idmap: &IdMap, rules: &[Rule], appl
             Ok(Some(payload)) => {
                 for &i in &matched {
                     match store.read_body(&entries[i].id) {
-                        Ok(current) if current == payload => {}
+                        Ok(current) if current == *crate::viewers::fit_payload(entries[i].kind, &payload) => {}
                         Ok(_) => plan.writes.push(i),
                         Err(e) => plan.report.notes.push(format!("{}: {e:#}", entries[i].id_hex)),
                     }
@@ -386,7 +420,7 @@ pub fn run(store: &Store, entries: &[Entry], idmap: &IdMap, rules: &[Rule], appl
         for plan in &mut plans {
             let Some(body) = &plan.payload else { continue };
             for &i in &plan.writes {
-                match store.replace_body(&entries[i].id, body) {
+                match store.replace_body(&entries[i].id, &crate::viewers::fit_payload(entries[i].kind, body)) {
                     Ok(entry) => plan.report.written.push(entry),
                     Err(e) => {
                         plan.report.changed -= 1;

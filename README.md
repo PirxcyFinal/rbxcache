@@ -126,6 +126,7 @@ rbxcache watch [--config <file>]       follow the cache, keeping a config applie
 rbxcache delete <id>...                remove entries
 rbxcache tag <id> <assetId>            record which asset an entry is
 rbxcache apply-config <file>           apply a replacement config
+rbxcache identify <file>               look up a config's asset IDs
 rbxcache probe                         test-decode every texture, mesh and model
 ```
 
@@ -159,18 +160,38 @@ Each entry of `replace_ids` can be:
 - a type name (`Image`, `Audio`, `Mesh`, `Video`, `Font`) for every cached asset
   of that kind.
 
-### Asset IDs need tagging
+### How asset IDs are matched
 
 The cache does not record which asset ID an entry belongs to, and its entry
-names cannot be derived from an ID. Fleasion learns the mapping by watching
-requests through its proxy; this tool has no such view. Instead it keeps an ID
-map (`%APPDATA%\rbxcache\idmap.json` on Windows, `idmap.json` in the data
-folder above elsewhere): select an entry, type its asset ID and
-press Tag (or use `rbxcache tag`). The map stores a fingerprint of the content
-rather than the cache key, so it still matches after the cache is cleared and
-can be shared between machines.
+names cannot be derived from an ID. When a config that names asset IDs is
+applied, each ID is looked up at Roblox's asset delivery endpoint, the same one
+the client uses, with no login. What comes back is byte-for-byte what the client
+cached, so its fingerprint (MD5 and size) identifies the entry. For images the
+client asks for a KTX2 rendition instead, so that is fetched too.
 
-A rule whose asset ID is not in the map is reported and skipped. Fleasion's
+The fingerprints are kept in an ID map (`%APPDATA%\rbxcache\idmap.json` on
+Windows, `idmap.json` in the data folder above elsewhere), whether or not the
+asset is in the cache yet. With the config still active, an asset Roblox
+downloads later is recognised and replaced when it arrives. The map does not
+depend on the cache key, so it survives a cache clear and can be shared.
+
+Not every asset is public. Roblox answers 401 or 403 for those that need a
+login or a permission, and rules naming them are reported and skipped; this
+tool never sends credentials. You can still tie such an asset to an entry by
+hand: select the entry, type the asset ID and press Tag (or use `rbxcache tag`).
+`rbxcache identify <config>` shows how each ID in a config fared, and
+`apply-config --offline` skips the lookup.
+
+Each ID is looked up once. The map remembers what it learned, including which
+IDs were refused, so applying the same or another config later only asks about
+IDs it has not seen. `rbxcache identify <config> --refresh` asks again, for an
+asset that was updated or made public since.
+
+A replacement asset named by `with_id` is taken from the cache when it is
+there and downloaded otherwise. An image going into an entry Roblox stores as
+KTX2 is converted to an uncompressed KTX2 texture first.
+
+Fleasion's
 texture-pack slot syntax (`"id:slot"`) and type names that cannot be recognised
 from content, such as `Animation`, are not supported.
 

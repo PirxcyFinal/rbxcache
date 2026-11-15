@@ -6,6 +6,7 @@ use crate::cli::{describe, export_name, matches};
 use crate::config::{self, IdMap};
 use crate::format::{self, human_size};
 use crate::protection::Protections;
+use crate::resolve;
 use crate::store::{self, category_name, format_time_ms, Entry, Id, Store};
 use crate::theme::{self, alpha};
 use crate::update::{self, Release};
@@ -150,7 +151,17 @@ struct PendingConfig {
     path: PathBuf,
     rules: Vec<config::Rule>,
     summary: String,
+    /// How looking up the config's asset IDs went; empty when it names none.
+    lookup: String,
     notes: Vec<String>,
+}
+
+/// Progress and result of checking a config on a worker thread.
+enum ConfigMsg {
+    /// Asset IDs looked up so far, out of how many.
+    Progress(usize, usize),
+    /// The checked config and the ID map with what the lookup learned.
+    Done(Result<(PendingConfig, IdMap), String>),
 }
 
 struct Toast {
@@ -216,6 +227,8 @@ struct App {
     clearing: Option<Receiver<Result<Vec<String>, String>>>,
     delete_prompt: String,
     pending_config: Option<PendingConfig>,
+    /// A config being checked in the background.
+    config_job: Option<Receiver<ConfigMsg>>,
     confirm_config: bool,
     /// A config that is re-applied to whatever Roblox writes while watching.
     active_config: Option<(String, Vec<config::Rule>)>,
@@ -293,6 +306,7 @@ impl App {
             clearing: None,
             delete_prompt: String::new(),
             pending_config: None,
+            config_job: None,
             confirm_config: false,
             active_config: None,
             live: true,
@@ -792,7 +806,7 @@ impl App {
                 Some((name, _)) => Ok(format!("{name} is no longer re-applied")),
                 None => Ok(String::new()),
             },
-            Action::ApplyConfig => self.check_config(),
+            Action::ApplyConfig => self.check_config(ctx),
             Action::ConfirmConfig => self.apply_config(),
             Action::Tag => self.tag_focused(),
             Action::PlayAudio => self.play_audio(),
@@ -937,17 +951,71 @@ impl App {
         }
     }
 
-    /// Picks a config and works out what it would change, then asks before applying it.
-    fn check_config(&mut self) -> Result<String> {
+    /// Picks a config, then on a worker thread looks up the asset IDs it names
+    /// and works out what it would change. The result is put up for confirmation.
+    fn check_config(&mut self, ctx: &egui::Context) -> Result<String> {
+        if self.config_job.is_some() {
+            return Ok(String::new());
+        }
         let Some(path) = rfd::FileDialog::new().set_title("Choose a replacement config").add_filter("Config", &["json"]).pick_file() else {
             return Ok(String::new());
         };
         let rules = config::load(&path)?;
-        let reports = config::run(&Store::open(&self.dir, false)?, &self.entries, &self.idmap, &rules, false, None);
-        let notes = reports.iter().flat_map(|r| r.notes.iter().map(move |n| format!("{}: {n}", r.name))).collect();
-        self.pending_config = Some(PendingConfig { path, rules, summary: config::summarize(&reports, false), notes });
-        self.confirm_config = true;
+        let ids = config::asset_ids(&rules);
+        let (tx, rx) = channel();
+        let (dir, entries, mut idmap, ctx) = (self.dir.clone(), self.entries.clone(), self.idmap.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = Store::open(&dir, false).map(|store| {
+                let mut lookup = String::new();
+                if !ids.is_empty() {
+                    let report = |done, total| {
+                        let _ = tx.send(ConfigMsg::Progress(done, total));
+                        ctx.request_repaint();
+                    };
+                    lookup = resolve::summarize(&resolve::identify(&store, &entries, &mut idmap, &ids, false, &report));
+                }
+                let reports = config::run(&store, &entries, &idmap, &rules, false, None);
+                let notes = reports.iter().flat_map(|r| r.notes.iter().map(move |n| format!("{}: {n}", r.name))).collect();
+                (PendingConfig { path, rules, summary: config::summarize(&reports, false), lookup, notes }, idmap)
+            });
+            let _ = tx.send(ConfigMsg::Done(result.map_err(|e| format!("{e:#}"))));
+            ctx.request_repaint();
+        });
+        self.config_job = Some(rx);
+        self.status = "Checking the config...".to_string();
         Ok(String::new())
+    }
+
+    fn poll_config(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.config_job else { return };
+        let mut finished = None;
+        for msg in rx.try_iter() {
+            match msg {
+                ConfigMsg::Progress(done, total) => self.status = format!("Looking up asset IDs... {done} / {total}"),
+                ConfigMsg::Done(result) => finished = Some(result),
+            }
+        }
+        match finished {
+            Some(Ok((pending, idmap))) => {
+                self.config_job = None;
+                self.status = pending.lookup.clone();
+                self.idmap = idmap;
+                // A map that failed to load is never written, so the broken file stays as it was.
+                if self.idmap_error.is_none() {
+                    if let Err(e) = self.idmap.save(&self.idmap_path) {
+                        self.notify(ctx, format!("The ID map could not be saved: {e:#}"), true);
+                    }
+                }
+                self.pending_config = Some(pending);
+                self.confirm_config = true;
+                self.preview = None;
+            }
+            Some(Err(e)) => {
+                self.config_job = None;
+                self.notify(ctx, e, true);
+            }
+            None => {}
+        }
     }
 
     fn apply_config(&mut self) -> Result<String> {
@@ -1612,6 +1680,9 @@ impl App {
             ui.label(egui::RichText::new("Apply config").size(18.0));
             ui.add_space(4.0);
             ui.label(egui::RichText::new(pending.path.display().to_string()).color(theme::MUTED).small());
+            if !pending.lookup.is_empty() {
+                ui.label(egui::RichText::new(&pending.lookup).color(theme::MUTED));
+            }
             ui.label(&pending.summary);
             const SHOWN: usize = 6;
             for note in pending.notes.iter().take(SHOWN) {
@@ -1820,6 +1891,7 @@ impl eframe::App for App {
         self.poll_load(ctx);
         self.poll_watch(ctx);
         self.poll_update(ctx);
+        self.poll_config(ctx);
         self.poll_clear(ctx);
         let now = ctx.input(|i| i.time);
         self.fresh.retain(|_, at| ((now - *at) as f32) < FRESH_SECONDS);
