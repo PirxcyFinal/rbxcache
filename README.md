@@ -92,6 +92,17 @@ To copy one cached asset over another, right-click the first and choose "Use as
 replacement source", then right-click the target and choose "Replace with
 source".
 
+### Staying in the tray
+
+On Windows, closing the window keeps rbxcache running in the notification area,
+so it goes on following the cache and re-applying replacements. Click the tray
+icon to bring the window back; right-click it for Show window and Quit. File >
+Hide to tray does the same as closing, File > Quit exits the app, and View >
+Close to tray turns the behaviour off. That choice,
+and the Animations and Watch cache live settings, are remembered in
+`settings.json` in the data folder. macOS and Linux have no tray support yet;
+there, closing the window quits.
+
 ### Clearing the cache
 
 File > Clear cache empties the whole cache so Roblox downloads everything
@@ -223,3 +234,8 @@ this against every entry.
   character.
 - Meshes are drawn untextured. Video segments and solid-model data have no
   viewer.
+
+## Credits
+
+The wordmark on the loading screen is set in Manrope ExtraBold, used under the
+SIL Open Font License (`assets/Manrope-OFL.txt`).

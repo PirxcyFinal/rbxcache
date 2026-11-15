@@ -14,12 +14,68 @@ pub const WARN: Color32 = Color32::from_rgb(240, 178, 76);
 pub const DANGER: Color32 = Color32::from_rgb(242, 100, 110);
 pub const OK: Color32 = Color32::from_rgb(92, 208, 150);
 
+/// The splash screen and the icon use the palette of the pirxcy site rather than the app's.
+pub const SPLASH_BG: Color32 = Color32::from_rgb(8, 8, 10);
+pub const SPLASH_INK: Color32 = Color32::from_rgb(246, 246, 247);
+pub const SPLASH_MUTED: Color32 = Color32::from_rgb(138, 141, 147);
+pub const LIME: Color32 = Color32::from_rgb(200, 255, 46);
+
 /// `color` at `a` opacity (0..1).
 pub fn alpha(color: Color32, a: f32) -> Color32 {
     color.gamma_multiply(a.clamp(0.0, 1.0))
 }
 
+/// Manrope ExtraBold; see assets/Manrope-OFL.txt.
+const MANROPE: &[u8] = include_bytes!("../assets/Manrope-ExtraBold.ttf");
+
+/// The app's icon as square RGBA pixels: a lime "p" on a dark rounded tile.
+pub fn app_icon(size: u32) -> Vec<u8> {
+    use ab_glyph::{Font, FontRef, PxScale};
+    let tile = [SPLASH_BG.r(), SPLASH_BG.g(), SPLASH_BG.b()];
+    let ink = [LIME.r() as f32, LIME.g() as f32, LIME.b() as f32];
+    let (side, radius) = (size as f32, size as f32 * 0.22);
+    let mut pixels = vec![0u8; (size * size * 4) as usize];
+    for y in 0..size {
+        for x in 0..size {
+            // Distance from the nearest corner's centre decides whether the pixel is on the tile.
+            let (cx, cy) = ((x as f32 + 0.5).clamp(radius, side - radius), (y as f32 + 0.5).clamp(radius, side - radius));
+            let distance = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+            let coverage = (radius - distance + 0.5).clamp(0.0, 1.0);
+            let at = ((y * size + x) * 4) as usize;
+            pixels[at..at + 4].copy_from_slice(&[tile[0], tile[1], tile[2], (coverage * 255.0) as u8]);
+        }
+    }
+    let glyph = FontRef::try_from_slice(MANROPE).ok().and_then(|font| {
+        let glyph = font.glyph_id('p').with_scale(PxScale::from(side * 0.92));
+        font.outline_glyph(glyph)
+    });
+    if let Some(outline) = glyph {
+        let bounds = outline.px_bounds();
+        let (left, top) = ((side - bounds.width()) / 2.0, (side - bounds.height()) / 2.0);
+        outline.draw(|x, y, coverage| {
+            let (px, py) = ((x as f32 + left) as u32, (y as f32 + top) as u32);
+            if px < size && py < size {
+                let at = ((py * size + px) * 4) as usize;
+                for k in 0..3 {
+                    pixels[at + k] = (pixels[at + k] as f32 * (1.0 - coverage) + ink[k] * coverage) as u8;
+                }
+            }
+        });
+    }
+    pixels
+}
+
+/// The font family of the "pirxcy" wordmark on the splash screen.
+pub fn wordmark_font() -> egui::FontFamily {
+    egui::FontFamily::Name("wordmark".into())
+}
+
 pub fn apply(ctx: &egui::Context) {
+    ctx.add_font(egui::epaint::text::FontInsert::new(
+        "Manrope-ExtraBold",
+        egui::FontData::from_static(MANROPE),
+        vec![egui::epaint::text::InsertFontFamily { family: wordmark_font(), priority: egui::epaint::text::FontPriority::Highest }],
+    ));
     let mut style = (*ctx.style()).clone();
     style.visuals = egui::Visuals::dark();
     let v = &mut style.visuals;

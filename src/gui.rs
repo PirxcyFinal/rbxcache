@@ -7,8 +7,10 @@ use crate::config::{self, IdMap};
 use crate::format::{self, human_size};
 use crate::protection::Protections;
 use crate::resolve;
+use crate::settings::Settings;
 use crate::store::{self, category_name, format_time_ms, Entry, Id, Store};
 use crate::theme::{self, alpha};
+use crate::tray::{Tray, TrayEvent};
 use crate::update::{self, Release};
 use crate::viewers;
 use crate::watch::{self, Change, Tracker, Verdict, Watcher};
@@ -18,21 +20,29 @@ use egui_extras::{Column, TableBuilder};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Arc;
 
 const ROW_HEIGHT: f32 = 24.0;
+/// Side of the window and tray icon, in pixels.
+const ICON_SIZE: u32 = 64;
 /// Seconds a newly written entry keeps its marker in the table.
 const FRESH_SECONDS: f32 = 10.0;
 /// Seconds the detail panel takes to settle after the focused entry changes.
 const PANEL_TIME: f32 = 0.32;
 
 pub fn run(dir: PathBuf, idmap_path: PathBuf) -> Result<()> {
+    let icon = theme::app_icon(ICON_SIZE);
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 860.0]).with_min_inner_size([960.0, 560.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 860.0]).with_min_inner_size([960.0, 560.0]).with_icon(egui::IconData {
+            rgba: icon.clone(),
+            width: ICON_SIZE,
+            height: ICON_SIZE,
+        }),
         ..Default::default()
     };
-    eframe::run_native("Roblox Cache Explorer", options, Box::new(move |cc| Ok(Box::new(App::new(cc, dir, idmap_path))))).map_err(|e| anyhow!("{e}"))
+    eframe::run_native("Roblox Cache Explorer", options, Box::new(move |cc| Ok(Box::new(App::new(cc, dir, idmap_path, icon)))))
+        .map_err(|e| anyhow!("{e}"))
 }
 
 /// Which list the table shows.
@@ -100,6 +110,7 @@ enum Action {
     CheckUpdate,
     OpenUpdate,
     Quit,
+    HideToTray,
 }
 
 struct Preview {
@@ -156,12 +167,31 @@ struct PendingConfig {
     notes: Vec<String>,
 }
 
+/// What applying a config on a worker thread produced.
+struct AppliedConfig {
+    name: String,
+    rules: Vec<config::Rule>,
+    summary: String,
+    /// The entries as they are after being rewritten.
+    rewritten: Vec<Entry>,
+}
+
 /// Progress and result of checking a config on a worker thread.
 enum ConfigMsg {
     /// Asset IDs looked up so far, out of how many.
     Progress(usize, usize),
     /// The checked config and the ID map with what the lookup learned.
     Done(Result<(PendingConfig, IdMap), String>),
+}
+
+/// The full-window loading screen; see [`App::show_splash`].
+struct Splash {
+    /// When it appeared.
+    shown: f64,
+    /// When it started to dissolve, once the work is done.
+    leaving: Option<f64>,
+    caption: String,
+    fraction: Option<f32>,
 }
 
 struct Toast {
@@ -229,11 +259,16 @@ struct App {
     pending_config: Option<PendingConfig>,
     /// A config being checked in the background.
     config_job: Option<Receiver<ConfigMsg>>,
+    /// Asset IDs looked up so far for the config being checked, and how many there are.
+    config_progress: (usize, usize),
+    /// A confirmed config being applied in the background.
+    apply_job: Option<Receiver<Result<AppliedConfig, String>>>,
+    splash: Option<Splash>,
+    /// When the current stretch of work began, for deciding whether it merits a splash.
+    busy_since: Option<f64>,
     confirm_config: bool,
     /// A config that is re-applied to whatever Roblox writes while watching.
     active_config: Option<(String, Vec<config::Rule>)>,
-    /// Follow the cache as Roblox changes it.
-    live: bool,
     /// Changes arriving from the watcher thread, and the flag that stops it.
     watch: Option<(Receiver<Change>, Arc<AtomicBool>)>,
     tracker: Tracker,
@@ -249,8 +284,11 @@ struct App {
     update_check: Option<(Receiver<Result<Release, String>>, bool)>,
     status: String,
 
-    /// Animations on. Off draws every change instantly.
-    motion: bool,
+    settings: Settings,
+    /// The notification-area icon, where the platform has one.
+    tray: Option<Tray>,
+    /// Set once the user has asked to quit, so closing is not turned into hiding.
+    quitting: bool,
     blob: Blob,
     /// When the detail panel last switched entry.
     panel_time: f64,
@@ -262,7 +300,7 @@ struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, dir: PathBuf, idmap_path: PathBuf) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, dir: PathBuf, idmap_path: PathBuf, icon: Vec<u8>) -> Self {
         theme::apply(&cc.egui_ctx);
         let (idmap, idmap_error) = match IdMap::load(&idmap_path) {
             Ok(map) => (map, None),
@@ -270,6 +308,7 @@ impl App {
         };
         // Copies made by "Open" in earlier sessions.
         let _ = std::fs::remove_dir_all(open_dir());
+        let settings = Settings::load();
         let mut app = Self {
             dir,
             idmap_path,
@@ -307,9 +346,12 @@ impl App {
             delete_prompt: String::new(),
             pending_config: None,
             config_job: None,
+            config_progress: (0, 0),
+            apply_job: None,
+            splash: None,
+            busy_since: None,
             confirm_config: false,
             active_config: None,
-            live: true,
             watch: None,
             tracker: Tracker::default(),
             protections: Protections::load_default().ok(),
@@ -318,7 +360,9 @@ impl App {
             show_about: false,
             update: None,
             update_check: None,
-            motion: true,
+            tray: Tray::new(cc, icon, ICON_SIZE),
+            settings,
+            quitting: false,
             blob: Blob::default(),
             panel_time: 0.0,
             toast: None,
@@ -377,7 +421,7 @@ impl App {
                 self.focus = None;
                 self.preview = None;
                 self.reindex();
-                if self.live {
+                if self.settings.watch {
                     self.start_watch(ctx);
                 }
                 if self.status.is_empty() {
@@ -435,7 +479,7 @@ impl App {
     }
 
     fn poll_clear(&mut self, ctx: &egui::Context) {
-        let Some(result) = self.clearing.as_ref().and_then(|rx| rx.try_recv().ok()) else { return };
+        let Some(result) = self.clearing.as_ref().and_then(finished) else { return };
         self.clearing = None;
         match result {
             Ok(steps) => {
@@ -452,8 +496,45 @@ impl App {
         }
         // Whatever is in the cache now is read again; after a clear that is nothing
         // until Roblox starts and writes a new index, which the watcher waits for.
-        if self.live {
+        if self.settings.watch {
             self.start_watch(ctx);
+        }
+    }
+
+    /// Hides the window in the tray. A sound would go on playing with no way to stop it, so it is stopped.
+    fn hide_to_tray(&mut self) {
+        let Some(tray) = &mut self.tray else { return };
+        tray.hide();
+        if let Some(audio) = &mut self.audio {
+            audio.stop();
+        }
+    }
+
+    /// Acts on the tray icon, and decides what closing the window does.
+    fn handle_close(&mut self, ctx: &egui::Context) {
+        let mut quit = false;
+        if let Some(tray) = &mut self.tray {
+            while let Some(event) = tray.poll() {
+                match event {
+                    TrayEvent::Show => tray.show(),
+                    TrayEvent::Quit => quit = true,
+                }
+            }
+        }
+        if quit {
+            self.quitting = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+        if self.apply_job.is_some() {
+            // Leaving now could stop between writing a blob and its index row; `poll_apply` closes afterwards.
+            self.quitting = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        } else if self.tray.is_some() && self.settings.close_to_tray && !self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide_to_tray();
         }
     }
 
@@ -711,11 +792,10 @@ impl App {
     }
 
     fn run_action(&mut self, action: Action, ctx: &egui::Context) {
-        // While the cache is being read the list is stale, so nothing may act on it.
+        // While the cache is being read, cleared or rewritten by a config, nothing may act on the list.
         let harmless =
             matches!(action, Action::About | Action::Quit | Action::OpenFolder | Action::ShowTab(_) | Action::CheckUpdate | Action::OpenUpdate);
-        // While the cache is being read or cleared the list is stale, so nothing may act on it.
-        if (self.loading.is_some() || self.clearing.is_some()) && !harmless {
+        if self.busy().is_some() && !harmless {
             return;
         }
         let result = match action {
@@ -785,7 +865,12 @@ impl App {
                 Ok(String::new())
             }
             Action::Quit => {
+                self.quitting = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                Ok(String::new())
+            }
+            Action::HideToTray => {
+                self.hide_to_tray();
                 Ok(String::new())
             }
             Action::Export => self.export_one(),
@@ -807,7 +892,7 @@ impl App {
                 None => Ok(String::new()),
             },
             Action::ApplyConfig => self.check_config(ctx),
-            Action::ConfirmConfig => self.apply_config(),
+            Action::ConfirmConfig => self.apply_config(ctx),
             Action::Tag => self.tag_focused(),
             Action::PlayAudio => self.play_audio(),
             Action::ExportConverted => self.export_converted(),
@@ -982,16 +1067,22 @@ impl App {
             ctx.request_repaint();
         });
         self.config_job = Some(rx);
-        self.status = "Checking the config...".to_string();
+        self.config_progress = (0, 0);
         Ok(String::new())
     }
 
     fn poll_config(&mut self, ctx: &egui::Context) {
         let Some(rx) = &self.config_job else { return };
         let mut finished = None;
+        if let Err(TryRecvError::Disconnected) = rx.try_recv().map(|msg| match msg {
+            ConfigMsg::Progress(done, total) => self.config_progress = (done, total),
+            ConfigMsg::Done(result) => finished = Some(result),
+        }) {
+            finished = Some(Err("checking the config stopped unexpectedly".to_string()));
+        }
         for msg in rx.try_iter() {
             match msg {
-                ConfigMsg::Progress(done, total) => self.status = format!("Looking up asset IDs... {done} / {total}"),
+                ConfigMsg::Progress(done, total) => self.config_progress = (done, total),
                 ConfigMsg::Done(result) => finished = Some(result),
             }
         }
@@ -1018,22 +1109,55 @@ impl App {
         }
     }
 
-    fn apply_config(&mut self) -> Result<String> {
+    /// Applies the confirmed config on a worker thread. Matching rules to
+    /// entries hashes their content and `cdn` rules download files, which is
+    /// too slow to do while drawing.
+    fn apply_config(&mut self, ctx: &egui::Context) -> Result<String> {
         let Some(pending) = self.pending_config.take() else { return Ok(String::new()) };
-        let store = Store::open(&self.dir, true)?;
-        let reports = config::run(&store, &self.entries, &self.idmap, &pending.rules, true, None);
-        let summary = config::summarize(&reports, true);
-        let rewritten: Vec<Entry> = reports.into_iter().flat_map(|r| r.written).collect();
-        for entry in &rewritten {
-            self.tracker.record(entry);
+        // The watcher would take the worker's writes for Roblox's, and an earlier
+        // config would be re-applied on top of them; both wait until this is done.
+        self.stop_watch();
+        self.active_config = None;
+        let (tx, rx) = channel();
+        let (dir, entries, idmap, ctx) = (self.dir.clone(), self.entries.clone(), self.idmap.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = Store::open(&dir, true).map(|store| {
+                let reports = config::run(&store, &entries, &idmap, &pending.rules, true, None);
+                let summary = config::summarize(&reports, true);
+                let name = pending.path.file_stem().map_or_else(|| "config".to_string(), |n| n.to_string_lossy().into_owned());
+                AppliedConfig { name, rules: pending.rules, summary, rewritten: reports.into_iter().flat_map(|r| r.written).collect() }
+            });
+            let _ = tx.send(result.map_err(|e| format!("{e:#}")));
+            ctx.request_repaint();
+        });
+        self.apply_job = Some(rx);
+        Ok(String::new())
+    }
+
+    fn poll_apply(&mut self, ctx: &egui::Context) {
+        let Some(result) = self.apply_job.as_ref().and_then(finished) else { return };
+        self.apply_job = None;
+        match result {
+            Ok(applied) => {
+                for entry in &applied.rewritten {
+                    self.tracker.record(entry);
+                }
+                watch::merge(&mut self.entries, &Change { written: applied.rewritten, ..Default::default() });
+                self.preview = None;
+                self.reindex();
+                // From here on the config follows the cache: whatever Roblox writes is checked against it.
+                self.active_config = Some((applied.name, applied.rules));
+                self.notify(ctx, applied.summary, false);
+            }
+            Err(e) => self.notify(ctx, e, true),
         }
-        watch::merge(&mut self.entries, &Change { written: rewritten, ..Default::default() });
-        self.preview = None;
-        self.reindex();
-        // From here on the config follows the cache: whatever Roblox writes is checked against it.
-        let name = pending.path.file_stem().map_or_else(|| "config".to_string(), |n| n.to_string_lossy().into_owned());
-        self.active_config = Some((name, pending.rules));
-        Ok(summary)
+        if self.settings.watch {
+            self.start_watch(ctx);
+        }
+        // A quit asked for while the cache was being written was held back until now.
+        if self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 
     fn play_audio(&mut self) -> Result<String> {
@@ -1083,7 +1207,10 @@ impl App {
                 item(ui, actions, true, "Apply config...", "Ctrl+O", Action::ApplyConfig);
                 item(ui, actions, self.active_config.is_some(), "Stop re-applying config", "", Action::StopConfig);
                 ui.separator();
-                item(ui, actions, true, "Quit", "Alt+F4", Action::Quit);
+                if self.tray.is_some() {
+                    item(ui, actions, true, "Hide to tray", "", Action::HideToTray);
+                }
+                item(ui, actions, true, "Quit", "", Action::Quit);
             });
             ui.menu_button("Entry", |ui| {
                 ui.set_min_width(230.0);
@@ -1094,12 +1221,20 @@ impl App {
                 if ui.checkbox(&mut self.show_redirects, "Show redirect records").changed() {
                     self.rebuild_view();
                 }
-                ui.checkbox(&mut self.motion, "Animations");
-                if ui.checkbox(&mut self.live, "Watch cache live").changed() {
-                    match self.live {
+                let mut changed = ui.checkbox(&mut self.settings.animations, "Animations").changed();
+                if ui.checkbox(&mut self.settings.watch, "Watch cache live").changed() {
+                    changed = true;
+                    match self.settings.watch {
                         true => self.start_watch(ui.ctx()),
                         false => self.stop_watch(),
                     }
+                }
+                if self.tray.is_some() {
+                    let hint = "Closing the window keeps rbxcache running in the notification area";
+                    changed |= ui.checkbox(&mut self.settings.close_to_tray, "Close to tray").on_hover_text(hint).changed();
+                }
+                if changed {
+                    self.settings.save();
                 }
                 ui.separator();
                 ui.menu_button("Sort by", |ui| {
@@ -1220,7 +1355,7 @@ impl App {
 
         // Each newly focused entry fades in while sliding up into place.
         let now = ui.input(|i| i.time);
-        let t = if self.motion { theme::ease_out(((now - self.panel_time) as f32) / PANEL_TIME) } else { 1.0 };
+        let t = if self.settings.animations { theme::ease_out(((now - self.panel_time) as f32) / PANEL_TIME) } else { 1.0 };
         if t < 1.0 {
             ui.ctx().request_repaint();
         }
@@ -1279,7 +1414,7 @@ impl App {
             });
             ui.separator();
         }
-        let (motion, audio) = (self.motion, &mut self.audio);
+        let (motion, audio) = (self.settings.animations, &mut self.audio);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(slide);
             if let Some(error) = &preview.error {
@@ -1494,7 +1629,7 @@ impl App {
         let blob = &mut self.blob;
         if blob.id != self.focus {
             blob.id = self.focus;
-            blob.moving = self.motion && blob.visible;
+            blob.moving = self.settings.animations && blob.visible;
         }
         if blob.moving {
             let dt = ctx.input(|i| i.stable_dt).min(0.05);
@@ -1543,7 +1678,7 @@ impl App {
             }
             // A dot that pulses while waiting.
             let (dot, _) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::hover());
-            let pulse = if self.motion { (ui.input(|i| i.time) * 2.2).sin() as f32 * 0.5 + 0.5 } else { 1.0 };
+            let pulse = if self.settings.animations { (ui.input(|i| i.time) * 2.2).sin() as f32 * 0.5 + 0.5 } else { 1.0 };
             ui.painter().circle_filled(dot.center(), 4.0 + 2.0 * pulse, alpha(theme::OK, 0.45 + 0.55 * pulse));
             ui.add_space(4.0);
             ui.label(egui::RichText::new("Waiting for Roblox").size(20.0));
@@ -1553,44 +1688,145 @@ impl App {
                 "Roblox is not running. Assets appear here as it downloads them."
             };
             ui.label(egui::RichText::new(state).color(theme::MUTED));
-            if self.motion {
+            if self.settings.animations {
                 ui.ctx().request_repaint();
             }
         });
     }
 
-    fn loading_card(&self, ui: &mut egui::Ui) {
-        let (done, total) = self.progress;
-        let fraction = if total > 0 { done as f32 / total as f32 } else { 0.0 };
-        let shown = ui.ctx().animate_value_with_time(egui::Id::new("load_progress"), fraction, 0.25);
-        ui.add_space(ui.available_height() * 0.36);
-        ui.vertical_centered(|ui| {
-            ui.label(egui::RichText::new("Reading the Roblox cache").size(20.0));
-            ui.add_space(2.0);
-            let detail = if total > 0 { format!("Scanning files  {done} / {total}") } else { "Opening the index...".to_string() };
-            ui.label(egui::RichText::new(detail).color(theme::MUTED));
-            ui.add_space(12.0);
-            let (track, _) = ui.allocate_exact_size(Vec2::new(360.0, 8.0), egui::Sense::hover());
-            let radius = CornerRadius::same(4);
-            let painter = ui.painter();
-            painter.rect_filled(track, radius, theme::RAISED);
-            let fill = Rect::from_min_size(track.min, Vec2::new(track.width() * shown.max(0.03), track.height()));
-            painter.rect_filled(fill, radius, theme::ACCENT);
-            if self.motion {
-                // A soft highlight sweeping along the filled part.
-                let phase = (ui.input(|i| i.time) * 0.9).fract() as f32;
-                let x = track.left() - 80.0 + phase * (track.width() + 160.0);
-                let sheen = Rect::from_min_size(egui::pos2(x, track.top()), Vec2::new(80.0, track.height()));
-                painter.with_clip_rect(fill).rect_filled(sheen, radius, Color32::from_white_alpha(70));
+    /// What the app is busy with, if anything: a caption and, when it can be
+    /// measured, how far along it is.
+    fn busy(&self) -> Option<(String, Option<f32>)> {
+        let fraction = |(done, total): (usize, usize)| (total > 0).then(|| done as f32 / total as f32);
+        if self.clearing.is_some() {
+            Some(("Clearing the cache".to_string(), None))
+        } else if self.loading.is_some() {
+            let (done, total) = self.progress;
+            let caption = if total > 0 { format!("Scanning files  {done} / {total}") } else { "Opening the index".to_string() };
+            Some((caption, fraction(self.progress)))
+        } else if self.apply_job.is_some() {
+            Some(("Applying the config".to_string(), None))
+        } else if self.config_job.is_some() {
+            let (done, total) = self.config_progress;
+            let caption = if total > 0 { format!("Looking up asset IDs  {done} / {total}") } else { "Checking the config".to_string() };
+            Some((caption, fraction(self.config_progress)))
+        } else {
+            None
+        }
+    }
+
+    /// The full-window splash shown while the app is busy: the "pirxcy" wordmark
+    /// bounces in, holds, and dissolves once the work is done.
+    fn show_splash(&mut self, ctx: &egui::Context) {
+        /// Seconds the wordmark takes to bounce in, stays at least, and takes to dissolve.
+        const BOUNCE: f32 = 0.9;
+        const HOLD: f32 = 0.28;
+        const DISSOLVE: f32 = 0.62;
+        /// Work shorter than this passes without a splash, except the first load.
+        const PATIENCE: f64 = 0.15;
+        use theme::{LIME, SPLASH_BG as BACKGROUND, SPLASH_INK as INK, SPLASH_MUTED as MUTED};
+
+        let now = ctx.input(|i| i.time);
+        let busy = self.busy();
+        match (&mut self.splash, &busy) {
+            (None, Some(_)) => {
+                let since = *self.busy_since.get_or_insert(now);
+                if now - since >= PATIENCE || self.entries.is_empty() {
+                    self.splash = Some(Splash { shown: now, leaving: None, caption: String::new(), fraction: None });
+                } else {
+                    ctx.request_repaint();
+                }
             }
+            // Let the entrance finish before leaving, however quick the work was.
+            (Some(splash), None) if splash.leaving.is_none() => {
+                let earliest = splash.shown + if self.settings.animations { (BOUNCE + HOLD) as f64 } else { 0.0 };
+                splash.leaving = Some(now.max(earliest));
+            }
+            // More work arrived while dissolving: stay.
+            (Some(splash), Some(_)) => splash.leaving = None,
+            _ => {}
+        }
+        if busy.is_none() {
+            self.busy_since = None;
+        }
+        let Some(splash) = &mut self.splash else { return };
+        if let Some((caption, fraction)) = busy {
+            (splash.caption, splash.fraction) = (caption, fraction);
+        }
+        let leaving = splash.leaving.map_or(0.0, |at| ((now - at) as f32 / if self.settings.animations { DISSOLVE } else { 0.001 }).clamp(0.0, 1.0));
+        if leaving >= 1.0 {
+            self.splash = None;
+            return;
+        }
+
+        // The entrance: up from below, past its place, a small settle back.
+        let entered = if self.settings.animations { ((now - splash.shown) as f32 / BOUNCE).clamp(0.0, 1.0) } else { 1.0 };
+        let between = |from: f32, to: f32, start: f32, end: f32| from + (to - from) * theme::ease_out((entered - start) / (end - start));
+        let (rise, scale) = match entered {
+            t if t < 0.55 => (between(22.0, -10.0, 0.0, 0.55), between(0.94, 1.02, 0.0, 0.55)),
+            t if t < 0.78 => (between(-10.0, 4.0, 0.55, 0.78), between(1.02, 0.995, 0.55, 0.78)),
+            _ => (between(4.0, 0.0, 0.78, 1.0), between(0.995, 1.0, 0.78, 1.0)),
+        };
+        let opacity = (entered / 0.55).min(1.0) * (1.0 - leaving);
+        let scale = scale * (1.0 + 0.04 * leaving);
+
+        let (caption, fraction, motion) = (splash.caption.clone(), splash.fraction, self.settings.animations);
+        let shown = ctx.animate_value_with_time(egui::Id::new("splash_progress"), fraction.unwrap_or(0.0), 0.25);
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("splash")).order(egui::Order::Foreground).fixed_pos(screen.min).show(ctx, |ui| {
+            // Takes the clicks while there is work going on; once dissolving, the app is usable again.
+            if leaving == 0.0 {
+                ui.allocate_rect(screen, egui::Sense::click_and_drag());
+            }
+            let painter = ui.painter();
+            painter.rect_filled(screen, CornerRadius::ZERO, alpha(BACKGROUND, 1.0 - leaving));
+
+            let size = (screen.width() * 0.12).clamp(52.0, 120.0) * scale;
+            let mut job = egui::text::LayoutJob::default();
+            let format = egui::TextFormat {
+                font_id: egui::FontId::new(size, theme::wordmark_font()),
+                color: INK,
+                extra_letter_spacing: -0.07 * size,
+                ..Default::default()
+            };
+            job.append("pirxcy", 0.0, format);
+            let galley = ui.fonts(|f| f.layout_job(job));
+            let at = screen.center() - galley.size() / 2.0 + Vec2::new(0.0, rise - 18.0);
+            // Dissolving, the word spreads into soft copies of itself, which reads as a blur.
+            if leaving > 0.0 {
+                let spread = 10.0 * leaving;
+                for step in 0..8 {
+                    let angle = step as f32 * std::f32::consts::TAU / 8.0;
+                    let offset = Vec2::new(angle.cos(), angle.sin()) * spread;
+                    painter.galley_with_override_text_color(at + offset, galley.clone(), alpha(INK, opacity * 0.12));
+                }
+            }
+            painter.galley_with_override_text_color(at, galley.clone(), alpha(INK, opacity * (1.0 - leaving * 0.6)));
+
+            // Below the word: what is happening, and a thin line for how far along it is.
+            let below = at.y + galley.size().y + 14.0;
+            let font = egui::FontId::proportional(13.0);
+            painter.text(egui::pos2(screen.center().x, below), egui::Align2::CENTER_TOP, &caption, font, alpha(MUTED, opacity));
+            let track = Rect::from_center_size(egui::pos2(screen.center().x, below + 30.0), Vec2::new(220.0, 2.0));
+            painter.rect_filled(track, CornerRadius::same(1), alpha(Color32::WHITE, 0.08 * opacity));
+            let filled = match fraction {
+                Some(_) => Rect::from_min_size(track.min, Vec2::new(track.width() * shown.clamp(0.0, 1.0), track.height())),
+                // Work that cannot be measured gets a short bar sweeping across.
+                None => {
+                    let phase = if motion { (now * 0.9).fract() as f32 } else { 0.4 };
+                    let left = track.left() + (track.width() + 60.0) * phase - 60.0;
+                    Rect::from_min_size(egui::pos2(left, track.top()), Vec2::new(60.0, track.height())).intersect(track)
+                }
+            };
+            painter.rect_filled(filled, CornerRadius::same(1), alpha(LIME, opacity));
         });
-        ui.ctx().request_repaint();
+        ctx.request_repaint();
     }
 
     /// A centred dialog that fades and slides in over a dimmed window. Returns
     /// true when the user dismissed it (Escape or a click outside).
     fn modal(&self, ctx: &egui::Context, name: &str, open: bool, add: impl FnOnce(&mut egui::Ui)) -> bool {
-        let time = if self.motion { 0.22 } else { 0.0 };
+        let time = if self.settings.animations { 0.22 } else { 0.0 };
         let t = ctx.animate_bool_with_time_and_easing(egui::Id::new(name).with("t"), open, time, egui::emath::easing::cubic_out);
         if t <= 0.0 {
             return false;
@@ -1764,7 +2000,7 @@ impl App {
             return;
         }
         // `travel` is how far from rest the toast still is; `speed` drives the trail.
-        let (opacity, travel, speed) = if !self.motion {
+        let (opacity, travel, speed) = if !self.settings.animations {
             (1.0, 0.0, 0.0)
         } else if age < IN {
             let k = age / IN;
@@ -1829,7 +2065,7 @@ impl App {
             if i.key_pressed(Key::F1) {
                 actions.push(Action::About);
             }
-            if typing || self.loading.is_some() {
+            if typing || self.busy().is_some() {
                 return;
             }
             if i.key_pressed(Key::Space) {
@@ -1888,11 +2124,17 @@ fn entry_items(ui: &mut egui::Ui, actions: &mut Vec<Action>, one: bool, any: boo
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_close(ctx);
         self.poll_load(ctx);
         self.poll_watch(ctx);
         self.poll_update(ctx);
         self.poll_config(ctx);
+        self.poll_apply(ctx);
         self.poll_clear(ctx);
+        // In the tray the cache is still followed, but there is nothing to draw.
+        if self.tray.as_ref().is_some_and(Tray::hidden) {
+            return;
+        }
         let now = ctx.input(|i| i.time);
         self.fresh.retain(|_, at| ((now - *at) as f32) < FRESH_SECONDS);
         if !self.fresh.is_empty() {
@@ -1943,14 +2185,8 @@ impl eframe::App for App {
                         actions.push(Action::Reload);
                     }
                 });
-            } else if self.clearing.is_some() {
-                ui.add_space(ui.available_height() * 0.4);
-                ui.vertical_centered(|ui| {
-                    ui.spinner();
-                    ui.label(egui::RichText::new("Clearing the cache").size(20.0));
-                });
-            } else if self.loading.is_some() {
-                self.loading_card(ui);
+            } else if self.loading.is_some() || self.clearing.is_some() {
+                // The splash covers the window while this goes on.
             } else if self.tab == Tab::Live && self.arrivals.is_empty() {
                 self.live_placeholder(ui);
             } else {
@@ -1962,12 +2198,23 @@ impl eframe::App for App {
         self.config_dialog(ctx, &mut actions);
         self.about_dialog(ctx);
         self.show_toast(ctx);
+        self.show_splash(ctx);
 
         for action in actions {
             self.run_action(action, ctx);
             // Actions run after this frame was laid out, so draw another to show the result.
             ctx.request_repaint();
         }
+    }
+}
+
+/// The answer of a worker thread once it has one. A worker that ended without
+/// answering (it panicked) counts as having failed, so nothing waits on it for ever.
+fn finished<T>(rx: &Receiver<Result<T, String>>) -> Option<Result<T, String>> {
+    match rx.try_recv() {
+        Ok(result) => Some(result),
+        Err(TryRecvError::Empty) => None,
+        Err(TryRecvError::Disconnected) => Some(Err("the work stopped unexpectedly".to_string())),
     }
 }
 
