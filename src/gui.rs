@@ -1,10 +1,15 @@
-//! The window: entry table, detail panel with previews, menus and dialogs.
+//! The window: sidebar, entry table, detail panel with previews, the Configs,
+//! Packs and Info pages, menus and dialogs.
 
 use crate::anim::Animation;
 use crate::audio::{self, Audio};
+use crate::changelog::{self, Version};
 use crate::cli::{describe, export_name, matches};
 use crate::config::{self, IdMap};
 use crate::format::{self, human_size};
+use crate::instance::{self, Claim};
+use crate::originals::Originals;
+use crate::packs::{self, Catalog};
 use crate::protection::Protections;
 use crate::resolve;
 use crate::settings::{SavedConfig, Settings};
@@ -18,6 +23,7 @@ use anyhow::{anyhow, Context, Result};
 use eframe::egui::{self, Color32, CornerRadius, Margin, Rect, Shape, Stroke, Vec2};
 use egui_extras::{Column, TableBuilder};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
@@ -30,8 +36,38 @@ const ICON_SIZE: u32 = 64;
 const FRESH_SECONDS: f32 = 10.0;
 /// Seconds the detail panel takes to settle after the focused entry changes.
 const PANEL_TIME: f32 = 0.32;
+/// Width of the sidebar and height of one of its rows.
+const NAV_WIDTH: f32 = 184.0;
+const NAV_ROW: f32 = 48.0;
+/// Widest a page (Configs, Packs, Info) lays its content out.
+const PAGE_WIDTH: f32 = 820.0;
 
-pub fn run(dir: PathBuf, idmap_path: PathBuf) -> Result<()> {
+/// Content types that share a tab in the sidebar. A group is listed only
+/// while the cache holds some of it; anything in no group goes under Other.
+const GROUPS: [(&str, &[&str]); 8] = [
+    ("Images", &["png", "jpeg", "gif", "webp"]),
+    ("Textures", &["ktx2", "ktx"]),
+    ("Meshes", &["mesh"]),
+    ("Models", &["rbxm", "rbxmx"]),
+    ("Sounds", &["ogg", "mp3", "wav"]),
+    ("Fonts", &["ttf", "otf"]),
+    ("Video", &["webm", "mp4"]),
+    ("Text", &["json", "text", "asset-map"]),
+];
+
+/// Opens the window. `tab` names the tab to start on; see [`Tab::named`].
+pub fn run(dir: PathBuf, idmap_path: PathBuf, tab: Option<&str>) -> Result<()> {
+    let tab = match tab {
+        Some(name) => Tab::named(name)
+            .with_context(|| format!("there is no tab '{name}'; try all, live, configs, packs, guide, info or a kind such as textures"))?,
+        None => Tab::All,
+    };
+    // A second copy would fight the first over the cache; it asks the first to come forward and leaves.
+    let listener = match instance::claim() {
+        Claim::First(listener) => Some(listener),
+        Claim::Second => return Ok(()),
+        Claim::Unknown => None,
+    };
     let icon = theme::app_icon(ICON_SIZE);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 860.0]).with_min_inner_size([960.0, 560.0]).with_icon(egui::IconData {
@@ -41,17 +77,57 @@ pub fn run(dir: PathBuf, idmap_path: PathBuf) -> Result<()> {
         }),
         ..Default::default()
     };
-    eframe::run_native("Roblox Cache Explorer", options, Box::new(move |cc| Ok(Box::new(App::new(cc, dir, idmap_path, icon)))))
+    eframe::run_native("Roblox Cache Explorer", options, Box::new(move |cc| Ok(Box::new(App::new(cc, dir, idmap_path, icon, tab, listener)))))
         .map_err(|e| anyhow!("{e}"))
 }
 
-/// Which list the table shows.
-#[derive(Clone, Copy, PartialEq)]
+/// What the window shows: one of the entry lists, or a page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Tab {
     /// Everything in the cache.
     All,
     /// Only what Roblox has written since the window opened or the list was cleared.
     Live,
+    /// The entries of one of [`GROUPS`].
+    Group(usize),
+    /// The entries that belong to no group.
+    Other,
+    Configs,
+    Packs,
+    Guide,
+    Info,
+}
+
+impl Tab {
+    /// The tab a name given on the command line stands for.
+    fn named(name: &str) -> Option<Self> {
+        let name = name.trim().to_ascii_lowercase();
+        let group = GROUPS.iter().position(|(group, _)| group.eq_ignore_ascii_case(&name)).map(Tab::Group);
+        group.or(match name.as_str() {
+            "all" => Some(Tab::All),
+            "live" => Some(Tab::Live),
+            "other" => Some(Tab::Other),
+            "configs" => Some(Tab::Configs),
+            "packs" => Some(Tab::Packs),
+            "guide" => Some(Tab::Guide),
+            "info" => Some(Tab::Info),
+            _ => None,
+        })
+    }
+
+    /// True for the tabs that show a list of cache entries.
+    fn lists(self) -> bool {
+        !matches!(self, Tab::Configs | Tab::Packs | Tab::Guide | Tab::Info)
+    }
+
+    /// Whether an entry of this content type belongs on the tab.
+    fn holds(self, kind: &str) -> bool {
+        match self {
+            Tab::Group(i) => GROUPS[i].1.contains(&kind),
+            Tab::Other => kind != "redirect" && !GROUPS.iter().any(|(_, kinds)| kinds.contains(&kind)),
+            _ => true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -80,7 +156,7 @@ enum LoadMsg {
     Done(Result<Vec<Entry>, String>),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Action {
     Reload,
     OpenFolder,
@@ -95,7 +171,12 @@ enum Action {
     AddConfigs,
     ReapplyConfigs,
     ConfirmConfigs,
+    CancelConfigs,
     ToggleConfig(usize),
+    /// Switches one rule of a config on or off: the config, then the rule.
+    ToggleRule(usize, usize),
+    /// Gives these targets to one of the configs that set them.
+    Choose(Vec<String>, usize),
     RemoveConfig(usize),
     RemoveAllConfigs,
     Tag,
@@ -109,7 +190,8 @@ enum Action {
     PlayAudio,
     ForcePreview,
     ExportConverted,
-    About,
+    RefreshPacks,
+    ApplyPack(usize),
     CheckUpdate,
     OpenUpdate,
     Quit,
@@ -176,8 +258,90 @@ struct LoadedConfig {
     path: PathBuf,
     rules: Vec<config::Rule>,
     enabled: bool,
+    /// The rules that are switched off, by [`rule_keys`].
+    off: BTreeSet<String>,
     /// Why the file could not be read when it was last tried; its rules are empty then.
     error: Option<String>,
+}
+
+/// What each rule of a config is remembered by: its name, numbered from the
+/// second on when several rules share one.
+fn rule_keys(rules: &[config::Rule]) -> Vec<String> {
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    rules
+        .iter()
+        .map(|rule| {
+            let n = seen.entry(rule.name.as_str()).or_insert(0);
+            *n += 1;
+            if *n == 1 {
+                rule.name.clone()
+            } else {
+                format!("{} #{n}", rule.name)
+            }
+        })
+        .collect()
+}
+
+/// A target that more than one enabled config sets.
+struct Conflict {
+    target: String,
+    /// The configs that set it, by index, each with the rule that does.
+    sides: Vec<(usize, String)>,
+}
+
+impl Conflict {
+    /// The config that has the target: the one the user chose if it is still
+    /// among the sides, otherwise the lowest in the list.
+    fn winner(&self, configs: &[LoadedConfig], winners: &BTreeMap<String, PathBuf>) -> usize {
+        let chosen = winners.get(&self.target).and_then(|path| self.sides.iter().find(|(config, _)| configs[*config].path == *path));
+        chosen.or(self.sides.last()).map_or(0, |(config, _)| *config)
+    }
+}
+
+/// The rules of a config that are switched on, each with its index.
+fn active_rules(config: &LoadedConfig) -> impl Iterator<Item = (usize, &config::Rule)> {
+    let keys = rule_keys(&config.rules);
+    config.rules.iter().enumerate().filter(move |(i, _)| config.enabled && !config.off.contains(&keys[*i]))
+}
+
+/// Every target set by rules of more than one enabled config.
+fn conflicts(configs: &[LoadedConfig]) -> Vec<Conflict> {
+    let mut by_target: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
+    for (index, config) in configs.iter().enumerate() {
+        for (_, rule) in active_rules(config) {
+            for target in &rule.targets {
+                let sides = by_target.entry(target.to_string()).or_default();
+                if sides.last().is_none_or(|(config, _)| *config != index) {
+                    sides.push((index, rule.name.clone()));
+                }
+            }
+        }
+    }
+    by_target.into_iter().filter(|(_, sides)| sides.len() > 1).map(|(target, sides)| Conflict { target, sides }).collect()
+}
+
+/// The rules in force: those of the enabled configs that are switched on,
+/// less the targets that were given to another config.
+fn rules_in_force(configs: &[LoadedConfig], winners: &BTreeMap<String, PathBuf>) -> Vec<config::Rule> {
+    let mut lost: HashSet<(usize, String)> = HashSet::new();
+    for conflict in conflicts(configs) {
+        let winner = conflict.winner(configs, winners);
+        lost.extend(conflict.sides.iter().filter(|(config, _)| *config != winner).map(|(config, _)| (*config, conflict.target.clone())));
+    }
+    let kept: Vec<(&str, Vec<config::Rule>)> = configs
+        .iter()
+        .enumerate()
+        .filter(|(_, config)| config.enabled)
+        .map(|(index, config)| {
+            let rules = active_rules(config).map(|(_, rule)| {
+                let mut rule = rule.clone();
+                rule.targets.retain(|target| !lost.contains(&(index, target.to_string())));
+                rule
+            });
+            (config.name.as_str(), rules.filter(|rule| !rule.targets.is_empty()).collect())
+        })
+        .collect();
+    config::combine(kept.iter().map(|(name, rules)| (*name, rules.as_slice())))
 }
 
 /// The rules of `configs` as one list; see [`config::combine`].
@@ -185,12 +349,15 @@ fn combined<'a>(configs: impl IntoIterator<Item = &'a LoadedConfig>) -> Vec<conf
     config::combine(configs.into_iter().map(|c| (c.name.as_str(), c.rules.as_slice())))
 }
 
-/// What applying configs on a worker thread produced.
-struct AppliedConfigs {
-    configs: Vec<LoadedConfig>,
+/// Where a pack's config was saved, and what that file held before.
+type SavedPack = (PathBuf, Option<Vec<u8>>);
+
+/// What bringing the cache in line with the configs produced.
+struct Synced {
     summary: String,
-    /// The entries as they are after being rewritten.
+    /// The entries as they are after being replaced, and after being put back.
     rewritten: Vec<Entry>,
+    restored: Vec<Entry>,
 }
 
 /// Progress and result of checking a config on a worker thread.
@@ -244,6 +411,9 @@ struct App {
     view_bytes: u64,
     kinds: Vec<(&'static str, usize)>,
     categories: Vec<(i64, usize)>,
+    /// How many entries each of [`GROUPS`] has, and how many belong to none.
+    group_counts: [usize; GROUPS.len()],
+    other_count: usize,
 
     loading: Option<Receiver<LoadMsg>>,
     progress: (usize, usize),
@@ -259,7 +429,15 @@ struct App {
     sort: SortKey,
     ascending: bool,
     tab: Tab,
-    /// The sort order of the tab that is not showing, restored when switching back.
+    /// The tab each half of the sidebar last showed, to go back to.
+    last_browse: Tab,
+    last_manage: Tab,
+    /// When the tab was last switched, for its entrance.
+    tab_time: f64,
+    /// When each sidebar row and chip first appeared, and where the sidebar's highlight is now.
+    nav_seen: HashMap<&'static str, f64>,
+    nav_y: Option<f32>,
+    /// The Live list keeps its own sort order; this is the order of whichever side is not showing.
     other_sort: (SortKey, bool),
     /// Entries Roblox wrote while watching, oldest first.
     arrivals: Vec<Id>,
@@ -279,7 +457,14 @@ struct App {
     /// Asset IDs looked up so far for the config being checked, and how many there are.
     config_progress: (usize, usize),
     /// A confirmed config being applied in the background.
-    apply_job: Option<Receiver<Result<AppliedConfigs, String>>>,
+    apply_job: Option<Receiver<Result<Synced, String>>>,
+    /// Entries Roblox has written that the configs have not been put on yet, and the worker doing so.
+    reapply_targets: HashSet<Id>,
+    reapply_job: Option<Receiver<Result<Vec<Entry>, String>>>,
+    /// Set when the configs, their rules or the choices between them changed, so the cache has to follow.
+    sync_wanted: bool,
+    /// True while the work going on was started by a switch on the Configs page, which should not take over the window.
+    quiet: bool,
     splash: Option<Splash>,
     /// When the current stretch of work began, for deciding whether it merits a splash.
     busy_since: Option<f64>,
@@ -294,7 +479,23 @@ struct App {
     fresh: HashMap<Id, f64>,
     /// The entry "Replace with source" copies from.
     source: Option<Id>,
-    show_about: bool,
+    /// The known packs: the list built in, until the one on GitHub arrives.
+    catalog: Catalog,
+    /// The list being fetched, whether one has ever arrived, and why the last attempt failed.
+    catalog_job: Option<Receiver<Result<Catalog, String>>>,
+    catalog_fetched: bool,
+    catalog_note: Option<String>,
+    /// A pack whose config is being downloaded, and its name. The answer is
+    /// where the config was saved and what that file held before.
+    pack_job: Option<(Receiver<Result<SavedPack, String>>, String)>,
+    /// The same, for a pack that is waiting to be confirmed: cancelling puts the file back.
+    pack_undo: Option<SavedPack>,
+    /// What changed in this version and the ones before it.
+    changelog: Vec<Version>,
+    /// Whether the changes since the version last used are waiting to be shown.
+    show_news: bool,
+    /// Later copies of the app asking this one to come forward.
+    summons: Option<Receiver<()>>,
     /// A newer release, once a check has found one.
     update: Option<Release>,
     /// The answer of a check in progress, and whether the user asked for it.
@@ -317,7 +518,7 @@ struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, dir: PathBuf, idmap_path: PathBuf, icon: Vec<u8>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, dir: PathBuf, idmap_path: PathBuf, icon: Vec<u8>, tab: Tab, listener: Option<TcpListener>) -> Self {
         theme::apply(&cc.egui_ctx);
         let (idmap, idmap_error) = match IdMap::load(&idmap_path) {
             Ok(map) => (map, None),
@@ -339,6 +540,8 @@ impl App {
             view_bytes: 0,
             kinds: Vec::new(),
             categories: Vec::new(),
+            group_counts: [0; GROUPS.len()],
+            other_count: 0,
             loading: None,
             progress: (0, 0),
             load_error: None,
@@ -351,6 +554,11 @@ impl App {
             sort: SortKey::Size,
             ascending: false,
             tab: Tab::All,
+            last_browse: Tab::All,
+            last_manage: Tab::Configs,
+            tab_time: 0.0,
+            nav_seen: HashMap::new(),
+            nav_y: None,
             other_sort: (SortKey::Arrival, false),
             arrivals: Vec::new(),
             selected: BTreeSet::new(),
@@ -365,6 +573,10 @@ impl App {
             config_job: None,
             config_progress: (0, 0),
             apply_job: None,
+            sync_wanted: false,
+            reapply_targets: HashSet::new(),
+            reapply_job: None,
+            quiet: false,
             splash: None,
             busy_since: None,
             confirm_configs: false,
@@ -374,7 +586,15 @@ impl App {
             protections: Protections::load_default().ok(),
             fresh: HashMap::new(),
             source: None,
-            show_about: false,
+            catalog: packs::bundled(),
+            catalog_job: None,
+            catalog_fetched: false,
+            catalog_note: None,
+            pack_job: None,
+            pack_undo: None,
+            changelog: changelog::bundled(),
+            show_news: settings.seen_version != update::CURRENT,
+            summons: None,
             update: None,
             update_check: None,
             tray: Tray::new(cc, icon, ICON_SIZE),
@@ -388,10 +608,137 @@ impl App {
             audio: None,
             force_preview: false,
         };
+        if let Some(listener) = listener {
+            let (tx, rx) = channel();
+            let ctx = cc.egui_ctx.clone();
+            instance::listen(listener, tx, move || ctx.request_repaint());
+            app.summons = Some(rx);
+        }
         app.restore_configs();
         app.start_load(&cc.egui_ctx);
         app.check_update(&cc.egui_ctx, false);
+        app.fetch_catalog(&cc.egui_ctx);
+        app.show_tab(tab, &cc.egui_ctx);
         app
+    }
+
+    /// Fetches the pack list from GitHub without holding up the window.
+    fn fetch_catalog(&mut self, ctx: &egui::Context) {
+        if self.catalog_job.is_some() {
+            return;
+        }
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(packs::fetch().map_err(|e| e.root_cause().to_string()));
+            ctx.request_repaint();
+        });
+        self.catalog_job = Some(rx);
+    }
+
+    /// Adds the fingerprints the pack list carries to the ID map.
+    fn learn_fingerprints(&mut self, ctx: &egui::Context) {
+        // A map that failed to load is never written, so the broken file stays as it was.
+        if self.idmap_error.is_some() || self.idmap.merge(&self.catalog.fingerprints) == 0 {
+            return;
+        }
+        if let Err(e) = self.idmap.save(&self.idmap_path) {
+            self.notify(ctx, format!("The ID map could not be saved: {e:#}"), true);
+        }
+    }
+
+    fn poll_catalog(&mut self, ctx: &egui::Context) {
+        let Some(result) = self.catalog_job.as_ref().and_then(finished) else { return };
+        self.catalog_job = None;
+        match result {
+            Ok(catalog) => {
+                (self.catalog, self.catalog_fetched, self.catalog_note) = (catalog, true, None);
+                self.learn_fingerprints(ctx);
+            }
+            Err(e) => self.catalog_note = Some(format!("The pack list could not be fetched, so this is the one this version came with. ({e})")),
+        }
+        // The cards come in again now that the list is here.
+        if self.tab == Tab::Packs {
+            self.tab_time = ctx.input(|i| i.time);
+        }
+    }
+
+    /// Downloads a pack's config on a worker thread; it is then checked like any config.
+    fn install_pack(&mut self, ctx: &egui::Context, index: usize) {
+        let Some(pack) = self.catalog.packs.get(index).cloned() else { return };
+        let (tx, rx) = channel();
+        let (ctx, name) = (ctx.clone(), pack.name.clone());
+        std::thread::spawn(move || {
+            let before = pack.path().ok().and_then(|path| std::fs::read(path).ok());
+            let _ = tx.send(pack.install().map(|path| (path, before)).map_err(|e| format!("{e:#}")));
+            ctx.request_repaint();
+        });
+        self.pack_job = Some((rx, name));
+    }
+
+    fn poll_pack(&mut self, ctx: &egui::Context) {
+        let Some(result) = self.pack_job.as_ref().and_then(|(rx, _)| finished(rx)) else { return };
+        self.pack_job = None;
+        let checking = result.map_err(|e| anyhow!(e)).and_then(|(path, before)| {
+            self.pack_undo = Some((path.clone(), before));
+            self.check_configs(ctx, vec![path])
+        });
+        if let Err(e) = checking {
+            self.undo_pack();
+            self.notify(ctx, format!("{e:#}"), true);
+        }
+    }
+
+    /// Puts a pack's config file back as it was before the download that was not confirmed.
+    fn undo_pack(&mut self) {
+        match self.pack_undo.take() {
+            Some((path, Some(before))) => drop(std::fs::write(path, before)),
+            Some((path, None)) => drop(std::fs::remove_file(path)),
+            None => {}
+        }
+    }
+
+    /// Switches tab, starting its entrance.
+    fn show_tab(&mut self, tab: Tab, ctx: &egui::Context) {
+        if self.tab == tab {
+            return;
+        }
+        if (self.tab == Tab::Live) != (tab == Tab::Live) {
+            let current = (self.sort, self.ascending);
+            (self.sort, self.ascending) = std::mem::replace(&mut self.other_sort, current);
+        }
+        self.tab = tab;
+        self.tab_time = ctx.input(|i| i.time);
+        if tab.lists() {
+            if self.last_browse != tab {
+                // A type filter or a selection made on one list means nothing on another.
+                self.kind_filter = None;
+                self.selected.clear();
+                (self.focus, self.preview) = (None, None);
+            }
+            self.rebuild_view();
+        }
+        if tab == Tab::Packs && !self.catalog_fetched {
+            self.fetch_catalog(ctx);
+        }
+        if tab.lists() {
+            self.last_browse = tab;
+        } else {
+            self.last_manage = tab;
+        }
+    }
+
+    /// How far the current tab's entrance has come, 0 to 1, for the `index`-th
+    /// thing on it; later ones start a little after earlier ones.
+    fn entrance(&self, ctx: &egui::Context, index: usize) -> f32 {
+        if !self.settings.animations {
+            return 1.0;
+        }
+        let age = (ctx.input(|i| i.time) - self.tab_time) as f32 - index.min(12) as f32 * 0.045;
+        if age < 0.34 {
+            ctx.request_repaint();
+        }
+        theme::ease_out(age / 0.34)
     }
 
     fn start_load(&mut self, ctx: &egui::Context) {
@@ -472,7 +819,9 @@ impl App {
         self.update_check = None;
         match result {
             Ok(release) if release.is_newer() => {
-                self.notify(ctx, format!("rbxcache {} is available", release.version), false);
+                let news: usize = release.news.iter().map(|v| v.changes.len()).sum();
+                let more = if news > 0 { format!(", with {}; see Info", format::count(news, "change", "changes")) } else { String::new() };
+                self.notify(ctx, format!("rbxcache {} is available{more}", release.version), false);
                 self.update = Some(release);
             }
             Ok(_) if asked => self.notify(ctx, format!("rbxcache {} is the latest release", update::CURRENT), false),
@@ -530,6 +879,15 @@ impl App {
 
     /// Acts on the tray icon, and decides what closing the window does.
     fn handle_close(&mut self, ctx: &egui::Context) {
+        if self.summons.as_ref().is_some_and(|summons| summons.try_iter().count() > 0) {
+            match &mut self.tray {
+                Some(tray) => tray.show(),
+                None => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+            }
+        }
         let mut quit = false;
         if let Some(tray) = &mut self.tray {
             while let Some(event) = tray.poll() {
@@ -546,8 +904,8 @@ impl App {
         if !ctx.input(|i| i.viewport().close_requested()) {
             return;
         }
-        if self.apply_job.is_some() {
-            // Leaving now could stop between writing a blob and its index row; `poll_apply` closes afterwards.
+        if self.apply_job.is_some() || self.reapply_job.is_some() {
+            // Leaving now could stop between writing a blob and its index row; the worker's poll closes afterwards.
             self.quitting = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         } else if self.tray.is_some() && self.settings.close_to_tray && !self.quitting {
@@ -643,19 +1001,7 @@ impl App {
                 }
             }
         }
-        let targets: HashSet<Id> = written.iter().filter(|id| self.tracker.may_replace(id)).copied().collect();
-        let rules = if targets.is_empty() { Vec::new() } else { combined(self.configs.iter().filter(|c| c.enabled)) };
-        if !rules.is_empty() {
-            let reports = Store::open(&self.dir, true).map(|store| config::run(&store, &self.entries, &self.idmap, &rules, true, Some(&targets)));
-            let rewritten: Vec<Entry> = reports.into_iter().flatten().flat_map(|r| r.written).collect();
-            if !rewritten.is_empty() {
-                self.status = format!("Re-applied configs to {}", format::count(rewritten.len(), "entry", "entries"));
-                for entry in &rewritten {
-                    self.tracker.record(entry);
-                }
-                watch::merge(&mut self.entries, &Change { written: rewritten, ..Default::default() });
-            }
-        }
+        self.reapply_targets.extend(written.iter().filter(|id| self.tracker.may_replace(id)));
         if self.focus.is_some_and(|id| written.contains(&id)) {
             self.preview = None;
         }
@@ -663,6 +1009,56 @@ impl App {
         self.selected.retain(|id| self.index.contains_key(id));
         if self.focus.is_some_and(|id| !self.index.contains_key(&id)) {
             self.focus = None;
+        }
+    }
+
+    /// Puts the rules in force on the entries Roblox has just written, on a
+    /// worker thread: a rule may have a file to download or a texture to
+    /// compress, and neither may hold up the window.
+    fn start_reapply(&mut self, ctx: &egui::Context) {
+        if self.reapply_targets.is_empty() || self.reapply_job.is_some() || self.busy().is_some() {
+            return;
+        }
+        let targets = std::mem::take(&mut self.reapply_targets);
+        let rules = rules_in_force(&self.configs, &self.settings.winners);
+        if rules.is_empty() {
+            return;
+        }
+        let (tx, rx) = channel();
+        let (dir, entries, idmap, ctx) = (self.dir.clone(), self.entries.clone(), self.idmap.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = Store::open(&dir, true).map(|store| {
+                let mut originals = Originals::load_default().ok();
+                let reports = config::run(&store, &entries, &idmap, &rules, true, Some(&targets), originals.as_mut());
+                reports.into_iter().flat_map(|r| r.written).collect()
+            });
+            let _ = tx.send(result.map_err(|e| format!("{e:#}")));
+            ctx.request_repaint();
+        });
+        self.reapply_job = Some(rx);
+    }
+
+    fn poll_reapply(&mut self, ctx: &egui::Context) {
+        let Some(result) = self.reapply_job.as_ref().and_then(finished) else { return };
+        self.reapply_job = None;
+        match result {
+            Ok(rewritten) if rewritten.is_empty() => {}
+            Ok(rewritten) => {
+                self.status = format!("Re-applied configs to {}", format::count(rewritten.len(), "entry", "entries"));
+                for entry in &rewritten {
+                    self.tracker.record(entry);
+                }
+                if self.focus.is_some_and(|id| rewritten.iter().any(|e| e.id == id)) {
+                    self.preview = None;
+                }
+                watch::merge(&mut self.entries, &Change { written: rewritten, ..Default::default() });
+                self.reindex();
+            }
+            Err(e) => self.status = format!("Configs could not be re-applied: {e}"),
+        }
+        // A quit asked for while the cache was being written was held back until now.
+        if self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -675,8 +1071,22 @@ impl App {
             *kinds.entry(e.kind).or_default() += 1;
             *categories.entry(e.category).or_default() += 1;
         }
+        self.group_counts = std::array::from_fn(|i| kinds.iter().filter(|(kind, _)| GROUPS[i].1.contains(*kind)).map(|(_, n)| n).sum());
+        self.other_count = kinds.iter().filter(|(kind, _)| Tab::Other.holds(kind)).map(|(_, n)| n).sum();
         self.kinds = kinds.into_iter().collect();
         self.categories = categories.into_iter().collect();
+        // A tab whose entries are all gone is no longer listed, so it cannot stay open.
+        let emptied = match self.tab {
+            Tab::Group(i) => self.group_counts[i] == 0,
+            Tab::Other => self.other_count == 0,
+            _ => false,
+        };
+        if emptied && self.loading.is_none() {
+            (self.tab, self.last_browse) = (Tab::All, Tab::All);
+        }
+        if matches!(self.last_browse, Tab::Group(i) if self.group_counts[i] == 0) || (self.last_browse == Tab::Other && self.other_count == 0) {
+            self.last_browse = Tab::All;
+        }
         self.rebuild_view();
     }
 
@@ -688,13 +1098,14 @@ impl App {
         // Position of each arrival, which doubles as the Live tab's membership test.
         let arrived: HashMap<Id, usize> = match self.tab {
             Tab::Live => self.arrivals.iter().enumerate().map(|(n, id)| (*id, n)).collect(),
-            Tab::All => HashMap::new(),
+            _ => HashMap::new(),
         };
         let mut view: Vec<usize> = (0..entries.len())
-            .filter(|&i| self.tab == Tab::All || arrived.contains_key(&entries[i].id))
+            .filter(|&i| self.tab != Tab::Live || arrived.contains_key(&entries[i].id))
             .filter(|&i| {
                 let e = &entries[i];
                 (redirects || e.kind != "redirect")
+                    && self.tab.holds(e.kind)
                     && self.kind_filter.is_none_or(|k| e.kind == k)
                     && self.category_filter.is_none_or(|c| e.category == c)
                     && (needle.is_empty() || matches(e, &needle))
@@ -810,8 +1221,16 @@ impl App {
 
     fn run_action(&mut self, action: Action, ctx: &egui::Context) {
         // While the cache is being read, cleared or rewritten by a config, nothing may act on the list.
-        let harmless =
-            matches!(action, Action::About | Action::Quit | Action::OpenFolder | Action::ShowTab(_) | Action::CheckUpdate | Action::OpenUpdate);
+        let harmless = matches!(
+            action,
+            Action::Quit | Action::OpenFolder | Action::ShowTab(_) | Action::CheckUpdate | Action::OpenUpdate | Action::RefreshPacks
+        );
+        // Switches on the Configs page only note what is wanted; the cache follows when it is free.
+        let harmless = harmless
+            || matches!(
+                action,
+                Action::ToggleConfig(_) | Action::ToggleRule(..) | Action::Choose(..) | Action::RemoveConfig(_) | Action::RemoveAllConfigs
+            );
         if self.busy().is_some() && !harmless {
             return;
         }
@@ -850,13 +1269,15 @@ impl App {
                 Ok(String::new())
             }
             Action::ShowTab(tab) => {
-                if self.tab != tab {
-                    self.tab = tab;
-                    // Each tab keeps its own sort order.
-                    let current = (self.sort, self.ascending);
-                    (self.sort, self.ascending) = std::mem::replace(&mut self.other_sort, current);
-                    self.rebuild_view();
-                }
+                self.show_tab(tab, ctx);
+                Ok(String::new())
+            }
+            Action::RefreshPacks => {
+                self.fetch_catalog(ctx);
+                Ok(String::new())
+            }
+            Action::ApplyPack(index) => {
+                self.install_pack(ctx, index);
                 Ok(String::new())
             }
             Action::ClearLive => {
@@ -877,10 +1298,6 @@ impl App {
                 Some(release) => open::that(&release.url).map(|()| String::new()).map_err(Into::into),
                 None => Ok(String::new()),
             },
-            Action::About => {
-                self.show_about = true;
-                Ok(String::new())
-            }
             Action::Quit => {
                 self.quitting = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -912,23 +1329,49 @@ impl App {
             Action::ToggleConfig(i) => {
                 if let Some(config) = self.configs.get_mut(i) {
                     config.enabled = !config.enabled;
-                    self.save_configs();
+                    self.configs_changed();
+                }
+                Ok(String::new())
+            }
+            Action::ToggleRule(i, rule) => {
+                if let Some(config) = self.configs.get_mut(i) {
+                    if let Some(key) = rule_keys(&config.rules).into_iter().nth(rule) {
+                        if !config.off.remove(&key) {
+                            config.off.insert(key);
+                        }
+                        self.configs_changed();
+                    }
+                }
+                Ok(String::new())
+            }
+            Action::Choose(targets, i) => {
+                if let Some(path) = self.configs.get(i).map(|c| c.path.clone()) {
+                    self.settings.winners.extend(targets.into_iter().map(|target| (target, path.clone())));
+                    self.configs_changed();
                 }
                 Ok(String::new())
             }
             Action::RemoveConfig(i) if i < self.configs.len() => {
                 let removed = self.configs.remove(i);
-                self.save_configs();
-                Ok(format!("{} removed; what it already replaced stays replaced", removed.name))
+                self.configs_changed();
+                Ok(format!("{} removed; what it replaced is put back", removed.name))
             }
             Action::RemoveConfig(_) => Ok(String::new()),
             Action::RemoveAllConfigs => {
                 let removed = format::count(self.configs.len(), "config", "configs");
                 self.configs.clear();
-                self.save_configs();
-                Ok(format!("{removed} removed; what they already replaced stays replaced"))
+                self.configs_changed();
+                Ok(format!("{removed} removed; what they replaced is put back"))
             }
-            Action::ConfirmConfigs => self.apply_configs(ctx),
+            Action::ConfirmConfigs => {
+                self.accept_configs();
+                Ok(String::new())
+            }
+            Action::CancelConfigs => {
+                self.pending_configs = None;
+                self.undo_pack();
+                Ok(String::new())
+            }
             Action::Tag => self.tag_focused(),
             Action::PlayAudio => self.play_audio(),
             Action::ExportConverted => self.export_converted(),
@@ -1007,12 +1450,9 @@ impl App {
             return Ok(String::new());
         };
         let body = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        let updated = Store::open(&self.dir, true)?.replace_body(&id, &body)?;
-        if let Some(protections) = &mut self.protections {
-            protections.remember(&id, &body)?;
-        }
-        let msg = format!("Replaced {} with {} ({})", updated.id_hex, path.display(), human_size(updated.size));
-        self.replaced(updated);
+        let written = config::replace_by_hand(&Store::open(&self.dir, true)?, &self.entries, &id, body)?;
+        let msg = format!("Replaced {} with {}", replaced_names(&written), path.display());
+        self.took_replacements(written)?;
         Ok(msg)
     }
 
@@ -1020,18 +1460,28 @@ impl App {
     fn replace_from_source(&mut self) -> Result<String> {
         let (Some(e), Some(source)) = (self.focused(), self.source) else { return Ok(String::new()) };
         let id = e.id;
-        if id == source {
+        let store = Store::open(&self.dir, true)?;
+        // Of a texture's packs, the most detailed one is the picture to copy.
+        let sources = config::siblings(&store, &self.entries, &source);
+        if sources.contains(&id) {
             return Err(anyhow!("This entry is the replacement source itself"));
         }
-        let store = Store::open(&self.dir, true)?;
-        let body = store.read_body(&source)?;
-        let updated = store.replace_body(&id, &body)?;
-        if let Some(protections) = &mut self.protections {
-            protections.remember(&id, &body)?;
-        }
-        let msg = format!("Replaced {} with the content of {}", &updated.id_hex[..12], &store::hex(&source)[..12]);
-        self.replaced(updated);
+        let body = store.read_body(sources.first().unwrap_or(&source))?;
+        let written = config::replace_by_hand(&store, &self.entries, &id, body)?;
+        let msg = format!("Replaced {} with the content of {}", replaced_names(&written), &store::hex(&source)[..12]);
+        self.took_replacements(written)?;
         Ok(msg)
+    }
+
+    /// Protects and takes in entries that were replaced by hand.
+    fn took_replacements(&mut self, written: Vec<(Entry, Vec<u8>)>) -> Result<()> {
+        for (entry, body) in written {
+            if let Some(protections) = &mut self.protections {
+                protections.remember(&entry.id, &body)?;
+            }
+            self.replaced(entry);
+        }
+        Ok(())
     }
 
     /// Takes in an entry this tool has just rewritten.
@@ -1074,8 +1524,18 @@ impl App {
 
     /// Remembers which configs are loaded for the next run.
     fn save_configs(&mut self) {
-        self.settings.configs = self.configs.iter().map(|c| SavedConfig { path: c.path.clone(), enabled: c.enabled }).collect();
+        let saved = |c: &LoadedConfig| SavedConfig { path: c.path.clone(), enabled: c.enabled, off: c.off.iter().cloned().collect() };
+        self.settings.configs = self.configs.iter().map(saved).collect();
+        // A choice between configs lasts only as long as the config that was chosen.
+        self.settings.winners.retain(|_, path| self.configs.iter().any(|c| c.path == *path));
         self.settings.save();
+    }
+
+    /// Called when a config or a rule was switched, removed or preferred: the
+    /// change is remembered and the cache brought in line with it, quietly.
+    fn configs_changed(&mut self) {
+        self.save_configs();
+        (self.sync_wanted, self.quiet) = (true, true);
     }
 
     /// Gives configs that share a file name their folder as well, so they can be told apart.
@@ -1101,7 +1561,8 @@ impl App {
                 Ok(rules) => (rules, None),
                 Err(e) => (Vec::new(), Some(format!("{e:#}"))),
             };
-            self.configs.push(LoadedConfig { name: String::new(), path: saved.path, rules, enabled: saved.enabled, error });
+            let off = saved.off.into_iter().collect();
+            self.configs.push(LoadedConfig { name: String::new(), path: saved.path, rules, enabled: saved.enabled, off, error });
         }
         Self::name_configs(&mut self.configs);
         let unreadable: Vec<&str> = self.configs.iter().filter(|c| c.error.is_some()).map(|c| c.name.as_str()).collect();
@@ -1120,7 +1581,14 @@ impl App {
         let mut configs: Vec<LoadedConfig> = Vec::new();
         for path in paths {
             if !configs.iter().any(|c| config::same_file(&c.path, &path)) {
-                configs.push(LoadedConfig { name: String::new(), rules: config::load(&path)?, path, enabled: true, error: None });
+                configs.push(LoadedConfig {
+                    name: String::new(),
+                    rules: config::load(&path)?,
+                    path,
+                    enabled: true,
+                    off: BTreeSet::new(),
+                    error: None,
+                });
             }
         }
         Self::name_configs(&mut configs);
@@ -1138,7 +1606,8 @@ impl App {
                     };
                     lookup = resolve::summarize(&resolve::identify(&store, &entries, &mut idmap, &ids, false, &report));
                 }
-                let reports = config::run(&store, &entries, &idmap, &rules, false, None);
+                let mut originals = Originals::load_default().ok();
+                let reports = config::run(&store, &entries, &idmap, &rules, false, None, originals.as_mut());
                 let notes = reports.iter().flat_map(|r| r.notes.iter().map(move |n| format!("{}: {n}", r.name))).collect();
                 (PendingConfigs { configs, summary: config::summarize(&reports, false), lookup, notes }, idmap)
             });
@@ -1170,6 +1639,7 @@ impl App {
                 self.config_job = None;
                 self.status = pending.lookup.clone();
                 self.idmap = idmap;
+                self.idmap.merge(&self.catalog.fingerprints);
                 // A map that failed to load is never written, so the broken file stays as it was.
                 if self.idmap_error.is_none() {
                     if let Err(e) = self.idmap.save(&self.idmap_path) {
@@ -1182,57 +1652,76 @@ impl App {
             }
             Some(Err(e)) => {
                 self.config_job = None;
+                self.undo_pack();
                 self.notify(ctx, e, true);
             }
             None => {}
         }
     }
 
-    /// Applies the confirmed configs on a worker thread. Matching rules to
-    /// entries hashes their content and `cdn` rules download files, which is
-    /// too slow to do while drawing.
-    fn apply_configs(&mut self, ctx: &egui::Context) -> Result<String> {
-        let Some(pending) = self.pending_configs.take() else { return Ok(String::new()) };
+    /// Takes the configs that were checked and confirmed into the list. One
+    /// that was already loaded is replaced by what was just read and moves to
+    /// the end with the rest, where it has any entry it shares with the
+    /// others; it keeps its switched-off rules.
+    fn accept_configs(&mut self) {
+        let Some(pending) = self.pending_configs.take() else { return };
+        self.pack_undo = None;
+        for mut config in pending.configs {
+            if let Some(loaded) = self.configs.iter().find(|c| config::same_file(&c.path, &config.path)) {
+                config.off = loaded.off.clone();
+            }
+            self.configs.retain(|c| !config::same_file(&c.path, &config.path));
+            self.configs.push(config);
+        }
+        Self::name_configs(&mut self.configs);
+        self.save_configs();
+        (self.sync_wanted, self.quiet) = (true, false);
+    }
+
+    /// Brings the cache in line with the configs on a worker thread: the rules
+    /// in force are applied, and whatever was replaced earlier and is no
+    /// longer wanted is put back. Matching rules to entries hashes their
+    /// content and `cdn` rules download files, which is too slow to do while drawing.
+    fn start_sync(&mut self, ctx: &egui::Context) {
+        self.sync_wanted = false;
         // The watcher would take the worker's writes for Roblox's and re-apply
-        // the loaded configs on top of them; it waits until this is done.
+        // the configs on top of them; it waits until this is done.
         self.stop_watch();
+        let rules = rules_in_force(&self.configs, &self.settings.winners);
         let (tx, rx) = channel();
         let (dir, entries, idmap, ctx) = (self.dir.clone(), self.entries.clone(), self.idmap.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let result = Store::open(&dir, true).map(|store| {
-                let reports = config::run(&store, &entries, &idmap, &combined(&pending.configs), true, None);
-                let summary = config::summarize(&reports, true);
-                AppliedConfigs { configs: pending.configs, summary, rewritten: reports.into_iter().flat_map(|r| r.written).collect() }
+            let result = Store::open(&dir, true).and_then(|store| {
+                let mut originals = Originals::load_default()?;
+                let (reports, restored) = config::sync(&store, &entries, &idmap, &rules, &mut originals);
+                let mut summary = config::summarize(&reports, true);
+                if !restored.is_empty() {
+                    summary.push_str(&format!(", {} put back", format::count(restored.len(), "entry", "entries")));
+                }
+                Ok(Synced { summary, rewritten: reports.into_iter().flat_map(|r| r.written).collect(), restored })
             });
             let _ = tx.send(result.map_err(|e| format!("{e:#}")));
             ctx.request_repaint();
         });
         self.apply_job = Some(rx);
-        Ok(String::new())
     }
 
     fn poll_apply(&mut self, ctx: &egui::Context) {
         let Some(result) = self.apply_job.as_ref().and_then(finished) else { return };
         self.apply_job = None;
         match result {
-            Ok(applied) => {
-                for entry in &applied.rewritten {
+            Ok(synced) => {
+                for entry in &synced.rewritten {
                     self.tracker.record(entry);
                 }
-                watch::merge(&mut self.entries, &Change { written: applied.rewritten, ..Default::default() });
+                for entry in &synced.restored {
+                    self.tracker.forget(&entry.id);
+                }
+                let written = synced.rewritten.into_iter().chain(synced.restored).collect();
+                watch::merge(&mut self.entries, &Change { written, ..Default::default() });
                 self.preview = None;
                 self.reindex();
-                // From here on the configs follow the cache: whatever Roblox writes is checked
-                // against them. One that was already loaded is replaced by what was just read.
-                // One that was already loaded moves to the end with the rest: it was applied last, so it
-                // is the one that has any entry it shares with the others, and it is ticked again.
-                for config in applied.configs {
-                    self.configs.retain(|c| !config::same_file(&c.path, &config.path));
-                    self.configs.push(config);
-                }
-                Self::name_configs(&mut self.configs);
-                self.save_configs();
-                self.notify(ctx, applied.summary, false);
+                self.notify(ctx, synced.summary, false);
             }
             Err(e) => self.notify(ctx, e, true),
         }
@@ -1301,6 +1790,8 @@ impl App {
             ui.menu_button("Configs", |ui| {
                 ui.set_min_width(280.0);
                 item(ui, actions, true, "Add configs...", "Ctrl+O", Action::AddConfigs);
+                item(ui, actions, true, "Manage configs", "", Action::ShowTab(Tab::Configs));
+                item(ui, actions, true, "Browse packs", "", Action::ShowTab(Tab::Packs));
                 ui.separator();
                 if self.configs.is_empty() {
                     ui.weak("No configs loaded");
@@ -1315,7 +1806,7 @@ impl App {
                                     format!("{}\n{error}", config.path.display()),
                                 ),
                                 None => {
-                                    let hint = "Ticked: re-applied to what Roblox writes while the cache is watched";
+                                    let hint = "Ticked: applied, and put on what Roblox writes while the cache is watched. Unticked: what it replaced is put back.";
                                     (egui::RichText::new(&config.name), format!("{}\n{hint}", config.path.display()))
                                 }
                             };
@@ -1323,11 +1814,7 @@ impl App {
                                 actions.push(Action::ToggleConfig(i));
                             }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui
-                                    .small_button("Remove")
-                                    .on_hover_text("Stop using this config. What it already replaced stays replaced.")
-                                    .clicked()
-                                {
+                                if ui.small_button("Remove").on_hover_text("Stop using this config and put back what it replaced").clicked() {
                                     actions.push(Action::RemoveConfig(i));
                                     ui.close_menu();
                                 }
@@ -1337,7 +1824,7 @@ impl App {
                 });
                 ui.separator();
                 let enabled = self.configs.iter().any(|c| c.enabled);
-                item(ui, actions, enabled, "Apply enabled configs now", "", Action::ReapplyConfigs);
+                item(ui, actions, enabled, "Reload configs from their files", "", Action::ReapplyConfigs);
                 item(ui, actions, !self.configs.is_empty(), "Remove all", "", Action::RemoveAllConfigs);
             });
             ui.menu_button("Live", |ui| {
@@ -1350,7 +1837,7 @@ impl App {
                     self.settings.save();
                 }
                 ui.separator();
-                let (tab, label) = if self.tab == Tab::Live { (Tab::All, "Show all entries") } else { (Tab::Live, "Show the Live list") };
+                let (tab, label) = if self.tab == Tab::Live { (Tab::All, "Show all assets") } else { (Tab::Live, "Show the Live list") };
                 item(ui, actions, true, label, "", Action::ShowTab(tab));
                 item(ui, actions, self.tab == Tab::Live && self.sort != SortKey::Arrival, "Newest first", "", Action::SortByArrival);
                 item(ui, actions, !self.arrivals.is_empty(), "Clear the Live list", "", Action::ClearLive);
@@ -1358,8 +1845,8 @@ impl App {
                 let applying = format::count(self.configs.iter().filter(|c| c.enabled).count(), "config", "configs");
                 ui.weak(format!("{} since the list was last cleared", format::count(self.arrivals.len(), "arrival", "arrivals")));
                 ui.weak(match self.watch.is_some() {
-                    true => format!("{applying} re-applied to new arrivals"),
-                    false => format!("{applying} ticked, but not re-applied while watching is off"),
+                    true => format!("{applying} put on new arrivals"),
+                    false => format!("{applying} on, but not put on new arrivals while watching is off"),
                 });
             });
             ui.menu_button("View", |ui| {
@@ -1397,18 +1884,12 @@ impl App {
                 }
             });
             ui.menu_button("Help", |ui| {
-                item(ui, actions, true, "About and shortcuts", "F1", Action::About);
+                item(ui, actions, true, "Info and shortcuts", "F1", Action::ShowTab(Tab::Info));
                 item(ui, actions, self.update_check.is_none(), "Check for updates", "", Action::CheckUpdate);
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.roblox_running {
                     theme::pill(ui, "Roblox is running - changes may be overwritten", theme::WARN);
-                }
-                if let Some(release) = &self.update {
-                    let label = egui::RichText::new(format!("Update to {}", release.version)).color(theme::OK);
-                    if ui.button(label).on_hover_text("Open the release page").clicked() {
-                        actions.push(Action::OpenUpdate);
-                    }
                 }
                 ui.label(egui::RichText::new(self.dir.display().to_string()).color(theme::MUTED).small());
             });
@@ -1417,11 +1898,6 @@ impl App {
 
     fn toolbar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
-            for (tab, label) in [(Tab::All, format!("All  {}", self.entries.len())), (Tab::Live, format!("Live  {}", self.arrivals.len()))] {
-                if ui.selectable_label(self.tab == tab, label).clicked() {
-                    actions.push(Action::ShowTab(tab));
-                }
-            }
             if self.tab == Tab::Live
                 && ui.add_enabled(!self.arrivals.is_empty(), egui::Button::new("Clear")).on_hover_text("Empty the Live list").clicked()
             {
@@ -1431,7 +1907,6 @@ impl App {
             {
                 actions.push(Action::SortByArrival);
             }
-            ui.separator();
             let search_id = egui::Id::new("search");
             let mut changed = ui
                 .add(egui::TextEdit::singleline(&mut self.search).id(search_id).hint_text("Search id, type or URL   (Ctrl+F)").desired_width(300.0))
@@ -1442,7 +1917,7 @@ impl App {
             let kind_text = self.kind_filter.unwrap_or("All types");
             egui::ComboBox::from_id_salt("kind").selected_text(kind_text).height(420.0).show_ui(ui, |ui| {
                 changed |= ui.selectable_value(&mut self.kind_filter, None, "All types").changed();
-                for &(kind, n) in &self.kinds {
+                for &(kind, n) in self.kinds.iter().filter(|(kind, _)| self.tab.holds(kind)) {
                     changed |= ui.selectable_value(&mut self.kind_filter, Some(kind), format!("{kind}  ({n})")).changed();
                 }
             });
@@ -1806,13 +2281,632 @@ impl App {
         painter.with_clip_rect(clip).set(slot, Shape::Vec(shapes));
     }
 
+    /// The sidebar: the two halves of the app, Browse and Manage.
+    fn sidebar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let now = ui.input(|i| i.time);
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("pirxcy").font(egui::FontId::new(27.0, theme::wordmark_font())).color(theme::SPLASH_INK));
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(11.0);
+            ui.label(egui::RichText::new(format!("rbxcache {}", update::CURRENT)).color(theme::MUTED).small());
+        });
+        ui.add_space(16.0);
+
+        let enabled = self.configs.iter().filter(|c| c.enabled).count();
+        let browsing = self.tab.lists();
+        let rows = [
+            NavRow { label: "Browse", hint: "What is in the cache", count: Some(self.listed()), selected: browsing, opens: self.last_browse },
+            NavRow {
+                label: "Manage",
+                hint: "Configs, packs and help",
+                count: (enabled > 0).then_some(enabled),
+                selected: !browsing,
+                opens: self.last_manage,
+            },
+        ];
+        ui.spacing_mut().item_spacing.y = 4.0;
+        let highlight = ui.painter().add(Shape::Noop);
+        let mut active = None;
+        for (index, row) in rows.iter().enumerate() {
+            let rect = self.nav_row(ui, now, index, row, actions);
+            if row.selected {
+                active = Some(rect);
+            }
+        }
+        self.paint_nav_highlight(ui, highlight, active);
+
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            ui.add_space(4.0);
+            let state = |ui: &mut egui::Ui, on: bool, text: &str| {
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    let (dot, _) = ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 3.0, if on { theme::OK } else { alpha(theme::MUTED, 0.5) });
+                    ui.label(egui::RichText::new(text).color(theme::MUTED).small());
+                });
+            };
+            state(ui, self.watch.is_some(), if self.watch.is_some() { "Watching the cache" } else { "Not watching" });
+            state(ui, self.roblox_running, if self.roblox_running { "Roblox is running" } else { "Roblox is closed" });
+            if let Some(release) = &self.update {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    let label = egui::RichText::new(format!("Update to {}", release.version)).color(theme::LIME);
+                    if ui.button(label).on_hover_text("See what is new").clicked() {
+                        actions.push(Action::ShowTab(Tab::Info));
+                    }
+                });
+            }
+        });
+    }
+
+    /// How many entries the All list has: redirect records only count while they are listed.
+    fn listed(&self) -> usize {
+        let redirects = self.kinds.iter().find(|(kind, _)| *kind == "redirect").map_or(0, |(_, n)| *n);
+        self.entries.len() - if self.show_redirects { 0 } else { redirects }
+    }
+
+    /// One row of the sidebar, sliding in when the window opens. Returns where it is.
+    fn nav_row(&mut self, ui: &mut egui::Ui, now: f64, index: usize, row: &NavRow, actions: &mut Vec<Action>) -> Rect {
+        let seen = *self.nav_seen.entry(row.label).or_insert(now);
+        let t = if self.settings.animations { theme::ease_out(((now - seen) as f32 - index as f32 * 0.06) / 0.4) } else { 1.0 };
+        if t < 1.0 {
+            ui.ctx().request_repaint();
+        }
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), NAV_ROW), egui::Sense::click());
+        let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+        let painter = ui.painter();
+        if response.hovered() && !row.selected {
+            painter.rect_filled(rect.shrink2(Vec2::new(6.0, 1.0)), CornerRadius::same(8), alpha(theme::RAISED, 0.7));
+        }
+        let left = rect.left() + 20.0 - (1.0 - t) * 16.0;
+        let ink = if row.selected { Color32::WHITE } else { theme::TEXT };
+        painter.text(egui::pos2(left, rect.center().y - 8.0), egui::Align2::LEFT_CENTER, row.label, egui::FontId::proportional(15.0), alpha(ink, t));
+        painter.text(
+            egui::pos2(left, rect.center().y + 10.0),
+            egui::Align2::LEFT_CENTER,
+            row.hint,
+            egui::FontId::proportional(11.5),
+            alpha(theme::MUTED, t),
+        );
+        if let Some(count) = row.count {
+            let at = egui::pos2(rect.right() - 16.0, rect.center().y - 8.0);
+            painter.text(at, egui::Align2::RIGHT_CENTER, count.to_string(), egui::FontId::proportional(12.0), alpha(theme::MUTED, t));
+        }
+        if response.clicked() {
+            actions.push(Action::ShowTab(row.opens));
+        }
+        rect
+    }
+
+    /// The lists Browse offers, as a row of chips: everything, what is new,
+    /// and one for each kind of asset the cache holds.
+    fn browse_chips(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let mut chips = vec![(Tab::All, "All", Some(self.listed()), theme::MUTED), (Tab::Live, "Live", Some(self.arrivals.len()), theme::OK)];
+        for (i, (name, kinds)) in GROUPS.iter().enumerate() {
+            if self.group_counts[i] > 0 {
+                chips.push((Tab::Group(i), name, Some(self.group_counts[i]), theme::kind_color(kinds[0])));
+            }
+        }
+        if self.other_count > 0 {
+            chips.push((Tab::Other, "Other", Some(self.other_count), theme::MUTED));
+        }
+        self.chips(ui, &chips, actions);
+    }
+
+    /// The pages of Manage, as a row of chips.
+    fn manage_chips(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let enabled = self.configs.iter().filter(|c| c.enabled).count();
+        let chips = [
+            (Tab::Configs, "Configs", (enabled > 0).then_some(enabled), theme::ACCENT),
+            (Tab::Packs, "Packs", Some(self.catalog.packs.len()), theme::LIME),
+            (Tab::Guide, "Guide", None, theme::OK),
+            (Tab::Info, "Info", None, if self.update.is_some() { theme::LIME } else { theme::MUTED }),
+        ];
+        self.chips(ui, &chips, actions);
+    }
+
+    /// A row of tabs. A chip fades in when it first appears, which for the
+    /// kinds of asset is when the cache has been read.
+    fn chips(&mut self, ui: &mut egui::Ui, chips: &[(Tab, &'static str, Option<usize>, Color32)], actions: &mut Vec<Action>) {
+        let now = ui.input(|i| i.time);
+        egui::ScrollArea::horizontal().id_salt(chips[0].1).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for (index, &(tab, label, count, colour)) in chips.iter().enumerate() {
+                    let seen = *self.nav_seen.entry(label).or_insert(now);
+                    let t = if self.settings.animations { theme::ease_out(((now - seen) as f32 - index as f32 * 0.03) / 0.35) } else { 1.0 };
+                    if t < 1.0 {
+                        ui.ctx().request_repaint();
+                    }
+                    if chip(ui, label, count, colour, self.tab == tab, t).clicked() {
+                        actions.push(Action::ShowTab(tab));
+                    }
+                }
+            });
+        });
+    }
+
+    /// The marker behind the open tab's row. It glides to a newly opened tab, smearing on the way.
+    fn paint_nav_highlight(&mut self, ui: &egui::Ui, slot: egui::layers::ShapeIdx, active: Option<Rect>) {
+        let Some(row) = active else { return };
+        let dt = ui.input(|i| i.stable_dt).min(0.05);
+        let mut y = match self.nav_y {
+            Some(y) if self.settings.animations => theme::approach(y, row.top(), 22.0, dt),
+            _ => row.top(),
+        };
+        let left = row.top() - y;
+        if left.abs() < 0.4 {
+            y = row.top();
+        } else {
+            ui.ctx().request_repaint();
+        }
+        self.nav_y = Some(y);
+        let radius = CornerRadius::same(8);
+        let at = Rect::from_min_size(egui::pos2(row.left() + 6.0, y), Vec2::new(row.width() - 12.0, row.height()));
+        let mut shapes = Vec::new();
+        if left.abs() > 1.0 {
+            shapes.push(theme::motion_trail(
+                at,
+                Vec2::new(0.0, -left.clamp(-60.0, 60.0) * 0.5),
+                theme::ACCENT,
+                radius,
+                (left.abs() / 50.0).clamp(0.2, 1.0),
+            ));
+        }
+        shapes.push(Shape::rect_filled(at, radius, alpha(theme::ACCENT, 0.22)));
+        let bar = Rect::from_min_size(at.min + Vec2::new(0.0, 10.0), Vec2::new(3.0, at.height() - 20.0));
+        shapes.push(Shape::rect_filled(bar, CornerRadius::same(2), theme::LIME));
+        ui.painter().set(slot, Shape::Vec(shapes));
+    }
+
+    /// Lays out one of Manage's pages under its row of tabs, in a centred column.
+    fn page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let width = ui.available_width().min(PAGE_WIDTH);
+        let margin = ((ui.available_width() - width) / 2.0).max(0.0);
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.add_space(margin);
+            self.manage_chips(ui, actions);
+        });
+        ui.add_space(6.0);
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                ui.add_space(margin);
+                ui.vertical(|ui| {
+                    ui.set_width(width);
+                    ui.add_space(8.0);
+                    match self.tab {
+                        Tab::Configs => self.configs_page(ui, actions),
+                        Tab::Packs => self.packs_page(ui, actions),
+                        Tab::Guide => self.guide_page(ui, actions),
+                        _ => self.info_page(ui, actions),
+                    }
+                    ui.add_space(24.0);
+                });
+            });
+        });
+    }
+
+    /// Title and one line of explanation at the top of a page.
+    fn page_header(&self, ui: &mut egui::Ui, title: &str, about: &str) {
+        let t = self.entrance(ui.ctx(), 0);
+        ui.scope(|ui| {
+            ui.set_opacity(t);
+            ui.add_space((1.0 - t) * 12.0);
+            ui.label(egui::RichText::new(title).font(egui::FontId::new(30.0, theme::wordmark_font())).color(theme::SPLASH_INK));
+            ui.add(egui::Label::new(egui::RichText::new(about).color(theme::MUTED)).wrap());
+        });
+        ui.add_space(10.0);
+    }
+
+    fn configs_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        self.page_header(
+            ui,
+            "Configs",
+            "Replacement rules that stay applied. What is switched on is put on whatever Roblox downloads; what is switched off is put back.",
+        );
+        let idle = self.busy().is_none();
+        let t = self.entrance(ui.ctx(), 1);
+        ui.scope(|ui| {
+            ui.set_opacity(t);
+            ui.horizontal(|ui| {
+                if ui.add_enabled(idle, primary_button("Add configs...")).clicked() {
+                    actions.push(Action::AddConfigs);
+                }
+                let any = self.configs.iter().any(|c| c.enabled);
+                if ui
+                    .add_enabled(idle && any, egui::Button::new("Reload from files"))
+                    .on_hover_text("Read the config files again and apply them to the whole cache")
+                    .clicked()
+                {
+                    actions.push(Action::ReapplyConfigs);
+                }
+                if self.apply_job.is_some() || self.sync_wanted {
+                    ui.spinner();
+                    ui.label(egui::RichText::new("Applying").color(theme::MUTED));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.watch.is_some() {
+                        theme::pill(ui, "Watching: new downloads are replaced too", theme::OK);
+                    } else {
+                        theme::pill(ui, "Not watching: new downloads are left alone", theme::WARN);
+                    }
+                });
+            });
+        });
+        ui.add_space(8.0);
+
+        if self.configs.is_empty() {
+            card(ui, self.entrance(ui.ctx(), 2), |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(18.0);
+                    ui.label(egui::RichText::new("No configs yet").size(18.0));
+                    ui.label(
+                        egui::RichText::new("Add a config file of your own, or pick a pack. The Guide tab walks through it.").color(theme::MUTED),
+                    );
+                    ui.add_space(18.0);
+                });
+            });
+            return;
+        }
+        self.conflicts_card(ui, actions);
+        for (i, config) in self.configs.iter().enumerate() {
+            card(ui, self.entrance(ui.ctx(), i + 3), |ui| {
+                ui.horizontal(|ui| {
+                    if switch(ui, config.enabled).on_hover_text("Off puts back everything this config replaced").clicked() {
+                        actions.push(Action::ToggleConfig(i));
+                    }
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(&config.name).size(16.0).strong());
+                    match &config.error {
+                        Some(_) => theme::pill(ui, "unreadable", theme::WARN),
+                        None => {
+                            let on = config.rules.len() - config.off.len().min(config.rules.len());
+                            theme::pill(ui, &format!("{on} of {} on", format::count(config.rules.len(), "rule", "rules")), theme::ACCENT);
+                        }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Remove").on_hover_text("Stop using this config and put back what it replaced").clicked() {
+                            actions.push(Action::RemoveConfig(i));
+                        }
+                    });
+                });
+                ui.add(egui::Label::new(egui::RichText::new(config.path.display().to_string()).color(theme::MUTED).small()).truncate());
+                if let Some(error) = &config.error {
+                    ui.add(egui::Label::new(egui::RichText::new(error).color(theme::WARN).small()).wrap());
+                    return;
+                }
+                let (ids, known, refused) = id_stats(&config.rules, &self.idmap);
+                if ids > 0 {
+                    let mut text = format!("{}: {known} identified", format::count(ids, "asset ID", "asset IDs"));
+                    if refused > 0 {
+                        text.push_str(&format!(", {refused} that Roblox would not hand out"));
+                    }
+                    if ids > known + refused {
+                        text.push_str(&format!(", {} not looked up yet", ids - known - refused));
+                    }
+                    ui.add(egui::Label::new(egui::RichText::new(text).color(theme::MUTED).small()).wrap());
+                }
+                let keys = rule_keys(&config.rules);
+                egui::CollapsingHeader::new(egui::RichText::new("Rules").color(theme::MUTED)).id_salt(("rules", &config.path)).show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt(("rule list", &config.path)).max_height(300.0).show(ui, |ui| {
+                        for (rule_index, (rule, key)) in config.rules.iter().zip(&keys).enumerate() {
+                            ui.horizontal(|ui| {
+                                if switch(ui, config.enabled && !config.off.contains(key)).clicked() {
+                                    actions.push(Action::ToggleRule(i, rule_index));
+                                }
+                                ui.label(&rule.name);
+                                ui.label(egui::RichText::new(rule_summary(rule)).color(theme::MUTED).small());
+                            });
+                        }
+                    });
+                });
+            });
+        }
+    }
+
+    /// Where enabled configs set the same thing, lets the user say which one has it.
+    fn conflicts_card(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let found = conflicts(&self.configs);
+        if found.is_empty() {
+            return;
+        }
+        // Conflicts between the same configs are shown together.
+        let mut groups: BTreeMap<Vec<usize>, Vec<&Conflict>> = BTreeMap::new();
+        for conflict in &found {
+            groups.entry(conflict.sides.iter().map(|(config, _)| *config).collect()).or_default().push(conflict);
+        }
+        card(ui, self.entrance(ui.ctx(), 2), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Conflicts").size(16.0).strong());
+                theme::pill(ui, &found.len().to_string(), theme::WARN);
+            });
+            let about = "These configs change the same things. Each one can only go to one config: pick which, for all of them or one by one.";
+            ui.add(egui::Label::new(egui::RichText::new(about).color(theme::MUTED)).wrap());
+            for (sides, list) in &groups {
+                ui.add_space(6.0);
+                let names: Vec<&str> = sides.iter().map(|config| self.configs[*config].name.as_str()).collect();
+                ui.label(format!("{}: {} in common", names.join(" and "), list.len()));
+                ui.horizontal_wrapped(|ui| {
+                    for &config in sides {
+                        let all = list.iter().all(|conflict| conflict.winner(&self.configs, &self.settings.winners) == config);
+                        let label = format!("All from {}", self.configs[config].name);
+                        if ui.selectable_label(all, label).clicked() {
+                            actions.push(Action::Choose(list.iter().map(|conflict| conflict.target.clone()).collect(), config));
+                        }
+                    }
+                });
+                egui::CollapsingHeader::new(egui::RichText::new("One by one").color(theme::MUTED)).id_salt(("conflicts", sides)).show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt(("conflict list", sides)).max_height(260.0).show(ui, |ui| {
+                        for conflict in list {
+                            let winner = conflict.winner(&self.configs, &self.settings.winners);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new(&conflict.target).monospace().color(theme::MUTED).small());
+                                for (config, rule) in &conflict.sides {
+                                    let label = format!("{}: {rule}", self.configs[*config].name);
+                                    if ui.selectable_label(winner == *config, label).clicked() {
+                                        actions.push(Action::Choose(vec![conflict.target.clone()], *config));
+                                    }
+                                }
+                            });
+                        }
+                    });
+                });
+            }
+        });
+    }
+
+    fn guide_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        self.page_header(ui, "Guide", "Using a config, from getting one to seeing it in game.");
+        let steps = [
+            ("Get a config", "A config is a file of replacement rules: swap this asset for that file, remove that one. Packs lists ready-made ones. Any config made for Fleasion works too; it is the same format."),
+            ("Add it", "Press Apply on a pack, or Add configs on the Configs tab for a file of your own. rbxcache looks up the asset IDs the config names and shows what it would change. Nothing is written until you press Apply in that window."),
+            ("Play", "Leave rbxcache open, or close it and let it sit in the tray. Roblox only saves an asset when a game first needs it, so most of a pack has nothing to replace until you have joined the game. Each asset is replaced as it arrives."),
+            ("Rejoin", "Roblox keeps what it has already loaded in memory, so a replacement shows the next time the asset is loaded. The first time with a pack: join the game, leave, and join again. After that the replacements are already in place when you start."),
+            ("Tune it", "Every config has a switch, and under Rules so does each thing it changes. When two configs change the same thing, a Conflicts box appears at the top of Configs and you choose which one has it."),
+            ("Undo it", "Switch a config or a rule off and what it replaced is put back from the copy rbxcache kept. Remove does that for the whole config. File > Clear cache makes Roblox download everything fresh."),
+        ];
+        for (n, (title, text)) in steps.iter().enumerate() {
+            card(ui, self.entrance(ui.ctx(), n + 1), |ui| {
+                ui.horizontal(|ui| {
+                    theme::pill(ui, &(n + 1).to_string(), theme::LIME);
+                    ui.label(egui::RichText::new(*title).size(16.0).strong());
+                });
+                ui.add(egui::Label::new(*text).wrap());
+                if n == 0 && ui.button("Open Packs").clicked() {
+                    actions.push(Action::ShowTab(Tab::Packs));
+                }
+                if n == 1 && ui.add_enabled(self.busy().is_none(), egui::Button::new("Add configs...")).clicked() {
+                    actions.push(Action::AddConfigs);
+                }
+            });
+        }
+        card(ui, self.entrance(ui.ctx(), steps.len() + 1), |ui| {
+            ui.label(egui::RichText::new("When something does not change").size(16.0).strong());
+            for (what, why) in [
+                ("Sounds", "Roblox only gives most sounds to players who are logged in and in the game, and rbxcache never logs in, so it cannot tell which cached sound is which. Those rules are counted as needing a login and skipped. Tagging the entry by hand (select it, type the asset ID, press Tag) makes the rule work."),
+                ("It still looks the same", "The asset was loaded before it was replaced. Rejoin or restart Roblox."),
+                ("It changed, then changed back", "Roblox downloaded the asset again. With rbxcache open and Live > Watch cache live on, it is replaced again as it arrives."),
+                ("Nothing matched", "Roblox has not downloaded those assets on this computer yet. Play the game once with rbxcache running."),
+            ] {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(what).color(theme::LIME));
+                ui.add(egui::Label::new(why).wrap());
+            }
+        });
+    }
+
+    fn packs_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        self.page_header(
+            ui,
+            "Packs",
+            "Known packs. Applying one downloads its config and loads it like any other, after showing what it would change.",
+        );
+        let fetching = self.catalog_job.is_some();
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!fetching, egui::Button::new("Refresh")).on_hover_text("Fetch the list again").clicked() {
+                actions.push(Action::RefreshPacks);
+            }
+            if fetching {
+                ui.spinner();
+                ui.label(egui::RichText::new("Fetching the pack list").color(theme::MUTED));
+            }
+        });
+        ui.add_space(8.0);
+        // Until the list has arrived once, placeholders stand where its cards will be.
+        if fetching && !self.catalog_fetched {
+            let now = ui.input(|i| i.time);
+            for _ in 0..3 {
+                skeleton_card(ui, now, self.settings.animations);
+            }
+            ui.ctx().request_repaint();
+            return;
+        }
+        if let Some(note) = &self.catalog_note {
+            ui.add(egui::Label::new(egui::RichText::new(note).color(theme::WARN).small()).wrap());
+            ui.add_space(4.0);
+        }
+        let idle = self.busy().is_none();
+        for (i, pack) in self.catalog.packs.iter().enumerate() {
+            let loaded = pack.path().is_ok_and(|path| self.configs.iter().any(|c| c.path == path));
+            card(ui, self.entrance(ui.ctx(), i + 1), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(&pack.name).size(17.0).strong());
+                    if !pack.game.is_empty() {
+                        theme::pill(ui, &pack.game, theme::LIME);
+                    }
+                    if !pack.author.is_empty() {
+                        ui.label(egui::RichText::new(format!("by {}", pack.author)).color(theme::MUTED));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let button = if loaded { egui::Button::new("Update and re-apply") } else { primary_button("Apply") };
+                        if ui.add_enabled(idle, button).on_hover_text("Download the pack's config and check it against the cache").clicked() {
+                            actions.push(Action::ApplyPack(i));
+                        }
+                        if loaded {
+                            theme::pill(ui, "Loaded", theme::OK);
+                        }
+                    });
+                });
+                if !pack.description.is_empty() {
+                    ui.add(egui::Label::new(&pack.description).wrap());
+                }
+            });
+        }
+        if self.catalog.packs.is_empty() {
+            card(ui, self.entrance(ui.ctx(), 1), |ui| {
+                ui.label(egui::RichText::new("The list has no packs right now.").color(theme::MUTED));
+            });
+        }
+        let note = "Images and fonts are matched by looking each asset ID up with Roblox, with no login. Roblox refuses that for most sounds and \
+                    for some images, so the parts of a pack that change those are skipped unless you tag the entries yourself. The Guide tab \
+                    has more.";
+        ui.add_space(4.0);
+        ui.add(egui::Label::new(egui::RichText::new(note).color(theme::MUTED).small()).wrap());
+    }
+
+    fn info_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let t = self.entrance(ui.ctx(), 0);
+        ui.scope(|ui| {
+            ui.set_opacity(t);
+            ui.add_space((1.0 - t) * 12.0);
+            ui.label(egui::RichText::new("pirxcy").font(egui::FontId::new(46.0, theme::wordmark_font())).color(theme::SPLASH_INK));
+            ui.label(
+                egui::RichText::new(format!("rbxcache {}  -  the Roblox asset cache, edited where it sits", update::CURRENT)).color(theme::MUTED),
+            );
+        });
+        ui.add_space(12.0);
+
+        if let Some(release) = &self.update {
+            card(ui, self.entrance(ui.ctx(), 1), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("Version {} is out", release.version)).size(17.0).strong().color(theme::LIME));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(primary_button("Open the release page")).clicked() {
+                            actions.push(Action::OpenUpdate);
+                        }
+                    });
+                });
+                if release.news.is_empty() {
+                    ui.label(egui::RichText::new("The list of changes could not be fetched; the release page has it.").color(theme::MUTED));
+                } else {
+                    ui.label(egui::RichText::new(format!("Everything new since {}:", update::CURRENT)).color(theme::MUTED));
+                    versions_list(ui, &release.news);
+                }
+            });
+        }
+
+        let facts = [
+            ("No frames lost", "Nothing runs inside Roblox: no injected code, no overlay, no hooks. The game renders exactly as it does on its own."),
+            ("No lag added", "Nothing sits between Roblox and its servers. There is no proxy to slow a connection down or drop it."),
+            ("Files only", "A replacement is a file swapped in the cache on disk. Roblox loads it the way it loads any cached asset."),
+        ];
+        let t = self.entrance(ui.ctx(), 2);
+        ui.scope(|ui| {
+            ui.set_opacity(t);
+            ui.add_space((1.0 - t) * 16.0);
+            ui.columns(3, |columns| {
+                for (column, (title, text)) in columns.iter_mut().zip(facts) {
+                    egui::Frame::new()
+                        .fill(theme::CARD)
+                        .stroke(Stroke::new(1.0_f32, theme::BORDER))
+                        .corner_radius(CornerRadius::same(12))
+                        .inner_margin(Margin::same(16))
+                        .show(column, |ui| {
+                            ui.set_min_height(118.0);
+                            // Columns justify their content, which spreads the words of a wrapped line apart.
+                            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                ui.label(egui::RichText::new(title).size(17.0).strong().color(theme::LIME));
+                                ui.add(egui::Label::new(egui::RichText::new(text).color(theme::TEXT)).wrap());
+                            });
+                        });
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        card(ui, self.entrance(ui.ctx(), 3), |ui| {
+            ui.label(egui::RichText::new("Lightweight by design").size(17.0).strong());
+            let text = "rbxcache changes what Roblox has already saved to disk, and nothing else. It is not a proxy, it installs no \
+                        certificate, and it never asks for or reads a login. While it sits in the tray it looks at the cache index once a \
+                        second and puts your configs on what is new. A texture is written at the size of the one it replaces.";
+            ui.add(egui::Label::new(egui::RichText::new(text).color(theme::TEXT)).wrap());
+            ui.add_space(4.0);
+            for (n, step) in [
+                "Roblox downloads an asset and saves it in its cache.",
+                "rbxcache recognises the entry and swaps its content for yours.",
+                "The next time Roblox loads that asset, it reads the replacement.",
+            ]
+            .iter()
+            .enumerate()
+            {
+                ui.horizontal(|ui| {
+                    theme::pill(ui, &(n + 1).to_string(), theme::ACCENT);
+                    ui.label(*step);
+                });
+            }
+            let caveat = "An asset Roblox already has in memory keeps its old look until it is loaded again: rejoin, or restart the client.";
+            ui.add(egui::Label::new(egui::RichText::new(caveat).color(theme::MUTED).small()).wrap());
+        });
+
+        card(ui, self.entrance(ui.ctx(), 4), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("What is new").size(17.0).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_enabled(self.update_check.is_none(), egui::Button::new("Check for updates")).clicked() {
+                        actions.push(Action::CheckUpdate);
+                    }
+                });
+            });
+            match self.changelog.split_first() {
+                Some((current, earlier)) => {
+                    versions_list(ui, std::slice::from_ref(current));
+                    if !earlier.is_empty() {
+                        egui::CollapsingHeader::new(egui::RichText::new("Earlier versions").color(theme::MUTED))
+                            .show(ui, |ui| versions_list(ui, earlier));
+                    }
+                }
+                None => drop(ui.label(egui::RichText::new("No changelog was built into this copy.").color(theme::MUTED))),
+            }
+        });
+
+        card(ui, self.entrance(ui.ctx(), 5), |ui| {
+            ui.label(egui::RichText::new("Shortcuts").size(17.0).strong());
+            egui::Grid::new("shortcuts").num_columns(2).spacing([18.0, 6.0]).show(ui, |ui| {
+                for (keys, what) in [
+                    ("Up / Down", "Move through the list"),
+                    ("Page Up / Page Down", "Move twenty rows"),
+                    ("Shift + Up / Down", "Extend the selection"),
+                    ("Ctrl / Shift + click", "Select several"),
+                    ("Double-click", "Open in the default program"),
+                    ("Right-click", "Entry menu"),
+                    ("Space", "Play or pause a sound or animation"),
+                    ("Ctrl+F", "Search"),
+                    ("Ctrl+E", "Export"),
+                    ("Ctrl+O", "Add configs"),
+                    ("Delete", "Delete the selection"),
+                    ("F5", "Reload the cache"),
+                    ("F1", "This page"),
+                ] {
+                    ui.label(egui::RichText::new(keys).monospace().color(theme::ACCENT));
+                    ui.label(what);
+                    ui.end_row();
+                }
+            });
+        });
+    }
+
     /// Shown on the Live tab until Roblox writes something.
     fn live_placeholder(&self, ui: &mut egui::Ui) {
         ui.add_space(ui.available_height() * 0.36);
         ui.vertical_centered(|ui| {
             if self.watch.is_none() {
                 ui.label(egui::RichText::new("Live watching is off").size(20.0));
-                ui.label(egui::RichText::new("Turn on View > Watch cache live to fill this list.").color(theme::MUTED));
+                ui.label(egui::RichText::new("Turn on Live > Watch cache live to fill this list.").color(theme::MUTED));
                 return;
             }
             // A dot that pulses while waiting.
@@ -1843,6 +2937,8 @@ impl App {
             let (done, total) = self.progress;
             let caption = if total > 0 { format!("Scanning files  {done} / {total}") } else { "Opening the index".to_string() };
             Some((caption, fraction(self.progress)))
+        } else if let Some((_, name)) = &self.pack_job {
+            Some((format!("Downloading {name}"), None))
         } else if self.apply_job.is_some() {
             Some(("Applying configs".to_string(), None))
         } else if self.config_job.is_some() {
@@ -1863,6 +2959,8 @@ impl App {
         const DISSOLVE: f32 = 0.62;
         /// Work shorter than this passes without a splash, except the first load.
         const PATIENCE: f64 = 0.15;
+        /// A switch on the Configs page gets this long before its work is given a splash.
+        const QUIET_PATIENCE: f64 = 2.5;
         use theme::{LIME, SPLASH_BG as BACKGROUND, SPLASH_INK as INK, SPLASH_MUTED as MUTED};
 
         let now = ctx.input(|i| i.time);
@@ -1870,7 +2968,8 @@ impl App {
         match (&mut self.splash, &busy) {
             (None, Some(_)) => {
                 let since = *self.busy_since.get_or_insert(now);
-                if now - since >= PATIENCE || self.entries.is_empty() {
+                let patience = if self.quiet { QUIET_PATIENCE } else { PATIENCE };
+                if now - since >= patience || (self.entries.is_empty() && !self.quiet) {
                     self.splash = Some(Splash { shown: now, leaving: None, caption: String::new(), fraction: None });
                 } else {
                     ctx.request_repaint();
@@ -1886,7 +2985,7 @@ impl App {
             _ => {}
         }
         if busy.is_none() {
-            self.busy_since = None;
+            (self.busy_since, self.quiet) = (None, false);
         }
         let Some(splash) = &mut self.splash else { return };
         if let Some((caption, fraction)) = busy {
@@ -2050,7 +3149,7 @@ impl App {
 
     fn configs_dialog(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         let Some(pending) = &self.pending_configs else { return };
-        let mut close = false;
+        let (mut close, mut accepted) = (false, false);
         let dismissed = self.modal(ctx, "config", self.confirm_configs, |ui| {
             ui.label(egui::RichText::new(format!("Apply {}", format::count(pending.configs.len(), "config", "configs"))).size(18.0));
             ui.add_space(4.0);
@@ -2080,7 +3179,7 @@ impl App {
                     && self.confirm_configs
                 {
                     actions.push(Action::ConfirmConfigs);
-                    close = true;
+                    (close, accepted) = (true, true);
                 }
                 if ui.button("Cancel").clicked() {
                     close = true;
@@ -2089,45 +3188,41 @@ impl App {
         });
         if close || dismissed {
             self.confirm_configs = false;
+            if !accepted {
+                actions.push(Action::CancelConfigs);
+            }
         }
     }
 
-    fn about_dialog(&mut self, ctx: &egui::Context) {
-        let mut close = false;
-        let dismissed = self.modal(ctx, "about", self.show_about, |ui| {
-            ui.label(egui::RichText::new("Roblox Cache Explorer").size(20.0));
+    /// Shown once after an update: what changed since the version last used.
+    fn news_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_news {
+            return;
+        }
+        let seen = &self.settings.seen_version;
+        // A first install is shown this version only; an update, everything in between.
+        let news: Vec<Version> = match seen.is_empty() {
+            true => self.changelog.first().cloned().into_iter().collect(),
+            false => changelog::between(self.changelog.clone(), seen, update::CURRENT),
+        };
+        let mut close = news.is_empty();
+        // It waits for the loading screen to clear.
+        let open = !news.is_empty() && self.busy().is_none() && self.splash.is_none();
+        let dismissed = self.modal(ctx, "news", open, |ui| {
+            ui.label(egui::RichText::new("What is new").font(egui::FontId::new(24.0, theme::wordmark_font())).color(theme::SPLASH_INK));
             ui.label(egui::RichText::new(format!("rbxcache {}", update::CURRENT)).color(theme::MUTED));
-            ui.add_space(10.0);
-            egui::Grid::new("shortcuts").num_columns(2).spacing([18.0, 6.0]).show(ui, |ui| {
-                for (keys, what) in [
-                    ("Up / Down", "Move through the list"),
-                    ("Page Up / Page Down", "Move twenty rows"),
-                    ("Shift + Up / Down", "Extend the selection"),
-                    ("Ctrl / Shift + click", "Select several"),
-                    ("Double-click", "Open in the default program"),
-                    ("Right-click", "Entry menu"),
-                    ("Space", "Play or pause a sound or animation"),
-                    ("Ctrl+F", "Search"),
-                    ("Ctrl+E", "Export"),
-                    ("Ctrl+O", "Add configs"),
-                    ("Delete", "Delete the selection"),
-                    ("F5", "Reload the cache"),
-                    ("F1", "This window"),
-                ] {
-                    ui.label(egui::RichText::new(keys).monospace().color(theme::ACCENT));
-                    ui.label(what);
-                    ui.end_row();
-                }
-            });
+            egui::ScrollArea::vertical().id_salt("news").max_height(380.0).show(ui, |ui| versions_list(ui, &news));
             ui.add_space(12.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Close").clicked() {
+                if ui.add(primary_button("Got it")).clicked() {
                     close = true;
                 }
             });
         });
         if close || dismissed {
-            self.show_about = false;
+            self.show_news = false;
+            self.settings.seen_version = update::CURRENT.to_string();
+            self.settings.save();
         }
     }
 
@@ -2187,7 +3282,7 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
-        if self.confirm_delete || self.confirm_clear || self.confirm_configs || self.show_about {
+        if self.confirm_delete || self.confirm_clear || self.confirm_configs || self.show_news {
             return;
         }
         let typing = ctx.wants_keyboard_input();
@@ -2206,9 +3301,10 @@ impl App {
                 actions.push(Action::Reload);
             }
             if i.key_pressed(Key::F1) {
-                actions.push(Action::About);
+                actions.push(Action::ShowTab(Tab::Info));
             }
-            if typing || self.busy().is_some() {
+            // The keys below act on the entry list, which the pages do not show.
+            if typing || self.busy().is_some() || !self.tab.lists() {
                 return;
             }
             if i.key_pressed(Key::Space) {
@@ -2235,6 +3331,143 @@ impl App {
                 self.step_focus(-20, extend);
             }
         });
+    }
+}
+
+/// One of the sidebar's rows.
+struct NavRow {
+    label: &'static str,
+    hint: &'static str,
+    count: Option<usize>,
+    selected: bool,
+    /// The tab a click on it goes to.
+    opens: Tab,
+}
+
+/// A rounded tab with a coloured dot and, for a list, how many it holds.
+fn chip(ui: &mut egui::Ui, label: &str, count: Option<usize>, colour: Color32, selected: bool, t: f32) -> egui::Response {
+    let ink = if selected { Color32::WHITE } else { theme::TEXT };
+    let name = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::proportional(13.5), alpha(ink, t));
+    let number = count.map(|n| ui.painter().layout_no_wrap(n.to_string(), egui::FontId::proportional(11.5), alpha(theme::MUTED, t)));
+    let width = 30.0 + name.size().x + number.as_ref().map_or(0.0, |n| n.size().x + 7.0) + 12.0;
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 28.0), egui::Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let painter = ui.painter();
+    let (fill, edge) = match (selected, response.hovered()) {
+        (true, _) => (alpha(theme::ACCENT, 0.26), alpha(theme::ACCENT, 0.7)),
+        (false, true) => (theme::RAISED, theme::BORDER),
+        (false, false) => (theme::CARD, theme::BORDER),
+    };
+    painter.rect(rect, CornerRadius::same(14), alpha(fill, t), Stroke::new(1.0_f32, alpha(edge, t)), egui::StrokeKind::Inside);
+    painter.circle_filled(egui::pos2(rect.left() + 15.0, rect.center().y), 3.5, alpha(colour, t));
+    let mut x = rect.left() + 26.0;
+    painter.galley(egui::pos2(x, rect.center().y - name.size().y / 2.0), name.clone(), ink);
+    x += name.size().x + 7.0;
+    if let Some(number) = number {
+        painter.galley(egui::pos2(x, rect.center().y - number.size().y / 2.0), number, theme::MUTED);
+    }
+    response
+}
+
+/// What a rule does, in a few words.
+fn rule_summary(rule: &config::Rule) -> String {
+    let what = match &rule.action {
+        config::Action::Remove => "removed".to_string(),
+        config::Action::Local(path) => {
+            format!("replaced with {}", path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned()))
+        }
+        config::Action::Cdn(url) => format!("replaced with {}", url.rsplit('/').next().unwrap_or(url)),
+        config::Action::With(target) => format!("replaced with {target}"),
+        config::Action::Invalid(why) => format!("not usable: {why}"),
+    };
+    format!("{}, {what}", format::count(rule.targets.len(), "target", "targets"))
+}
+
+/// A rounded panel for one thing on a page. `t` is how far its entrance has come.
+fn card(ui: &mut egui::Ui, t: f32, add: impl FnOnce(&mut egui::Ui)) {
+    ui.scope(|ui| {
+        ui.set_opacity(t);
+        ui.add_space((1.0 - t) * 16.0);
+        egui::Frame::new()
+            .fill(theme::CARD)
+            .stroke(Stroke::new(1.0_f32, theme::BORDER))
+            .corner_radius(CornerRadius::same(12))
+            .inner_margin(Margin::same(16))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                add(ui);
+            });
+    });
+    ui.add_space(4.0);
+}
+
+/// A card-shaped placeholder with a band of light passing over it, shown while a list loads.
+fn skeleton_card(ui: &mut egui::Ui, now: f64, motion: bool) {
+    card(ui, 1.0, |ui| {
+        let phase = if motion { (now * 0.9).fract() as f32 } else { 0.5 };
+        for (width, height) in [(0.34, 18.0), (0.92, 11.0), (0.7, 11.0)] {
+            let (bar, _) = ui.allocate_exact_size(Vec2::new(ui.available_width() * width, height), egui::Sense::hover());
+            let painter = ui.painter().with_clip_rect(bar);
+            painter.rect_filled(bar, CornerRadius::same(5), theme::RAISED);
+            // The band crosses the whole card, not each bar on its own.
+            let span = ui.max_rect();
+            let x = span.left() - 140.0 + (span.width() + 280.0) * phase;
+            for (offset, strength) in [(0.0, 0.05), (30.0, 0.09), (60.0, 0.05)] {
+                let band = Rect::from_min_size(egui::pos2(x + offset, bar.top()), Vec2::new(40.0, height));
+                painter.rect_filled(band, CornerRadius::ZERO, alpha(Color32::WHITE, strength));
+            }
+            ui.add_space(3.0);
+        }
+    });
+}
+
+/// The one button on a page that does its main thing.
+fn primary_button(text: &str) -> egui::Button<'_> {
+    egui::Button::new(egui::RichText::new(text).color(Color32::WHITE)).fill(alpha(theme::ACCENT, 0.75))
+}
+
+/// An on/off switch whose knob slides.
+fn switch(ui: &mut egui::Ui, on: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(36.0, 20.0), egui::Sense::click());
+    let t = ui.ctx().animate_bool_with_time(response.id, on, 0.16);
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(10), theme::RAISED.lerp_to_gamma(alpha(theme::ACCENT, 0.9), t));
+    let x = rect.left() + 10.0 + (rect.width() - 20.0) * t;
+    painter.circle_filled(egui::pos2(x, rect.center().y), 7.0, Color32::WHITE);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Versions of the changelog with their changes as a list.
+fn versions_list(ui: &mut egui::Ui, versions: &[Version]) {
+    for version in versions {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            theme::pill(ui, &version.version, theme::LIME);
+            ui.label(egui::RichText::new(&version.date).color(theme::MUTED).small());
+        });
+        for change in &version.changes {
+            ui.horizontal_top(|ui| {
+                ui.label(egui::RichText::new("-").color(theme::MUTED));
+                ui.add(egui::Label::new(change).wrap());
+            });
+        }
+    }
+}
+
+/// Of the asset IDs `rules` name: how many there are, how many are identified,
+/// and how many Roblox refused to hand out.
+fn id_stats(rules: &[config::Rule], idmap: &IdMap) -> (usize, usize, usize) {
+    let ids = config::asset_ids(rules);
+    let looked_up: Vec<&Vec<config::Fingerprint>> = ids.iter().filter_map(|id| idmap.assets.get(&id.to_string())).collect();
+    let refused = looked_up.iter().filter(|prints| prints.is_empty()).count();
+    (ids.len(), looked_up.len() - refused, refused)
+}
+
+/// The entries a replacement went into, for the message about it.
+fn replaced_names(written: &[(Entry, Vec<u8>)]) -> String {
+    match written {
+        [(entry, _)] => format!("{} ({})", &entry.id_hex[..12], human_size(entry.size)),
+        _ => format!("the {} packs of the texture", written.len()),
     }
 }
 
@@ -2271,9 +3504,16 @@ impl eframe::App for App {
         self.poll_load(ctx);
         self.poll_watch(ctx);
         self.poll_update(ctx);
+        self.poll_catalog(ctx);
+        self.poll_pack(ctx);
         self.poll_config(ctx);
         self.poll_apply(ctx);
         self.poll_clear(ctx);
+        self.poll_reapply(ctx);
+        if self.sync_wanted && self.busy().is_none() && self.reapply_job.is_none() {
+            self.start_sync(ctx);
+        }
+        self.start_reapply(ctx);
         // In the tray the cache is still followed, but there is nothing to draw.
         if self.tray.as_ref().is_some_and(Tray::hidden) {
             return;
@@ -2294,7 +3534,6 @@ impl eframe::App for App {
 
         let bar = egui::Frame::new().fill(theme::PANEL).inner_margin(Margin::symmetric(10, 6));
         egui::TopBottomPanel::top("menu").frame(bar).show(ctx, |ui| self.menu_bar(ui, &mut actions));
-        egui::TopBottomPanel::top("toolbar").frame(bar.inner_margin(Margin::symmetric(10, 8))).show(ctx, |ui| self.toolbar(ui, &mut actions));
         egui::TopBottomPanel::bottom("status").frame(bar).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(&self.status).color(theme::MUTED).small());
@@ -2308,41 +3547,61 @@ impl eframe::App for App {
                         [only] => theme::pill(ui, &format!("Applying {}", only.name), theme::ACCENT),
                         several => theme::pill(ui, &format!("Applying {} configs", several.len()), theme::ACCENT),
                     }
-                    if !self.selected.is_empty() {
+                    if !self.selected.is_empty() && self.tab.lists() {
                         let text = format!("{} selected  -  {}", self.selected.len(), human_size(self.selected_bytes()));
                         ui.label(egui::RichText::new(text).color(theme::ACCENT).small());
                     }
                 });
             });
         });
-        egui::SidePanel::right("details")
-            .resizable(true)
-            .default_width(540.0)
-            .width_range(340.0..=820.0)
-            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(Margin::same(14)))
-            .show(ctx, |ui| self.details(ui, &mut actions));
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin::symmetric(10, 6))).show(ctx, |ui| {
-            if let Some(error) = &self.load_error {
-                ui.add_space(ui.available_height() * 0.36);
-                ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("Could not load the cache").size(20.0));
-                    ui.colored_label(theme::DANGER, error);
-                    if ui.button("Try again").clicked() {
-                        actions.push(Action::Reload);
-                    }
-                });
-            } else if self.loading.is_some() || self.clearing.is_some() {
-                // The splash covers the window while this goes on.
-            } else if self.tab == Tab::Live && self.arrivals.is_empty() {
-                self.live_placeholder(ui);
-            } else {
-                self.table(ui, &mut actions);
-            }
-        });
+        egui::SidePanel::left("nav")
+            .resizable(false)
+            .exact_width(NAV_WIDTH)
+            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(Margin::symmetric(0, 8)))
+            .show(ctx, |ui| self.sidebar(ui, &mut actions));
+        if !self.tab.lists() {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin::symmetric(18, 0)))
+                .show(ctx, |ui| self.page(ui, &mut actions));
+        } else {
+            egui::TopBottomPanel::top("toolbar").frame(bar.inner_margin(Margin::symmetric(10, 8))).show(ctx, |ui| {
+                self.browse_chips(ui, &mut actions);
+                ui.add_space(2.0);
+                self.toolbar(ui, &mut actions);
+            });
+            egui::SidePanel::right("details")
+                .resizable(true)
+                .default_width(500.0)
+                .width_range(340.0..=820.0)
+                .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(Margin::same(14)))
+                .show(ctx, |ui| self.details(ui, &mut actions));
+            egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin::symmetric(10, 6))).show(ctx, |ui| {
+                // A newly opened tab's list fades in as it settles into place.
+                let t = self.entrance(ui.ctx(), 0);
+                ui.set_opacity(0.2 + 0.8 * t);
+                ui.add_space((1.0 - t) * 10.0);
+                if let Some(error) = &self.load_error {
+                    ui.add_space(ui.available_height() * 0.36);
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("Could not load the cache").size(20.0));
+                        ui.colored_label(theme::DANGER, error);
+                        if ui.button("Try again").clicked() {
+                            actions.push(Action::Reload);
+                        }
+                    });
+                } else if self.loading.is_some() || self.clearing.is_some() {
+                    // The splash covers the window while this goes on.
+                } else if self.tab == Tab::Live && self.arrivals.is_empty() {
+                    self.live_placeholder(ui);
+                } else {
+                    self.table(ui, &mut actions);
+                }
+            });
+        }
         self.delete_dialog(ctx, &mut actions);
         self.clear_dialog(ctx, &mut actions);
         self.configs_dialog(ctx, &mut actions);
-        self.about_dialog(ctx);
+        self.news_dialog(ctx);
         self.show_toast(ctx);
         self.show_splash(ctx);
 
@@ -2662,7 +3921,15 @@ fn build_preview(dir: &std::path::Path, entry: &Entry, idmap: &IdMap, ctx: &egui
             Err(e) => preview.error = Some(format!("Could not decode the image: {e}")),
         },
         "ktx2" => match viewers::decode_ktx2(body, 2048) {
-            Ok(image) => show_image(&mut preview, image),
+            Ok(image) => {
+                if let Some(pack) = crate::texture::Pack::parse(body) {
+                    let whole = pack.full_size().map_or(String::new(), |(w, h)| format!(" of a {w} x {h} texture"));
+                    let levels = format::count(pack.levels as usize, "mip level", "mip levels");
+                    preview.facts.push(("Texture pack", format!("{} x {}, {levels}{whole}", pack.width, pack.height)));
+                    preview.facts.push(("Content hash", pack.content_hash));
+                }
+                show_image(&mut preview, image)
+            }
             Err(e) => preview.error = Some(format!("Could not decode the texture: {e:#}")),
         },
         "mesh" => match viewers::parse_mesh(body) {
@@ -2730,4 +3997,57 @@ fn build_preview(dir: &std::path::Path, entry: &Entry, idmap: &IdMap, ctx: &egui
     }
     preview.hex = format::hex_dump(body, 256);
     preview
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Action as Does, Rule, Target};
+
+    fn config(name: &str, rules: &[(&str, &[u64])]) -> LoadedConfig {
+        let rules = rules
+            .iter()
+            .map(|(rule, ids)| Rule { name: rule.to_string(), targets: ids.iter().map(|id| Target::Asset(*id)).collect(), action: Does::Remove })
+            .collect();
+        LoadedConfig { name: name.into(), path: format!("{name}.json").into(), rules, enabled: true, off: BTreeSet::new(), error: None }
+    }
+
+    /// The asset IDs each rule in force sets, by rule name.
+    fn in_force(configs: &[LoadedConfig], winners: &BTreeMap<String, PathBuf>) -> Vec<(String, Vec<String>)> {
+        rules_in_force(configs, winners).into_iter().map(|r| (r.name, r.targets.iter().map(|t| t.to_string()).collect())).collect()
+    }
+
+    #[test]
+    fn a_shared_target_goes_to_one_config() {
+        let mut configs = vec![config("a", &[("sky", &[1, 2]), ("font", &[3])]), config("b", &[("night", &[2, 3, 4])])];
+        let found = conflicts(&configs);
+        assert_eq!(found.iter().map(|c| c.target.as_str()).collect::<Vec<_>>(), ["asset 2", "asset 3"]);
+        assert_eq!(found[0].sides, [(0, "sky".to_string()), (1, "night".to_string())]);
+
+        // Left alone, the config lower in the list has what both set.
+        let mut winners = BTreeMap::new();
+        let own = |name: &str, ids: &[&str]| (name.to_string(), ids.iter().map(|id| id.to_string()).collect::<Vec<_>>());
+        assert_eq!(in_force(&configs, &winners), [own("a / sky", &["asset 1"]), own("b / night", &["asset 2", "asset 3", "asset 4"])]);
+        // Chosen one by one.
+        winners.insert("asset 2".to_string(), PathBuf::from("a.json"));
+        assert_eq!(in_force(&configs, &winners), [own("a / sky", &["asset 1", "asset 2"]), own("b / night", &["asset 3", "asset 4"])]);
+
+        // A rule that is switched off takes no part, so there is nothing left to choose for its targets.
+        configs[1].off.insert("night".to_string());
+        assert!(conflicts(&configs).is_empty());
+        assert_eq!(in_force(&configs, &winners), [own("a / sky", &["asset 1", "asset 2"]), own("a / font", &["asset 3"])]);
+        // Nor does a config that is switched off, whatever was chosen for it.
+        configs[1].off.clear();
+        configs[0].enabled = false;
+        assert_eq!(in_force(&configs, &winners), [own("night", &["asset 2", "asset 3", "asset 4"])]);
+    }
+
+    #[test]
+    fn rules_that_share_a_name_are_told_apart() {
+        let config = config("a", &[("font", &[1]), ("icon", &[2]), ("font", &[3]), ("font", &[4])]);
+        assert_eq!(rule_keys(&config.rules), ["font", "icon", "font #2", "font #3"]);
+        assert_eq!(Tab::named("Textures"), Some(Tab::Group(1)));
+        assert_eq!((Tab::named("guide"), Tab::named("nope")), (Some(Tab::Guide), None));
+        assert!(Tab::Other.holds("binary") && !Tab::Other.holds("redirect") && !Tab::Other.holds("png"));
+    }
 }

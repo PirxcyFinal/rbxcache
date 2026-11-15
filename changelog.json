@@ -1,0 +1,33 @@
+{
+  "versions": [
+    {
+      "version": "1.1.0",
+      "date": "2026-11-15",
+      "changes": [
+        "Texture rules now rewrite every mip pack Roblox keeps for a texture, in Roblox's own format. 1.0 replaced only the smallest pack.",
+        "Switching a config off, or removing it, puts back what it replaced. rbxcache keeps a copy of each original.",
+        "Every rule in a config has its own switch.",
+        "When two configs change the same thing, you choose which one has it.",
+        "The sidebar has two halves, Browse and Manage. Browse has a tab for each kind of asset in the cache; Manage has Configs, Packs, Guide and Info.",
+        "Packs: a list of known packs, kept in the repository, that can be applied from the app.",
+        "A guide to using configs, in the app and in the README.",
+        "Sounds and other assets that Roblox would not hand out without a login are counted as such instead of silently doing nothing. The pack list can carry fingerprints for them; none are published yet.",
+        "A replacement taken from another asset ID uses that asset's full-size picture when Roblox gives it out, and removing an image writes a transparent picture rather than an empty file.",
+        "Only one window opens at a time; starting rbxcache again brings up the one that is running.",
+        "After an update, a window lists what changed, and update notices list every version since yours.",
+        "Putting configs on what Roblox has just downloaded no longer holds up the window, and files a config downloads are fetched once per session.",
+        "macOS builds are app bundles in a disk image, one for Apple silicon and one for Intel, and every release file carries the version number."
+      ]
+    },
+    {
+      "version": "1.0.0",
+      "date": "2026-11-15",
+      "changes": [
+        "First release: browse, preview, export, replace and delete entries of the Roblox asset cache.",
+        "Replacement configs in the format Fleasion uses, several at once, re-applied while the cache is watched.",
+        "Asset IDs matched to cached entries without a login, for public assets.",
+        "A Live list of what Roblox writes, clearing the cache, the notification-area icon and the update check."
+      ]
+    }
+  ]
+}

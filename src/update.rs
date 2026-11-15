@@ -1,5 +1,6 @@
 //! Checking GitHub for a newer release.
 
+use crate::changelog::{self, Version};
 use anyhow::{anyhow, Context, Result};
 use std::time::Duration;
 
@@ -14,6 +15,9 @@ pub struct Release {
     pub version: String,
     /// The release page.
     pub url: String,
+    /// What changed in each version after this one, newest first. Empty when
+    /// the release is not newer or the changelog could not be fetched.
+    pub news: Vec<Version>,
 }
 
 impl Release {
@@ -32,14 +36,19 @@ pub fn latest() -> Result<Release> {
         Err(ureq::Error::Status(404, _)) => return Err(anyhow!("no public release was found")),
         Err(e) => return Err(e).context("could not reach GitHub"),
     };
-    parse(&serde_json::from_reader(response.into_reader()).context("GitHub sent an unreadable answer")?)
+    let mut release = parse(&serde_json::from_reader(response.into_reader()).context("GitHub sent an unreadable answer")?)?;
+    if release.is_newer() {
+        // The update is worth reporting even when its changelog cannot be had.
+        release.news = changelog::fetch().map(|all| changelog::between(all, CURRENT, &release.version)).unwrap_or_default();
+    }
+    Ok(release)
 }
 
 /// Reads the fields this tool needs from GitHub's description of a release.
 fn parse(body: &serde_json::Value) -> Result<Release> {
     let tag = body["tag_name"].as_str().context("the release has no tag")?;
     let url = body["html_url"].as_str().context("the release has no page")?;
-    Ok(Release { version: tag.trim_start_matches('v').to_string(), url: url.to_string() })
+    Ok(Release { version: tag.trim_start_matches('v').to_string(), url: url.to_string(), news: Vec::new() })
 }
 
 /// True when version `a` is later than `b`. Numbers are compared part by part;
@@ -64,7 +73,7 @@ mod tests {
     fn reads_a_release() {
         let body = serde_json::json!({"tag_name": "v9.9.9", "html_url": "https://example.com/r", "draft": false});
         let release = parse(&body).unwrap();
-        assert_eq!(release, Release { version: "9.9.9".into(), url: "https://example.com/r".into() });
+        assert_eq!(release, Release { version: "9.9.9".into(), url: "https://example.com/r".into(), news: Vec::new() });
         assert!(release.is_newer());
         assert!(parse(&serde_json::json!({"message": "Not Found"})).is_err());
     }

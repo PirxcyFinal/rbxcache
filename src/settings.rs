@@ -2,6 +2,7 @@
 
 use crate::protection::data_dir;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -14,6 +15,10 @@ pub struct Settings {
     pub watch: bool,
     /// The configs that were loaded when the app last ran.
     pub configs: Vec<SavedConfig>,
+    /// Where two configs set the same target and the user picked one: target -> that config's file.
+    pub winners: BTreeMap<String, PathBuf>,
+    /// The version whose changes were last shown on launch.
+    pub seen_version: String,
 }
 
 /// A loaded config as it is remembered between runs.
@@ -23,6 +28,9 @@ pub struct SavedConfig {
     /// Whether it is re-applied to what Roblox writes.
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
+    /// The rules of it that are switched off, by name.
+    #[serde(default)]
+    pub off: Vec<String>,
 }
 
 fn enabled_by_default() -> bool {
@@ -31,7 +39,7 @@ fn enabled_by_default() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { close_to_tray: true, animations: true, watch: true, configs: Vec::new() }
+        Self { close_to_tray: true, animations: true, watch: true, configs: Vec::new(), winners: BTreeMap::new(), seen_version: String::new() }
     }
 }
 
@@ -65,6 +73,6 @@ mod tests {
         assert_eq!(settings, Settings { animations: false, ..Settings::default() });
         assert!(Settings::default().close_to_tray);
         let listed: Settings = serde_json::from_str(r#"{"configs": [{"path": "a.json"}]}"#).unwrap();
-        assert_eq!(listed.configs, [SavedConfig { path: "a.json".into(), enabled: true }]);
+        assert_eq!(listed.configs, [SavedConfig { path: "a.json".into(), enabled: true, off: Vec::new() }]);
     }
 }

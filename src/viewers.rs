@@ -34,8 +34,7 @@ const MAX_TEXELS: usize = 1 << 26;
 /// `VK_FORMAT_R8G8B8A8_UNORM`.
 const VK_RGBA8: u32 = 37;
 
-/// Writes RGBA pixels as an uncompressed, single-level KTX2 texture, which
-/// Roblox accepts in place of the block-compressed ones it downloads.
+/// Writes RGBA pixels as an uncompressed, single-level KTX2 texture.
 pub fn encode_ktx2(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
     ensure!(width > 0 && height > 0 && rgba.len() == width as usize * height as usize * 4, "pixel data does not fit the texture size");
     // Data format descriptor: four 8-bit unsigned channels, sRGB primaries, linear transfer.
@@ -76,21 +75,6 @@ pub fn encode_ktx2(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
     out.resize(level_at, 0);
     out.extend_from_slice(rgba);
     Ok(out)
-}
-
-/// Makes replacement content suit the entry it goes into. Roblox asks for
-/// textures as KTX2, so an ordinary image bound for a KTX2 entry is converted;
-/// everything else is used as it is.
-pub fn fit_payload<'a>(target_kind: &str, payload: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
-    if !matches!(target_kind, "ktx2" | "ktx") || !matches!(crate::format::sniff(payload), "png" | "jpeg" | "gif" | "webp") {
-        return payload.into();
-    }
-    let converted = image::load_from_memory(payload).ok().map(|i| i.to_rgba8()).and_then(|i| encode_ktx2(i.width(), i.height(), i.as_raw()).ok());
-    match converted {
-        Some(ktx2) => ktx2.into(),
-        // An image that cannot be decoded is written as it is rather than dropped.
-        None => payload.into(),
-    }
 }
 
 /// Decodes a KTX2 texture to RGBA. Roblox ships block-compressed (BC) data with
@@ -618,17 +602,6 @@ mod tests {
         let image = decode_ktx2(&file, 4096).unwrap();
         assert_eq!((image.width, image.height, image.pixels), (3, 2, pixels));
         assert!(encode_ktx2(3, 2, &[0; 5]).is_err());
-    }
-
-    #[test]
-    fn images_are_converted_only_for_texture_entries() {
-        let mut png = Vec::new();
-        image::RgbaImage::from_pixel(2, 2, image::Rgba([9, 8, 7, 255]))
-            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-            .unwrap();
-        assert_eq!(crate::format::sniff(&fit_payload("ktx2", &png)), "ktx2");
-        assert_eq!(&*fit_payload("png", &png), &png[..]);
-        assert_eq!(&*fit_payload("ktx2", b"OggS....."), b"OggS.....");
     }
 
     #[test]

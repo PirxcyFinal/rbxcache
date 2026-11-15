@@ -1,0 +1,41 @@
+{
+  "packs": [
+    {
+      "id": "determination",
+      "name": "DETERMINATION",
+      "game": "RIVALS",
+      "description": "Undertale and Deltarune: sounds, music, the font, rank icons, the logo and a new skybox.",
+      "config": "packs/determination.json"
+    },
+    {
+      "id": "mirc-5k",
+      "name": "Mirc's 5k Pack",
+      "author": "Mirc",
+      "game": "RIVALS",
+      "description": "TETR.IO and classic Roblox sounds, a new font, letter-grade rank icons, custom skyboxes and a dark arena.",
+      "config": "packs/mirc-5k.json"
+    },
+    {
+      "id": "minecraft-classic-day",
+      "name": "Minecraft Classic v1.3 (Day)",
+      "game": "RIVALS",
+      "description": "Minecraft sounds, music, rank icons, item slots, the logo and a day sky. The game's font is left as it is.",
+      "config": "packs/minecraft-classic-day.json"
+    },
+    {
+      "id": "minecraft-classic-font-day",
+      "name": "Minecraft Classic v1.3 (Font, Day)",
+      "game": "RIVALS",
+      "description": "Minecraft sounds, music, the font, rank icons, item slots, the logo and a day sky.",
+      "config": "packs/minecraft-classic-font-day.json"
+    },
+    {
+      "id": "minecraft-classic-font-night",
+      "name": "Minecraft Classic v1.3 (Font, Night)",
+      "game": "RIVALS",
+      "description": "Minecraft sounds, music, the font, rank icons, item slots, the logo and a night sky.",
+      "config": "packs/minecraft-classic-font-night.json"
+    }
+  ],
+  "fingerprints": {}
+}

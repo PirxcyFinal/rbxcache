@@ -30,7 +30,11 @@ pub struct Args {
 #[derive(Subcommand)]
 pub enum Cmd {
     /// Open the graphical explorer (the default)
-    Gui,
+    Gui {
+        /// Open on this tab: all, live, configs, packs, info, or a kind of asset such as textures
+        #[arg(long)]
+        tab: Option<String>,
+    },
     /// Check GitHub for a newer release
     Update,
     /// Summarise the cache by category and content type
@@ -153,6 +157,29 @@ pub enum Cmd {
         #[arg(required = true)]
         ids: Vec<String>,
     },
+    /// List the known packs, or download one and apply it
+    Packs {
+        /// Apply the pack with this id
+        #[arg(long)]
+        apply: Option<String>,
+        /// With --apply: only report what would change
+        #[arg(long, requires = "apply")]
+        dry_run: bool,
+    },
+    /// Print the fingerprints recorded for the asset IDs in configs, to publish in packs.json
+    Share {
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+    },
+    /// Show what changed in each version
+    Changelog,
+    /// Write the app icon as a PNG file
+    #[command(hide = true)]
+    Icon {
+        output: PathBuf,
+        #[arg(long, default_value_t = 1024)]
+        size: u32,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -165,11 +192,12 @@ pub enum Sort {
 
 pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
     match cmd {
-        Cmd::Gui => unreachable!("handled by main"),
+        Cmd::Gui { .. } => unreachable!("handled by main"),
         Cmd::Update => {
             let release = crate::update::latest()?;
             if release.is_newer() {
                 println!("rbxcache {} is available (this is {}): {}", release.version, crate::update::CURRENT, release.url);
+                print_versions(&release.news);
             } else {
                 println!("rbxcache {} is the latest release", crate::update::CURRENT);
             }
@@ -285,8 +313,10 @@ pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
                 (None, Some(from)) => store.read_body(&store.resolve(&from)?)?,
                 (None, None) => unreachable!("clap requires a file or --from"),
             };
-            let e = store.replace_body(&id, &body)?;
-            println!("replaced {} - now {} ({})", e.id_hex, e.kind, human_size(e.size));
+            let entries = store.list(|_, _| {})?;
+            for (e, _) in config::replace_by_hand(&store, &entries, &id, body)? {
+                println!("replaced {} - now {} ({})", e.id_hex, e.kind, human_size(e.size));
+            }
             Ok(())
         }
         Cmd::Watch { config, interval } => watch(dir, idmap_path, &config, interval),
@@ -313,26 +343,61 @@ pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::ApplyConfig { files, dry_run, offline } => {
-            let rules = config::load_all(&files)?;
-            let store = Store::open(dir, !dry_run)?;
-            if !dry_run {
-                warn_if_running();
+        Cmd::ApplyConfig { files, dry_run, offline } => apply_configs(dir, idmap_path, &files, dry_run, offline),
+        Cmd::Packs { apply: None, .. } => {
+            // The list on GitHub, or the one built in when that cannot be reached.
+            let catalog = crate::packs::fetch().unwrap_or_else(|e| {
+                eprintln!("{e:#}; showing the list this version was built with");
+                crate::packs::bundled()
+            });
+            for pack in &catalog.packs {
+                let by = if pack.author.is_empty() { String::new() } else { format!(" by {}", pack.author) };
+                println!("{:<16} {}{by}  [{}]\n{:<16} {}", pack.id, pack.name, pack.game, "", pack.description);
             }
-            let entries = store.list(|_, _| {})?;
+            println!("{}; apply one with: rbxcache packs --apply <id>", format::count(catalog.packs.len(), "pack", "packs"));
+            Ok(())
+        }
+        Cmd::Packs { apply: Some(id), dry_run } => {
+            let catalog = crate::packs::fetch()?;
+            let pack =
+                catalog.packs.iter().find(|p| p.id == id).with_context(|| format!("there is no pack '{id}'; run 'rbxcache packs' for the list"))?;
+            // A dry run leaves nothing behind: the config goes to the temp folder and the ID map stays as it is.
+            let path = if dry_run { pack.install_into(&std::env::temp_dir().join("rbxcache-packs"))? } else { pack.install()? };
+            println!("{} saved to {}", pack.name, path.display());
             let mut idmap = IdMap::load(idmap_path)?;
-            if !offline {
-                identify(&store, &entries, &mut idmap, idmap_path, &rules, false)?;
+            if !dry_run && idmap.merge(&catalog.fingerprints) > 0 {
+                idmap.save(idmap_path)?;
             }
-            let reports = config::run(&store, &entries, &idmap, &rules, !dry_run, None);
-            for r in &reports {
-                println!("{:<28} matched {:>5}  {} {:>5}", r.name, r.matched, if dry_run { "would change" } else { "changed" }, r.changed);
-                for note in &r.notes {
-                    println!("    ! {note}");
+            apply_configs(dir, idmap_path, &[path], dry_run, dry_run)
+        }
+        Cmd::Share { files } => {
+            let rules = config::load_all(&files)?;
+            let idmap = IdMap::load(idmap_path)?;
+            let ids = config::asset_ids(&rules);
+            let mut known = IdMap::default();
+            for id in &ids {
+                for fp in idmap.assets.get(&id.to_string()).into_iter().flatten() {
+                    known.add(*id, fp.clone());
                 }
             }
-            println!("{}", config::summarize(&reports, !dry_run));
+            println!("{}", serde_json::to_string_pretty(&known)?);
+            eprintln!(
+                "{} of {} have a fingerprint; paste these under \"fingerprints\" in packs.json",
+                known.assets.len(),
+                format::count(ids.len(), "asset ID", "asset IDs")
+            );
             Ok(())
+        }
+        Cmd::Changelog => {
+            print_versions(&crate::changelog::bundled());
+            Ok(())
+        }
+        Cmd::Icon { output, size } => {
+            let size = size.clamp(16, 2048);
+            image::RgbaImage::from_raw(size, size, crate::theme::app_icon(size))
+                .context("the icon has the wrong size")?
+                .save(&output)
+                .with_context(|| format!("writing {}", output.display()))
         }
         Cmd::Probe { kind, limit } => {
             let store = Store::open(dir, false)?;
@@ -414,6 +479,47 @@ pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
     }
 }
 
+fn print_versions(versions: &[crate::changelog::Version]) {
+    for version in versions {
+        let date = if version.date.is_empty() { String::new() } else { format!("  ({})", version.date) };
+        println!("\n{}{date}", version.version);
+        for change in &version.changes {
+            println!("  - {change}");
+        }
+    }
+}
+
+/// Looks up the asset IDs the configs name, unless `offline`, and applies the configs.
+fn apply_configs(dir: &Path, idmap_path: &Path, files: &[PathBuf], dry_run: bool, offline: bool) -> Result<()> {
+    let rules = config::load_all(files)?;
+    let store = Store::open(dir, !dry_run)?;
+    if !dry_run {
+        warn_if_running();
+    }
+    let entries = store.list(|_, _| {})?;
+    let mut idmap = IdMap::load(idmap_path)?;
+    if !offline {
+        identify(&store, &entries, &mut idmap, idmap_path, &rules, false)?;
+    }
+    let reports = config::run(&store, &entries, &idmap, &rules, !dry_run, None, None);
+    for r in &reports {
+        let mut absent = Vec::new();
+        if r.waiting > 0 {
+            absent.push(format!("{} not cached", r.waiting));
+        }
+        if r.refused > 0 {
+            absent.push(format!("{} not handed out", r.refused));
+        }
+        let absent = if absent.is_empty() { String::new() } else { format!("  ({})", absent.join(", ")) };
+        println!("{:<28} matched {:>5}  {} {:>5}{absent}", r.name, r.matched, if dry_run { "would change" } else { "changed" }, r.changed);
+        for note in &r.notes {
+            println!("    ! {note}");
+        }
+    }
+    println!("{}", config::summarize(&reports, !dry_run));
+    Ok(())
+}
+
 /// Prints cache activity until interrupted, re-applying `configs` to what Roblox writes.
 fn watch(dir: &Path, idmap_path: &Path, configs: &[PathBuf], interval: f32) -> Result<()> {
     use crate::watch::{merge, Tracker, Verdict, Watcher};
@@ -426,7 +532,7 @@ fn watch(dir: &Path, idmap_path: &Path, configs: &[PathBuf], interval: f32) -> R
     }
     let mut tracker = Tracker::default();
     if let Some(rules) = &rules {
-        for report in config::run(&store, &entries, &idmap, rules, true, None) {
+        for report in config::run(&store, &entries, &idmap, rules, true, None, None) {
             for entry in &report.written {
                 println!("= applied   {:<12} {}  ({})", entry.kind, entry.id_hex, report.name);
                 tracker.record(entry);
@@ -460,7 +566,7 @@ fn watch(dir: &Path, idmap_path: &Path, configs: &[PathBuf], interval: f32) -> R
         if fresh.is_empty() {
             continue;
         }
-        for report in config::run(&store, &entries, &idmap, rules, true, Some(&fresh)) {
+        for report in config::run(&store, &entries, &idmap, rules, true, Some(&fresh), None) {
             for entry in &report.written {
                 println!("= applied   {:<12} {}  ({})", entry.kind, entry.id_hex, report.name);
                 tracker.record(entry);

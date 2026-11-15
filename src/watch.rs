@@ -122,6 +122,11 @@ impl Tracker {
         self.applied.get(&entry.id).is_some_and(|a| a.size == entry.size)
     }
 
+    /// Notes that an entry no longer holds a replacement of ours.
+    pub fn forget(&mut self, id: &Id) {
+        self.applied.remove(id);
+    }
+
     /// Protected replacements are retried indefinitely.
     pub fn may_replace(&self, id: &Id) -> bool {
         let _ = id;

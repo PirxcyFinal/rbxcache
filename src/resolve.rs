@@ -3,8 +3,10 @@
 //! The cache does not record asset IDs, but Roblox's asset delivery endpoint
 //! serves many assets to anyone, with no login. An asset fetched that way is
 //! byte-for-byte what the client cached, so its fingerprint identifies the
-//! entry. Images are the exception: the client asks for a KTX2 rendition, so
-//! that rendition is fetched as well.
+//! entry. Images are the exception: the client asks for KTX2 renditions, one
+//! per group of mip levels. The first of those is fetched as well; it carries
+//! the content hash that every other pack of the texture has too (see
+//! [`crate::texture`]).
 //!
 //! Both fingerprints go into the ID map whether or not the asset is cached
 //! yet, so an entry Roblox downloads later is recognised when it arrives.
@@ -15,8 +17,9 @@
 use crate::config::{fingerprint, Fingerprint, IdMap};
 use crate::format;
 use crate::store::{Entry, Store};
+use crate::texture;
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::time::Duration;
 
@@ -50,7 +53,8 @@ pub fn fetch(id: u64, ktx2: bool) -> Result<Fetched> {
     match ureq::get(&url).set("User-Agent", "rbxcache").timeout(Duration::from_secs(40)).call() {
         Ok(response) => {
             let mut body = Vec::new();
-            response.into_reader().take(LIMIT).read_to_end(&mut body).with_context(|| format!("downloading asset {id}"))?;
+            response.into_reader().take(LIMIT + 1).read_to_end(&mut body).with_context(|| format!("downloading asset {id}"))?;
+            anyhow::ensure!(body.len() as u64 <= LIMIT, "asset {id} is larger than {} MB", LIMIT >> 20);
             Ok(Fetched::Body(body))
         }
         Err(ureq::Error::Status(code @ (401 | 403), _)) => Ok(Fetched::Denied(code)),
@@ -65,7 +69,7 @@ pub enum Outcome {
     Known,
     /// The public download is byte-for-byte a cached entry.
     Exact,
-    /// The KTX2 rendition of the image is byte-for-byte a cached entry.
+    /// A KTX2 pack of the image is cached.
     Rendition,
     /// Fetched, but nothing in the cache matches. It will match once Roblox downloads it.
     NotCached,
@@ -86,7 +90,7 @@ impl std::fmt::Display for Outcome {
         match self {
             Outcome::Known => write!(f, "already known"),
             Outcome::Exact => write!(f, "matched exactly"),
-            Outcome::Rendition => write!(f, "matched its KTX2 rendition"),
+            Outcome::Rendition => write!(f, "matched its texture packs"),
             Outcome::NotCached => write!(f, "not in the cache yet"),
             Outcome::Denied(401) => write!(f, "needs a Roblox login"),
             Outcome::Denied(REMEMBERED) => write!(f, "not available without a login (remembered)"),
@@ -127,6 +131,8 @@ struct Cache<'a> {
     entries: &'a [Entry],
     by_size: HashMap<u64, Vec<usize>>,
     md5s: HashMap<usize, String>,
+    /// Content hashes of the cached texture packs; read when first needed.
+    textures: Option<HashSet<String>>,
 }
 
 impl<'a> Cache<'a> {
@@ -137,21 +143,43 @@ impl<'a> Cache<'a> {
                 by_size.entry(e.body_len).or_default().push(i);
             }
         }
-        Self { store, entries, by_size, md5s: HashMap::new() }
+        Self { store, entries, by_size, md5s: HashMap::new(), textures: None }
     }
 
-    fn holds(&mut self, fp: &Fingerprint) -> bool {
-        let Some(candidates) = self.by_size.get(&fp.size) else { return false };
-        for &i in candidates {
+    /// The entry holding exactly this content.
+    fn find(&mut self, fp: &Fingerprint) -> Option<usize> {
+        for &i in self.by_size.get(&fp.size)? {
             if !self.md5s.contains_key(&i) {
                 let Ok(body) = self.store.read_body(&self.entries[i].id) else { continue };
                 self.md5s.insert(i, fingerprint(&body).md5);
             }
             if self.md5s[&i] == fp.md5 {
-                return true;
+                return Some(i);
             }
         }
-        false
+        None
+    }
+
+    /// True when the cache has this content, or any pack of the texture it belongs to.
+    fn holds(&mut self, fp: &Fingerprint) -> bool {
+        if self.find(fp).is_some() {
+            return true;
+        }
+        let Some(hash) = &fp.texture else { return false };
+        let (store, entries) = (self.store, self.entries);
+        self.textures.get_or_insert_with(|| entries.iter().filter_map(|e| texture::hash_of(store, e)).collect()).contains(hash)
+    }
+
+    /// The same fingerprint with its texture's content hash filled in, when it
+    /// lacks one and the pack it describes is cached. Maps written before
+    /// packs were understood are completed this way.
+    fn completed(&mut self, fp: &Fingerprint) -> Option<Fingerprint> {
+        if fp.texture.is_some() {
+            return None;
+        }
+        let i = self.find(fp)?;
+        let texture = texture::hash_of(self.store, &self.entries[i])?;
+        Some(Fingerprint { texture: Some(texture), ..fp.clone() })
     }
 }
 
@@ -174,6 +202,11 @@ pub fn identify(
     let mut outcomes: HashMap<u64, Outcome> = HashMap::new();
     let mut unknown = Vec::new();
     for &id in ids {
+        for fp in idmap.assets.get(&id.to_string()).cloned().unwrap_or_default() {
+            if let Some(fp) = cache.completed(&fp) {
+                idmap.add(id, fp);
+            }
+        }
         match idmap.assets.get(&id.to_string()).cloned() {
             Some(prints) if prints.iter().any(|fp| cache.holds(fp)) => drop(outcomes.insert(id, Outcome::Known)),
             Some(_) if refresh => unknown.push(id),
@@ -185,19 +218,23 @@ pub fn identify(
     }
 
     let fetched = parallel(&unknown, progress, |&id| (id, fetch(id, false)));
-    let mut images = Vec::new();
+    // Images are cached as the KTX2 packs the client asks for, not as the file
+    // itself. Their fingerprint waits until the first pack has been asked for
+    // too: recorded on its own it would mark the ID as looked up, and a pack
+    // request that failed would never be made again.
+    let mut images: Vec<(u64, Fingerprint)> = Vec::new();
     for (id, result) in fetched {
         let outcome = match result {
             Ok(Fetched::Body(body)) => {
                 let fp = fingerprint(&body);
-                let cached = cache.holds(&fp);
-                idmap.add(id, fp);
-                if !cached && format::is_image(format::sniff(&body)) {
-                    images.push(id);
-                }
-                if cached {
+                if cache.holds(&fp) {
+                    idmap.add(id, fp);
                     Outcome::Exact
+                } else if format::is_image(format::sniff(&body)) {
+                    images.push((id, fp));
+                    continue;
                 } else {
+                    idmap.add(id, fp);
                     Outcome::NotCached
                 }
             }
@@ -214,15 +251,27 @@ pub fn identify(
         outcomes.insert(id, outcome);
     }
 
-    // Images are cached as the KTX2 rendition the client asked for.
-    for (id, result) in parallel(&images, &|_, _| {}, |&id| (id, fetch(id, true))) {
-        if let Ok(Fetched::Body(body)) = result {
-            let fp = fingerprint(&body);
-            if cache.holds(&fp) {
-                outcomes.insert(id, Outcome::Rendition);
+    for ((id, original), result) in parallel(&images, &|_, _| {}, |(id, original)| ((*id, original.clone()), fetch(*id, true))) {
+        let outcome = match result {
+            Ok(Fetched::Body(body)) => {
+                let pack = fingerprint(&body);
+                let cached = cache.holds(&pack);
+                idmap.add(id, original);
+                idmap.add(id, pack);
+                if cached {
+                    Outcome::Rendition
+                } else {
+                    Outcome::NotCached
+                }
             }
-            idmap.add(id, fp);
-        }
+            // There is no pack to be had, so the file itself is all that can be known.
+            Ok(Fetched::Denied(_) | Fetched::Gone) => {
+                idmap.add(id, original);
+                Outcome::NotCached
+            }
+            Err(e) => Outcome::Failed(format!("{e:#}")),
+        };
+        outcomes.insert(id, outcome);
     }
     ids.iter().map(|id| (*id, outcomes.get(id).cloned().unwrap_or(Outcome::NotCached))).collect()
 }

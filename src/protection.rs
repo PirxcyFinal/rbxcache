@@ -55,12 +55,13 @@ impl Protections {
         for id in ids {
             let hex = store::hex(&id);
             let Some(saved) = self.manifest.replacements.get(&hex).cloned() else { continue };
-            let body = std::fs::read(self.root.join(&saved.body))?;
+            // One entry that has gone, or whose saved copy has, must not stop the rest being restored.
+            let Ok(body) = std::fs::read(self.root.join(&saved.body)) else { continue };
             let current = store.read_body(&id).ok();
             if current.as_deref() == Some(body.as_slice()) {
                 continue;
             }
-            let entry = store.replace_body(&id, &body)?;
+            let Ok(entry) = store.replace_body(&id, &body) else { continue };
             if let Some(meta) = self.manifest.replacements.get_mut(&hex) {
                 meta.restored += 1;
             }

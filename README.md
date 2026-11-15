@@ -18,9 +18,12 @@ disk, and it reads the same config format, with the exceptions listed under
 "Safest" is not "risk free". Changing how a game looks on your own machine may
 still be against Roblox's rules or a game's, and that is yours to judge.
 
-To undo everything, remove or untick your configs and clear the cache: Roblox
-downloads the originals again. Entries you replaced by hand are protected and
-are put back after a clear, so delete those first if you want them gone.
+Switching a config off puts back what it replaced, from a copy rbxcache keeps
+of each original. To undo everything at once, remove your configs and clear the
+cache: Roblox downloads the originals again. Entries you replaced by hand are
+protected, which means they are replaced again whenever Roblox rewrites them,
+after a clear too; there is no command yet to stop protecting one, short of
+deleting the `protections` folder in the data folder.
 
 Windows, macOS and Linux. The cache is looked for in the client's own folder:
 
@@ -31,13 +34,22 @@ Windows, macOS and Linux. The cache is looked for in the client's own folder:
 | Linux (Sober) | `~/.var/app/org.vinegarhq.Sober/data/sober/appData` |
 
 Pass `--dir <folder>` to use another one. Development and testing so far have
-been on Windows; the macOS and Linux builds compile and pass the unit tests in
-CI but have not been run against a real cache.
+been on Windows. Each release is built and unit-tested in CI on Apple silicon,
+an Intel Mac and Linux, and on the two Macs the app is also opened from its
+disk image; but the macOS and Linux builds have not been run against a real
+cache.
+
+It is lightweight by construction. Nothing runs inside Roblox and nothing sits
+between it and its servers, so there is nothing to cost frames or add lag: a
+replacement is a file swapped on disk, which Roblox loads the way it loads any
+cached asset.
 
 ## Features
 
-- Browse the whole cache in a sortable, searchable table, filtered by content
-  type or category.
+- Browse the whole cache in a sortable, searchable table, with a tab for each
+  kind of asset the cache holds (images, textures, meshes, models, sounds,
+  fonts, video, text). The table can be filtered further by content type or
+  category.
 - Preview assets:
   - images (PNG, JPEG, WebP, GIF) and KTX2 textures (BC1/3/4/5/7, Zstandard)
   - meshes, versions 1 to 7 including Draco-compressed ones, in a 3D view
@@ -49,7 +61,10 @@ CI but have not been run against a real cache.
 - Export an asset as it is, or converted: KTX2 to PNG, mesh to OBJ.
 - Replace an asset's content with a file of your own, or delete it so Roblox
   downloads it again.
-- Apply replacement configs in the JSON format Fleasion uses.
+- Apply replacement configs in the JSON format Fleasion uses, or pick a known
+  pack from the list in the app. Each config and each rule in it has a switch;
+  switching one off puts back what it replaced. Where two configs change the
+  same thing, you choose which one has it.
 - Follow the cache live while Roblox runs: newly fetched and rewritten entries appear as
   they are written, loaded configs are re-applied to them, and the tool
   reports whether Roblox read a replacement or wrote over it. Manual replacements
@@ -57,10 +72,27 @@ CI but have not been run against a real cache.
 
 ## Getting it
 
-Download the file for your platform from the releases page
-(`rbxcache-windows-x86_64.exe`, `rbxcache-macos-arm64`, `rbxcache-macos-x86_64`
-or `rbxcache-linux-x86_64`). On macOS and Linux, make it executable first with
-`chmod +x`. Or build it:
+Download the file for your platform from the releases page. Each name carries
+the version, shown here as `<version>`:
+
+| Platform | File |
+| --- | --- |
+| Windows | `rbxcache-<version>-windows-x86_64.exe` |
+| macOS, Apple silicon (M1 and later) | `rbxcache-<version>-macos-arm64.dmg` |
+| macOS, Intel | `rbxcache-<version>-macos-x86_64.dmg` |
+| Linux | `rbxcache-<version>-linux-x86_64` |
+
+On macOS, open the disk image and drag rbxcache to Applications. The app is
+signed ad hoc, not with an Apple developer certificate, so macOS refuses to
+open it the first time. Either run
+`xattr -dr com.apple.quarantine /Applications/rbxcache.app`, or try to open it,
+then go to System Settings > Privacy & Security and press Open Anyway (on
+macOS 14 and earlier, right-clicking the app and choosing Open also works).
+For the command line, the binary is `rbxcache.app/Contents/MacOS/rbxcache`.
+
+On Linux, make the file executable first with `chmod +x`.
+
+Or build it:
 
 ```
 cargo build --release
@@ -72,8 +104,14 @@ GTK 3 development packages on Linux (`libasound2-dev libgtk-3-dev`).
 
 ## Using it
 
-Run `rbxcache` with no arguments to open the window. Select a row to see its
+Run `rbxcache` with no arguments to open the window. The sidebar has two
+halves. Browse lists what is in the cache, with a row of tabs for everything,
+for what Roblox has just written (Live), and for each kind of asset. Manage
+holds Configs, Packs, a Guide and Info. In a list, select a row to see its
 details and preview on the right; right-click a row for the entry menu.
+
+Only one window runs at a time. Starting rbxcache again brings up the one that
+is already running, from the tray if that is where it is.
 
 | Keys | Action |
 | --- | --- |
@@ -86,6 +124,7 @@ details and preview on the right; right-click a row for the entry menu.
 | Ctrl+O | Add configs |
 | Delete | Delete the selection |
 | F5 | Reload the cache |
+| F1 | The Info page |
 
 An asset Roblox has already loaded stays in its memory, so a replacement shows
 up the next time the asset is loaded: after rejoining, or after restarting the
@@ -96,7 +135,7 @@ client. The window shows a warning while the client is running.
 The window follows the cache while it is open; the Live menu turns that on and
 off. The Live tab starts empty and fills with what Roblox writes from then on,
 newest first, and the Live menu can switch to it, clear it, or sort it newest
-first again. On either tab, entries Roblox has just written are marked with a
+first again. In every list, entries Roblox has just written are marked with a
 dot that fades, and a replaced entry shows whether Roblox has read it since.
 
 Protected entries are monitored and restored indefinitely, including after
@@ -104,31 +143,82 @@ Protected entries are monitored and restored indefinitely, including after
 `%LOCALAPPDATA%\rbxcache` on Windows, `~/Library/Application Support/rbxcache`
 on macOS, and `$XDG_DATA_HOME/rbxcache` (or `~/.local/share/rbxcache`) on Linux.
 
-### Loading configs
+### Using a config, step by step
 
-Configs > Add configs opens one or more config files. They are checked together
-against the cache, and a dialog shows what they would change before anything is
-written. Once applied they stay loaded and are listed in the Configs menu:
+This is what most people use rbxcache for, and the Guide tab in the app says
+the same thing.
 
-- A ticked config is re-applied to whatever Roblox writes, for as long as
-  rbxcache is running and Live > Watch cache live is on. Untick one to pause
-  it; Remove takes it out of the list. Neither undoes what was already
-  replaced. Delete those entries, or clear the cache, to get the originals
-  back.
-- Where two configs set the same entry, the one lower in the list has it.
-  Adding a config that is already loaded moves it to the bottom.
-- Cancelling the dialog leaves the configs out of the list.
+1. **Get a config.** A config is a file of replacement rules: swap this asset
+   for that file, remove that one. The Packs tab lists ready-made ones, and any
+   config made for Fleasion works too.
+2. **Add it.** Press Apply on a pack, or Add configs on the Configs tab (or
+   Ctrl+O) for a file of your own; several files can be added at once.
+   rbxcache looks up the asset IDs the config names and shows what it would
+   change. Nothing is written until you press Apply in that dialog; cancelling
+   leaves things as they were.
+3. **Play.** Leave rbxcache open, or close it and let it sit in the tray.
+   Roblox only caches an asset when a game first needs it, so most of a pack
+   has nothing to replace until you have joined the game. Each asset is
+   replaced as it arrives, for as long as Live > Watch cache live is on.
+4. **Rejoin.** Roblox keeps what it has already loaded in memory, so a
+   replacement shows the next time the asset is loaded. The first time with a
+   pack: join, leave, join again.
+
+### Configs
+
+The Configs tab lists the loaded configs. They are remembered between runs.
+
+- Each config has a switch. On, its rules are applied to the cache and to
+  whatever Roblox writes later. Off, what it replaced is put back. Remove does
+  the same and takes it out of the list.
+- Under Rules, each rule of a config has its own switch, which works the same
+  way for that rule alone.
+- When two enabled configs change the same thing, a Conflicts box lists what
+  they share. Pick a config for all of it, or go through it one by one. Until
+  you choose, the config lower in the list has it. Adding a config that is
+  already loaded moves it to the bottom.
+- Each config shows how many of its asset IDs were identified and how many
+  Roblox would not hand out.
 - A config whose file cannot be read is kept in the list, marked unreadable,
   until the file is back or you remove it.
-- Apply enabled configs now reads the files again and applies them to the
-  whole cache, which picks up edits made to them since.
-- The list is remembered. When the app next starts, the configs are loaded
-  again and re-applied to new arrivals; nothing already in the cache is
-  touched until you apply them.
+- Reload from files reads the config files again, which picks up edits made
+  to them, and shows the dialog again.
+
+Putting things back works from a copy: before a rule replaces an entry,
+rbxcache saves what the entry held in an `originals` folder in its data
+folder. If Roblox has downloaded the asset again in the meantime, there is
+nothing to put back and the copy is dropped. Replacements made by the
+`apply-config` command are not tracked this way.
 
 To copy one cached asset over another, right-click the first and choose "Use as
 replacement source", then right-click the target and choose "Replace with
-source".
+source". Replacing a texture by hand, like replacing it with a rule, writes
+every pack of that texture that is cached at that moment; a rule also catches
+the packs Roblox downloads later, a replacement by hand does not.
+
+### Packs
+
+The Packs tab lists known packs. The list is [`packs.json`](packs.json) in
+this repository, fetched when the app starts; the copy built into the app is
+shown when it cannot be reached. Apply downloads the pack's config into the
+data folder and loads it like any other config, with the same dialog first.
+A pack's config may download files over https but may not name files on your
+computer. `rbxcache packs` prints the list and `rbxcache packs --apply <id>`
+applies one.
+
+The packs listed change sounds as well as images, and most of them change the
+font. The sound rules do nothing as shipped, for the reason given under
+[How asset IDs are matched](#how-asset-ids-are-matched).
+
+To add a pack, put its config under `packs/` and add an entry to `packs.json`:
+
+```json
+{ "id": "my-pack", "name": "My Pack", "author": "me", "game": "RIVALS",
+  "description": "What it changes.", "config": "packs/my-pack.json" }
+```
+
+`config` may also be an `https` address. `packs.json` can carry fingerprints
+for asset IDs as well; see [How asset IDs are matched](#how-asset-ids-are-matched).
 
 ### Staying in the tray
 
@@ -151,17 +241,23 @@ is running unless `--close-roblox` is given.
 
 ### Updates
 
-On start the window asks GitHub once whether a newer release exists and, if so,
-shows an "Update to ..." button that opens the release page. Help > Check for
-updates asks again, and `rbxcache update` does the same from a terminal. Nothing
-is downloaded or installed automatically. The check reads the public releases
-of this repository, so it finds nothing while the repository is private.
+On start the window asks GitHub once whether a newer release exists. If so, an
+"Update to ..." button appears in the sidebar, and the Info page lists what
+changed in every version after yours, with a button for the release page. Help >
+Check for updates asks again, and `rbxcache update` does the same from a
+terminal. Nothing is downloaded or installed automatically.
+
+The changes come from [`changelog.json`](changelog.json), which has an entry
+for every version. The first time a new version is started, a window lists
+what changed since the one used before. The Info page and `rbxcache changelog`
+show the same list.
 
 ### Command line
 
 The same binary takes commands. Entry IDs can be shortened to any unique prefix.
 
 ```
+rbxcache gui --tab packs               open the window on a tab
 rbxcache stats                         summary by category and type
 rbxcache list --kind png --limit 20    list entries
 rbxcache info <id>                     everything known about one entry
@@ -176,6 +272,9 @@ rbxcache delete <id>...                remove entries
 rbxcache tag <id> <assetId>            record which asset an entry is
 rbxcache apply-config <file>...        apply one or more replacement configs
 rbxcache identify <file>...            look up the asset IDs in configs
+rbxcache packs [--apply <id>]          list the known packs, or apply one
+rbxcache share <file>...               print the fingerprints known for a config's IDs
+rbxcache changelog                     what changed in each version
 rbxcache probe                         test-decode every texture, mesh and model
 ```
 
@@ -215,8 +314,17 @@ The cache does not record which asset ID an entry belongs to, and its entry
 names cannot be derived from an ID. When a config that names asset IDs is
 applied, each ID is looked up at Roblox's asset delivery endpoint, the same one
 the client uses, with no login. What comes back is byte-for-byte what the client
-cached, so its fingerprint (MD5 and size) identifies the entry. For images the
-client asks for a KTX2 rendition instead, so that is fetched too.
+cached, so its fingerprint (MD5 and size) identifies the entry.
+
+Images are different. The client does not cache an image as one file: it asks
+for KTX2 "packs", the texture cut into groups of mip levels, smallest first,
+and fetches the larger ones as the texture gets closer. Each pack is its own
+cache entry, and all packs of one texture carry the same content hash in their
+metadata. The lookup fetches the first pack, reads that hash, and from then on
+every cached pack with the hash counts as that asset. A replacement is written
+into each pack at the pack's own size, block-compressed (BC1 or BC3) and
+Zstandard-wrapped like the original, with the original's metadata kept. A pack
+with no alpha channel becomes BC3 when the replacement is transparent.
 
 The fingerprints are kept in an ID map (`%APPDATA%\rbxcache\idmap.json` on
 Windows, `idmap.json` in the data folder above elsewhere), whether or not the
@@ -226,8 +334,20 @@ depend on the cache key, so it survives a cache clear and can be shared.
 
 Not every asset is public. Roblox answers 401 or 403 for those that need a
 login or a permission, and rules naming them are reported and skipped; this
-tool never sends credentials. You can still tie such an asset to an entry by
-hand: select the entry, type the asset ID and press Tag (or use `rbxcache tag`).
+tool never sends credentials. In DETERMINATION and Mirc's 5k Pack, that is
+every sound and some of the images: 48 of their 126 asset IDs when this was
+written. So a
+pack's sound replacements do nothing until those IDs are known some other way:
+
+- Tie the asset to an entry by hand: select the entry, type the asset ID and
+  press Tag (or use `rbxcache tag`). The Live tab shows entries as Roblox
+  downloads them, which narrows down which one a sound is.
+- Share what was tagged. A fingerprint describes content, not a machine, so it
+  works for everyone. `rbxcache share <config>` prints the fingerprints known
+  for a config's IDs; put under `"fingerprints"` in `packs.json`, they are
+  merged into every user's ID map when the app fetches the list. None are
+  published there yet.
+
 `rbxcache identify <config>` shows how each ID in a config fared, and
 `apply-config --offline` skips the lookup.
 
@@ -237,8 +357,10 @@ IDs it has not seen. `rbxcache identify <config> --refresh` asks again, for an
 asset that was updated or made public since.
 
 A replacement asset named by `with_id` is taken from the cache when it is
-there and downloaded otherwise. An image going into an entry Roblox stores as
-KTX2 is converted to an uncompressed KTX2 texture first.
+there and downloaded otherwise; for an image the original is downloaded when
+Roblox gives it out, since a cached pack is only part of the picture. Files a
+config downloads are fetched once while the app runs, and a dry run downloads
+them too, to tell what would change.
 
 Fleasion's
 texture-pack slot syntax (`"id:slot"`) and type names that cannot be recognised
@@ -264,9 +386,17 @@ this against every entry.
 ## Limitations
 
 - Whether a replacement takes effect in game has only been checked as far as
-  the cache goes: the entry is rewritten with a valid checksum. Use the watch
-  view to see whether Roblox reads it or writes over it.
-- `remove` rules write an empty payload rather than a valid empty asset.
+  the cache goes: the entry is rewritten with a valid checksum, and rewritten
+  texture packs decode with the reference Zstandard and BC decoders. Use the
+  Live tab to see whether Roblox reads a replacement or writes over it.
+- Sounds, and anything else Roblox will not give out without a login, are not
+  matched by ID unless tagged by hand or covered by shared fingerprints.
+- The rewritten texture packs have not been checked in a running client.
+- A transparent replacement for a texture with no alpha channel is written as
+  BC3, which is twice the size of the BC1 pack it replaces.
+- Texture packs in a format other than BC1 or BC3 are rewritten as BC3.
+- A `remove` rule writes a transparent picture into an image, and an empty
+  payload into anything else, rather than a valid empty asset of that kind.
 - Curve animations (`CurveAnimation`) and animations for custom rigs are shown
   as a tree only. The R15 rig uses the proportions of the default blocky
   character.

@@ -109,6 +109,18 @@ pub fn hex(id: &[u8]) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The entry ID that 32 hex digits spell.
+pub fn parse_id(text: &str) -> Option<Id> {
+    if text.len() != 32 || !text.is_ascii() {
+        return None;
+    }
+    let mut id = [0u8; 16];
+    for (i, byte) in id.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(id)
+}
+
 fn blob_path(blobs: &Path, id_hex: &str) -> PathBuf {
     blobs.join(&id_hex[..2]).join(id_hex)
 }
@@ -356,6 +368,22 @@ impl Store {
         let (mut raw, header) = self.read_parsed(id)?;
         if let Some(h) = header {
             raw.drain(..h.body_offset);
+        }
+        Ok(raw)
+    }
+
+    /// The first few kilobytes of an entry's content, wrapper removed: enough to read a file header.
+    pub fn read_body_head(&self, id: &Id) -> Result<Vec<u8>> {
+        let content = self.conn.query_row("SELECT content FROM files WHERE id = ?1", params![&id[..]], |r| r.get::<_, Option<Vec<u8>>>(0));
+        let mut raw = match self.lookup(id, content)? {
+            Some(c) => c,
+            None => {
+                let path = self.blob_path(id);
+                read_head(&path).with_context(|| format!("reading {}", path.display()))?
+            }
+        };
+        if let Some(h) = format::parse_header(&raw) {
+            raw.drain(..h.body_offset.min(raw.len()));
         }
         Ok(raw)
     }
