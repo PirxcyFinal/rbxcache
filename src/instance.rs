@@ -1,7 +1,7 @@
 //! Keeping to one window. Two copies would both follow the cache and write
 //! over each other's replacements, so a second start hands over to the first.
 //!
-//! The first copy listens on a loopback port. A later copy that finds the
+//! The first copy listens on a loopback port of its own user's. A later copy that finds the
 //! port taken asks whoever holds it to show its window, and exits if the
 //! answer is the one this app gives.
 
@@ -10,13 +10,19 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
-/// Chosen at random from the range no service is registered in.
-const PORT: u16 = 47_163;
+/// The first of the ports a copy may listen on, in a range no service is registered in.
+const FIRST_PORT: u16 = 47_000;
+const PORTS: u64 = 2_000;
 const ASK: &[u8] = b"rbxcache show\n";
 const ANSWER: &[u8] = b"rbxcache shown\n";
 
+/// The port for this user's copy. It follows from the app's data folder, so
+/// two people logged in to one computer do not shut each other out.
 fn address() -> SocketAddr {
-    SocketAddr::from((Ipv4Addr::LOCALHOST, PORT))
+    let folder = crate::protection::data_dir().map(|dir| dir.to_string_lossy().into_owned()).unwrap_or_default();
+    // FNV-1a: the same folder has to give the same port in every copy and every version.
+    let hash = folder.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| (hash ^ byte as u64).wrapping_mul(0x0000_0100_0000_01b3));
+    SocketAddr::from((Ipv4Addr::LOCALHOST, FIRST_PORT + (hash % PORTS) as u16))
 }
 
 pub enum Claim {

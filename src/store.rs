@@ -455,6 +455,29 @@ impl Store {
     }
 }
 
+/// The place ID of the game most recently joined, read from the newest Roblox
+/// log beside the cache in `dir`. Used to ask again, as that game's client
+/// would, for an asset the game keeps to its own players. `None` when no log
+/// names one (the client has not joined a game, or keeps logs elsewhere).
+pub fn latest_place_id(dir: &Path) -> Option<u64> {
+    let logs = dir.join("logs");
+    let newest = std::fs::read_dir(&logs)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "log"))
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .max_by_key(|(time, _)| *time)
+        .map(|(_, path)| path)?;
+    let text = std::fs::read_to_string(&newest).ok()?;
+    // Join reports read "... placeid:17625359962, join_time:...". The last is the current game.
+    text.match_indices("placeid:")
+        .filter_map(|(at, _)| {
+            let digits: String = text[at + "placeid:".len()..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse::<u64>().ok().filter(|&n| n > 0)
+        })
+        .last()
+}
+
 /// True when a Roblox client or Studio process is running (it may be using the cache).
 #[cfg(windows)]
 pub fn roblox_running() -> bool {

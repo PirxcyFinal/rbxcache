@@ -16,9 +16,33 @@ pub const OK: Color32 = Color32::from_rgb(92, 208, 150);
 
 /// The splash screen and the icon use the palette of the pirxcy site rather than the app's.
 pub const SPLASH_BG: Color32 = Color32::from_rgb(8, 8, 10);
-pub const SPLASH_INK: Color32 = Color32::from_rgb(246, 246, 247);
-pub const SPLASH_MUTED: Color32 = Color32::from_rgb(138, 141, 147);
+/// The deep purple at the bottom of the splash gradient.
+pub const SPLASH_PURPLE: Color32 = Color32::from_rgb(42, 18, 72);
+/// The wordmark stays white on every splash, whatever the gradient does underneath.
+pub const SPLASH_INK: Color32 = Color32::WHITE;
+pub const SPLASH_MUTED: Color32 = Color32::from_rgb(168, 156, 196);
+/// The thin progress line on the splash: soft purple, not the lime of the rest of the app.
+pub const SPLASH_BAR: Color32 = Color32::from_rgb(148, 112, 255);
 pub const LIME: Color32 = Color32::from_rgb(200, 255, 46);
+
+/// Fills `rect` with a quiet black-to-purple gradient, top to bottom.
+pub fn splash_gradient(painter: &egui::Painter, rect: Rect, opacity: f32) {
+    const STEPS: i32 = 40;
+    let height = rect.height().max(1.0);
+    for i in 0..STEPS {
+        let t0 = i as f32 / STEPS as f32;
+        let t1 = (i + 1) as f32 / STEPS as f32;
+        let band = Rect::from_min_max(egui::pos2(rect.left(), rect.top() + height * t0), egui::pos2(rect.right(), rect.top() + height * t1));
+        // Ease toward purple so the top stays near black and the colour only shows in the lower half.
+        let weight = t0 * t0;
+        let color = Color32::from_rgb(
+            (SPLASH_BG.r() as f32 + (SPLASH_PURPLE.r() as f32 - SPLASH_BG.r() as f32) * weight) as u8,
+            (SPLASH_BG.g() as f32 + (SPLASH_PURPLE.g() as f32 - SPLASH_BG.g() as f32) * weight) as u8,
+            (SPLASH_BG.b() as f32 + (SPLASH_PURPLE.b() as f32 - SPLASH_BG.b() as f32) * weight) as u8,
+        );
+        painter.rect_filled(band, CornerRadius::ZERO, alpha(color, opacity));
+    }
+}
 
 /// `color` at `a` opacity (0..1).
 pub fn alpha(color: Color32, a: f32) -> Color32 {

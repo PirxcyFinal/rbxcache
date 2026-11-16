@@ -34,6 +34,9 @@ pub enum Cmd {
         /// Open on this tab: all, live, configs, packs, info, or a kind of asset such as textures
         #[arg(long)]
         tab: Option<String>,
+        /// Open on the IDs tab and look these asset IDs up
+        #[arg(long, num_args = 1.., conflicts_with = "tab")]
+        fetch: Vec<String>,
     },
     /// Check GitHub for a newer release
     Update,
@@ -171,6 +174,33 @@ pub enum Cmd {
         #[arg(required = true)]
         files: Vec<PathBuf>,
     },
+    /// Look asset IDs up: what they are, the file when Roblox hands it out, and the cached sounds one might be
+    Fetch {
+        /// Asset IDs, links or rbxassetid:// addresses
+        #[arg(required = true)]
+        ids: Vec<String>,
+        /// Save the files Roblox hands out into this folder
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Add a Roblox account by its session cookie, so sounds and other assets Roblox
+    /// keeps from guests can be fetched. This can be a main account; an alternate
+    /// account is recommended, because whoever holds this cookie can sign in as that
+    /// account. The cookie is not sent until the warning has been up for 5 seconds.
+    /// Reads the cookie from stdin if not given, so it does not sit in your shell history
+    Login {
+        /// The account's .ROBLOSECURITY cookie, copied from your own already signed-in
+        /// browser; AVOID passing it here if you can, since most shells keep a history
+        cookie: Option<String>,
+    },
+    /// Removes an account from this computer. This does not end its Roblox session;
+    /// to do that, sign out of that account on roblox.com
+    Logout {
+        /// The account's user ID or name; with none, the active account
+        who: Option<String>,
+    },
+    /// List the added accounts
+    Accounts,
     /// Show what changed in each version
     Changelog,
     /// Write the app icon as a PNG file
@@ -191,6 +221,10 @@ pub enum Sort {
 }
 
 pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
+    // Sign requests with the signed-in account, and name a game when Roblox refuses, so
+    // sounds and other assets a guest cannot reach are matched from the terminal too.
+    crate::account::activate();
+    crate::resolve::set_place(crate::store::latest_place_id(dir));
     match cmd {
         Cmd::Gui { .. } => unreachable!("handled by main"),
         Cmd::Update => {
@@ -386,6 +420,118 @@ pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
                 known.assets.len(),
                 format::count(ids.len(), "asset ID", "asset IDs")
             );
+            Ok(())
+        }
+        Cmd::Fetch { ids, output } => {
+            use crate::resolve::Outcome;
+            if crate::account::Accounts::load().is_empty() {
+                bail!("fetching IDs needs a signed-in account: run `rbxcache login` first (an alternate account is fine)");
+            }
+            let Some(who) = crate::account::check_active()? else { bail!("no signed-in account is in use") };
+            println!("Fetching as @{}", who.name);
+            let ids = crate::lookup::parse_ids(&ids.join(" "));
+            if ids.is_empty() {
+                bail!("no asset ID was given: a number such as 16530229616");
+            }
+            let store = Store::open(dir, false)?;
+            let entries = store.list(|_, _| {})?;
+            let mut idmap = IdMap::load(idmap_path)?;
+            let found = crate::lookup::find(&store, &entries, &mut idmap, &ids, &|_, _| {});
+            idmap.save(idmap_path)?;
+            let sounds = if found.iter().any(|f| matches!(f.outcome, Outcome::Denied(_))) {
+                crate::lookup::sounds(&store, &entries, &idmap)
+            } else {
+                Vec::new()
+            };
+            for item in &found {
+                let details = item.details.clone().unwrap_or_default();
+                let kind = details.type_id.map_or("unknown type", format::asset_type_name);
+                println!(
+                    "{}  {}  ({kind}){}",
+                    item.id,
+                    if details.name.is_empty() { "no public details" } else { &details.name },
+                    details.seconds.map_or(String::new(), |s| format!(", about {s} s"))
+                );
+                println!("    {}", item.outcome);
+                if let Some((kind, body)) = &item.file {
+                    match &output {
+                        Some(folder) => {
+                            std::fs::create_dir_all(folder)?;
+                            let path = folder.join(format!("{}.{}", item.id, format::extension(kind)));
+                            std::fs::write(&path, &body[..]).with_context(|| format!("writing {}", path.display()))?;
+                            println!("    saved {} ({})", path.display(), human_size(body.len() as u64));
+                        }
+                        None => println!("    {kind}, {}; pass -o <folder> to save it", human_size(body.len() as u64)),
+                    }
+                }
+                // Refused and a sound, or refused with nothing known: the cached sounds it could be.
+                if matches!(item.outcome, Outcome::Denied(_)) && (item.details.is_none() || item.is_sound()) {
+                    let candidates = crate::lookup::candidates(&sounds, details.seconds);
+                    println!(
+                        "    {} could be it; listen in the window's IDs tab, or tie one with: rbxcache tag <entry> {}",
+                        format::count(candidates.len(), "cached sound", "cached sounds"),
+                        item.id
+                    );
+                    for sound in candidates.iter().take(12) {
+                        println!(
+                            "      {}  {:>8}  {}",
+                            store::hex(&sound.id),
+                            sound.seconds.map_or("?".to_string(), |s| format!("{s:.2} s")),
+                            human_size(sound.size)
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        Cmd::Login { cookie } => {
+            println!("{}\n", crate::account::WARNING);
+            let pasted = match cookie {
+                Some(cookie) => cookie,
+                None => {
+                    println!("Paste the .ROBLOSECURITY cookie from your own already signed-in browser, then press Enter:");
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line).context("could not read the cookie")?;
+                    line
+                }
+            };
+            let cookie = crate::account::extract(&pasted).context("that did not look like a cookie")?;
+            let seconds = crate::account::SUBMIT_HOLD.as_secs();
+            println!("Sending it in {seconds} seconds. Press Ctrl+C to stop.");
+            for left in (1..=seconds).rev() {
+                println!("{left}...");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            let who = crate::account::whoami(&cookie)?;
+            let mut accounts = crate::account::Accounts::load();
+            accounts.add(who.clone(), &cookie)?;
+            println!("added {} (@{}, {})", who.display, who.name, who.user_id);
+            Ok(())
+        }
+        Cmd::Logout { who } => {
+            let mut accounts = crate::account::Accounts::load();
+            let id = match &who {
+                Some(text) => accounts
+                    .accounts
+                    .iter()
+                    .find(|a| a.user_id.to_string() == *text || a.name.eq_ignore_ascii_case(text))
+                    .map(|a| a.user_id)
+                    .with_context(|| format!("no added account matches '{text}'"))?,
+                None => accounts.active().map(|a| a.user_id).context("no account has been added")?,
+            };
+            accounts.remove(id)?;
+            println!("removed {id} from this computer; its Roblox session is not ended, sign out of it on roblox.com if you want that too");
+            Ok(())
+        }
+        Cmd::Accounts => {
+            let accounts = crate::account::Accounts::load();
+            if accounts.is_empty() {
+                println!("no account has been added; run: rbxcache login");
+            }
+            for account in &accounts.accounts {
+                let mark = if accounts.active().is_some_and(|a| a.user_id == account.user_id) { "*" } else { " " };
+                println!("{mark} {:<12} {} (@{})", account.user_id, account.display, account.name);
+            }
             Ok(())
         }
         Cmd::Changelog => {

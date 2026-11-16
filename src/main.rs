@@ -1,3 +1,4 @@
+mod account;
 mod anim;
 mod audio;
 mod changelog;
@@ -6,6 +7,7 @@ mod config;
 mod format;
 mod gui;
 mod instance;
+mod lookup;
 mod originals;
 mod packs;
 mod protection;
@@ -34,9 +36,9 @@ fn main() -> Result<()> {
     let idmap = args.idmap.unwrap_or_else(config::IdMap::default_path);
     match args.cmd {
         cmd @ (None | Some(cli::Cmd::Gui { .. })) => {
-            let tab = match cmd {
-                Some(cli::Cmd::Gui { tab }) => tab,
-                _ => None,
+            let (tab, fetch) = match cmd {
+                Some(cli::Cmd::Gui { tab, fetch }) => (tab, fetch.join(" ")),
+                _ => (None, String::new()),
             };
             // Started with no arguments, usually by double-click: drop the console
             // window Windows opened for us. With it gone, a failure to start has
@@ -46,7 +48,7 @@ fn main() -> Result<()> {
             if detached {
                 unsafe { FreeConsole() };
             }
-            let result = gui::run(dir, idmap, tab.as_deref());
+            let result = gui::run(dir, idmap, tab.as_deref(), fetch);
             if let (true, Err(error)) = (detached, &result) {
                 rfd::MessageDialog::new().set_level(rfd::MessageLevel::Error).set_title("rbxcache").set_description(format!("{error:#}")).show();
             }

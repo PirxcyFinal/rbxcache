@@ -1,6 +1,20 @@
 {
   "versions": [
     {
+      "version": "1.1.1",
+      "date": "2026-11-16",
+      "changes": [
+        "Signing in is optional, but it fixes assets that were not working 100% and makes configs apply more smoothly. Once an account is added, rbxcache asks Roblox as that account, then retries naming the asset's creator's games until one hands the file out — you do not have to have joined the game first. Sounds and skies work flawlessly after signing in; everything else still works without it.",
+        "Demo of signed-in sound and sky replacements: https://medal.tv/games/roblox/clips/nWlYKvwOgaSvPB9n7?invite=cr-MSxaZlAsNDQ5Mjg2NDY5",
+        "Optional accounts: paste a session cookie you copy yourself from your own already signed-in browser (an alternate account is recommended; a main account is allowed). Nothing is sent until a 5-second warning has been on screen. rbxcache never reads a cookie by itself and never asks for a password.",
+        "An IDs tab: type an asset ID to see what it is, get the file when Roblox hands it out, and tie it to the entry in your cache. Sounds that are still refused are listed as the cached sounds of the right length, to play and pick from.",
+        "Loading screens keep the black-to-purple gradient, a white pirxcy wordmark, purple progress bars, and a short sentence under each title that says what the work is doing.",
+        "Copy fingerprints, on the IDs tab, puts what you picked on the clipboard in the form packs.json takes.",
+        "rbxcache fetch looks IDs up from a terminal, with the same signed-in check and place retry as the window.",
+        "Each user of a computer gets their own window; one user's copy no longer keeps another's from opening."
+      ]
+    },
+    {
       "version": "1.1.0",
       "date": "2026-11-15",
       "changes": [

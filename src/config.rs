@@ -127,7 +127,15 @@ fn collect_rules(entries: &[Value], base: &Path, out: &mut Vec<Rule>) {
                 }
                 None => Action::Remove,
             },
-            "cdn" => text("cdn_url").map_or(Action::Remove, |u| Action::Cdn(u.to_string())),
+            "cdn" => match text("cdn_url") {
+                Some(url) if url.starts_with("http://") || url.starts_with("https://") => Action::Cdn(url.to_string()),
+                // Some configs put a path on this computer where the address goes.
+                Some(path) => {
+                    let path = PathBuf::from(path.strip_prefix("file:///").unwrap_or(path));
+                    Action::Local(if path.is_absolute() { path } else { base.join(path) })
+                }
+                None => Action::Remove,
+            },
             "id" => match obj.get("with_id") {
                 None | Some(Value::Null) => Action::Remove,
                 Some(Value::String(s)) if s.trim().is_empty() => Action::Remove,
@@ -875,6 +883,19 @@ mod tests {
         assert_eq!(rules[4].action, Action::Remove);
         assert_eq!(rules[5].targets, [Target::Unsupported("7547298786:1".into())]);
         assert_eq!(rules[6].action, Action::Remove);
+    }
+
+    #[test]
+    fn a_path_given_as_an_address_is_read_from_disk() {
+        let text = r#"[
+            {"name": "sound", "replace_ids": [5], "mode": "cdn", "cdn_url": "C:\\Users\\me\\Downloads\\mambo.mp3"},
+            {"name": "beside", "replace_ids": [5], "mode": "cdn", "cdn_url": "slide.mp3"},
+            {"name": "online", "replace_ids": [5], "mode": "cdn", "cdn_url": "https://example.com/a.mp3"}
+        ]"#;
+        let rules = parse(text, Path::new("packs")).unwrap();
+        assert_eq!(rules[0].action, Action::Local(PathBuf::from("C:\\Users\\me\\Downloads\\mambo.mp3")));
+        assert_eq!(rules[1].action, Action::Local(Path::new("packs").join("slide.mp3")));
+        assert_eq!(rules[2].action, Action::Cdn("https://example.com/a.mp3".into()));
     }
 
     #[test]

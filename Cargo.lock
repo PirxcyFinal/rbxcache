@@ -3787,7 +3787,7 @@ dependencies = [
 
 [[package]]
 name = "rbxcache"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "ab_glyph",
  "anyhow",

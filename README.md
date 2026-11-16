@@ -9,11 +9,17 @@ network traffic to intercept.
 This is the safest way to do what [Fleasion](https://github.com/fleasion/Fleasion)
 does. Fleasion swaps assets by routing Roblox's traffic through a local proxy:
 it adds its own certificate to the client's trusted list, relaunches the client
-through the proxy, and uses your Roblox login to fetch assets. rbxcache does
-none of that. It never modifies the client or sits in its traffic, and it never
-asks for or reads a login. It only edits files Roblox has already saved to
-disk, and it reads the same config format, with the exceptions listed under
-[How asset IDs are matched](#how-asset-ids-are-matched).
+through the proxy, and reads your Roblox session cookie, on its own, from
+Roblox's own files or your browser's, to fetch assets. rbxcache does none of
+that. It never modifies the client or sits in its traffic, never asks for your
+password, and never reads a cookie by itself. It only edits files Roblox has
+already saved to disk, and it reads the same config format, with the
+exceptions listed under [How asset IDs are matched](#how-asset-ids-are-matched).
+
+Adding an account is optional and works the same way as Fleasion's manual
+cookie import: you copy your own account's cookie out of your own browser and
+paste it in, deliberately, rather than rbxcache finding it on its own. See
+[Signing in](#signing-in), and read its warnings before adding one.
 
 "Safest" is not "risk free". Changing how a game looks on your own machine may
 still be against Roblox's rules or a game's, and that is yours to judge.
@@ -110,8 +116,9 @@ for what Roblox has just written (Live), and for each kind of asset. Manage
 holds Configs, Packs, a Guide and Info. In a list, select a row to see its
 details and preview on the right; right-click a row for the entry menu.
 
-Only one window runs at a time. Starting rbxcache again brings up the one that
-is already running, from the tray if that is where it is.
+Only one window runs at a time for each user of the computer. Starting
+rbxcache again brings up the one that is already running, from the tray if
+that is where it is.
 
 | Keys | Action |
 | --- | --- |
@@ -239,6 +246,83 @@ running (the dialog says so before you confirm). Other files kept in the cache
 folder are left alone. `rbxcache clear` does the same and refuses while Roblox
 is running unless `--close-roblox` is given.
 
+### Signing in
+
+Adding an account is optional, and it is how sounds, which Roblox only hands
+to signed-in players, can be fetched and matched to your cache automatically.
+Everything else works without it. What needs it is locked until an account is
+added: the IDs tab, `rbxcache fetch`, and the rules in a config that name
+assets Roblox keeps from guests, mostly sounds. Adding one asks about those
+again, and the Configs page shows how many are waiting.
+
+**This can be a main account. An alternate account is recommended, and never
+paste anyone else's.** A throwaway account works exactly as well as your main
+one: it only has to exist and be able to sign in. Whoever holds the cookie you
+paste in can act as that account, including spending its Robux, for as long as
+the cookie is valid, so an alt with nothing of value on it is the better choice.
+
+Nothing is sent until that warning has been on screen for 5 seconds. In the
+window the Add button stays disabled and counts down; from a terminal,
+`rbxcache login` waits the same 5 seconds and Ctrl+C stops it.
+
+rbxcache has no Roblox login page of its own, and reads no cookie by itself.
+Open Manage > Account (or run `rbxcache login`) and paste in the account's
+`.ROBLOSECURITY` cookie, which you copy yourself from that account's own,
+already signed-in browser session (in most browsers: developer tools (F12) >
+Application or Storage > Cookies > `https://www.roblox.com` > `.ROBLOSECURITY`
+> copy its value). rbxcache checks it with Roblox and shows who it belongs to
+before adding it.
+
+- Several accounts can be added; one is in use at a time. Its name and avatar
+  show at the bottom right of the window.
+- The cookie is kept encrypted for your Windows user (DPAPI) in
+  `accounts.json` in the data folder, so the file is no use on another user or
+  computer.
+- Remove deletes an account from this computer at once, with one click
+  (`rbxcache logout` from a terminal). This does not end the account's Roblox
+  session: a cookie cannot be revoked the way a login token can. To be sure a
+  pasted cookie can never be used again, sign that account out on roblox.com.
+
+Once an account is in use, every asset request is sent with its cookie, so
+Roblox answers as that account. Before each fetch, rbxcache checks with Roblox
+that the account is still signed in, and stops with a message if it is not
+(the cookie has expired, or the account was signed out on roblox.com). When
+Roblox still refuses, the same request is sent again naming a game, with the
+`Roblox-Place-Id` header the client itself sends: first the game you last
+joined, then each game belonging to the asset's creator, looked up from
+Roblox's public games list. The first game that hands the file out is the one
+used, and it is remembered for that creator's other assets. Joining the game
+first is not required.
+
+Signing in is only built for Windows so far; on other platforms the by-ear
+matching below is the way to get sounds working.
+
+### Looking an ID up
+
+This needs a signed-in account (see [Signing in](#signing-in)). Without one the
+IDs tab is locked, and `rbxcache fetch` says so.
+
+The IDs tab under Manage takes asset IDs: numbers, links or `rbxassetid://`
+addresses, one or several. For each it shows what Roblox says in public about
+the asset (name, type, creator) and then one of three things:
+
+- Roblox hands the file out. It is shown, or can be played, and saved with
+  Save as. If the same content is in your cache the ID is tied to that entry;
+  if not, it will be recognised when Roblox downloads it.
+- Roblox refuses, and the asset is a sound. The cached sounds within a second
+  of its length, and not yet tied to an ID, are listed. Play them and press
+  This is it on the right one. Configs that name the ID work from then on,
+  and are applied straight away.
+- Roblox refuses, and it is something else. It can still be tagged by hand
+  from Browse.
+
+Copy fingerprints puts what is known about the listed IDs on the clipboard, in
+the form `packs.json` takes under `"fingerprints"`, so that what one person
+picked by ear works for everyone who uses the pack list.
+
+`rbxcache fetch <id>...` does the lookup from a terminal (`-o <folder>` saves
+the files), and `rbxcache gui --fetch <id>...` opens the window on the result.
+
 ### Updates
 
 On start the window asks GitHub once whether a newer release exists. If so, an
@@ -274,6 +358,10 @@ rbxcache apply-config <file>...        apply one or more replacement configs
 rbxcache identify <file>...            look up the asset IDs in configs
 rbxcache packs [--apply <id>]          list the known packs, or apply one
 rbxcache share <file>...               print the fingerprints known for a config's IDs
+rbxcache fetch <id>... [-o dir]        look asset IDs up, saving what Roblox hands out
+rbxcache login [cookie]                add an account by its .ROBLOSECURITY cookie
+rbxcache logout [user]                 remove an account from this computer
+rbxcache accounts                      list the added accounts
 rbxcache changelog                     what changed in each version
 rbxcache probe                         test-decode every texture, mesh and model
 ```
@@ -333,15 +421,19 @@ downloads later is recognised and replaced when it arrives. The map does not
 depend on the cache key, so it survives a cache clear and can be shared.
 
 Not every asset is public. Roblox answers 401 or 403 for those that need a
-login or a permission, and rules naming them are reported and skipped; this
-tool never sends credentials. In DETERMINATION and Mirc's 5k Pack, that is
+login or a permission, and rules naming them are reported and skipped, unless
+you have signed in (see [Signing in](#signing-in)). As a guest, in DETERMINATION and Mirc's 5k Pack, that is
 every sound and some of the images: 48 of their 126 asset IDs when this was
 written. So a
 pack's sound replacements do nothing until those IDs are known some other way:
 
-- Tie the asset to an entry by hand: select the entry, type the asset ID and
-  press Tag (or use `rbxcache tag`). The Live tab shows entries as Roblox
-  downloads them, which narrows down which one a sound is.
+- Pick it by ear on the IDs tab (see [Looking an ID up](#looking-an-id-up)).
+  Roblox does say in public how long a sound is, to the second, so the app
+  lists the cached sounds of about that length; you play them and pick the one
+  it is. Identify them, under a config on the Configs tab, queues up every ID
+  of that config that Roblox would not hand out.
+- Tie the asset to an entry by hand: select the entry under Browse, type the
+  asset ID and press Tag (or use `rbxcache tag`).
 - Share what was tagged. A fingerprint describes content, not a machine, so it
   works for everyone. `rbxcache share <config>` prints the fingerprints known
   for a config's IDs; put under `"fingerprints"` in `packs.json`, they are

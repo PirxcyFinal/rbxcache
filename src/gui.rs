@@ -1,6 +1,7 @@
 //! The window: sidebar, entry table, detail panel with previews, the Configs,
 //! Packs and Info pages, menus and dialogs.
 
+use crate::account::{self, Accounts};
 use crate::anim::Animation;
 use crate::audio::{self, Audio};
 use crate::changelog::{self, Version};
@@ -8,6 +9,7 @@ use crate::cli::{describe, export_name, matches};
 use crate::config::{self, IdMap};
 use crate::format::{self, human_size};
 use crate::instance::{self, Claim};
+use crate::lookup::{self, Found, Sound};
 use crate::originals::Originals;
 use crate::packs::{self, Catalog};
 use crate::protection::Protections;
@@ -56,10 +58,12 @@ const GROUPS: [(&str, &[&str]); 8] = [
 ];
 
 /// Opens the window. `tab` names the tab to start on; see [`Tab::named`].
-pub fn run(dir: PathBuf, idmap_path: PathBuf, tab: Option<&str>) -> Result<()> {
+/// `fetch` is text holding asset IDs to look up on the IDs tab straight away.
+pub fn run(dir: PathBuf, idmap_path: PathBuf, tab: Option<&str>, fetch: String) -> Result<()> {
     let tab = match tab {
-        Some(name) => Tab::named(name)
-            .with_context(|| format!("there is no tab '{name}'; try all, live, configs, packs, guide, info or a kind such as textures"))?,
+        Some(name) => Tab::named(name).with_context(|| {
+            format!("there is no tab '{name}'; try all, live, configs, packs, ids, account, guide, info or a kind such as textures")
+        })?,
         None => Tab::All,
     };
     // A second copy would fight the first over the cache; it asks the first to come forward and leaves.
@@ -77,8 +81,21 @@ pub fn run(dir: PathBuf, idmap_path: PathBuf, tab: Option<&str>) -> Result<()> {
         }),
         ..Default::default()
     };
-    eframe::run_native("Roblox Cache Explorer", options, Box::new(move |cc| Ok(Box::new(App::new(cc, dir, idmap_path, icon, tab, listener)))))
-        .map_err(|e| anyhow!("{e}"))
+    eframe::run_native(
+        "Roblox Cache Explorer",
+        options,
+        Box::new(move |cc| {
+            let mut app = App::new(cc, dir, idmap_path, icon, tab, listener);
+            if !fetch.trim().is_empty() {
+                app.lookup_input = fetch;
+                app.show_tab(Tab::Lookup, &cc.egui_ctx);
+                // Without an account the IDs tab is locked, so there is nothing to look up yet.
+                app.lookup_wanted = !app.accounts.is_empty();
+            }
+            Ok(Box::new(app))
+        }),
+    )
+    .map_err(|e| anyhow!("{e}"))
 }
 
 /// What the window shows: one of the entry lists, or a page.
@@ -94,6 +111,10 @@ enum Tab {
     Other,
     Configs,
     Packs,
+    /// Looking asset IDs up one at a time.
+    Lookup,
+    /// Signing in with Roblox.
+    Account,
     Guide,
     Info,
 }
@@ -109,6 +130,8 @@ impl Tab {
             "other" => Some(Tab::Other),
             "configs" => Some(Tab::Configs),
             "packs" => Some(Tab::Packs),
+            "ids" => Some(Tab::Lookup),
+            "account" => Some(Tab::Account),
             "guide" => Some(Tab::Guide),
             "info" => Some(Tab::Info),
             _ => None,
@@ -117,7 +140,7 @@ impl Tab {
 
     /// True for the tabs that show a list of cache entries.
     fn lists(self) -> bool {
-        !matches!(self, Tab::Configs | Tab::Packs | Tab::Guide | Tab::Info)
+        !matches!(self, Tab::Configs | Tab::Packs | Tab::Lookup | Tab::Account | Tab::Guide | Tab::Info)
     }
 
     /// Whether an entry of this content type belongs on the tab.
@@ -188,6 +211,27 @@ enum Action {
     SetSource,
     ReplaceFromSource,
     PlayAudio,
+    /// Looks up the asset IDs typed on the IDs tab.
+    RunLookup,
+    /// Opens the warning that has to be read before a cookie is sent.
+    AskAddAccount,
+    /// Checks a pasted cookie and, if it is one, adds the account.
+    AddAccount,
+    /// Removes an account from this computer, by user ID. Does not end its Roblox session.
+    SignOut(u64),
+    /// Makes an account the one used for requests.
+    UseAccount(u64),
+    /// Looks up the IDs of this config that Roblox would not hand out.
+    LookupFor(usize),
+    /// Plays a cached sound, or the file fetched for the lookup at this place in the list.
+    PlaySound(Id),
+    PlayFetched(usize),
+    SaveFetched(usize),
+    /// Ties an asset ID to the cached entry the user picked for it.
+    Pick(u64, Id),
+    /// Opens the All list on this entry.
+    ShowEntry(Id),
+    CopyFingerprints,
     ForcePreview,
     ExportConverted,
     RefreshPacks,
@@ -349,6 +393,32 @@ fn combined<'a>(configs: impl IntoIterator<Item = &'a LoadedConfig>) -> Vec<conf
     config::combine(configs.into_iter().map(|c| (c.name.as_str(), c.rules.as_slice())))
 }
 
+/// A pasted cookie being checked with Roblox on a worker thread.
+struct AddingAccount {
+    result: Receiver<Result<(account::Identity, String), String>>,
+}
+
+/// Gets requests ready to go out as the signed-in account, if there is one: a
+/// token that is still good, and the game last joined to name if Roblox refuses.
+fn prepare_requests(dir: &std::path::Path) {
+    account::activate();
+    resolve::set_place(store::latest_place_id(dir));
+}
+
+/// Progress and result of looking asset IDs up on a worker thread.
+enum LookupMsg {
+    Progress(usize, usize),
+    /// What was found, the cached sounds, and the ID map with what was learned.
+    Done(Result<(Vec<Found>, Vec<Sound>, IdMap), String>),
+}
+
+/// Stands in for an entry ID when the sound playing is a fetched file.
+fn fetched_id(asset: u64) -> Id {
+    let mut id = [0xff; 16];
+    id[8..].copy_from_slice(&asset.to_be_bytes());
+    id
+}
+
 /// Where a pack's config was saved, and what that file held before.
 type SavedPack = (PathBuf, Option<Vec<u8>>);
 
@@ -374,7 +444,10 @@ struct Splash {
     shown: f64,
     /// When it started to dissolve, once the work is done.
     leaving: Option<f64>,
+    /// Short title of what is happening.
     caption: String,
+    /// A sentence under the title that says what that work is doing.
+    detail: String,
     fraction: Option<f32>,
 }
 
@@ -490,6 +563,32 @@ struct App {
     pack_job: Option<(Receiver<Result<SavedPack, String>>, String)>,
     /// The same, for a pack that is waiting to be confirmed: cancelling puts the file back.
     pack_undo: Option<SavedPack>,
+    /// The IDs tab: what is typed, what was found (newest first), the lookup
+    /// under way with how far it is, and the cached sounds an ID can be picked from.
+    lookup_input: String,
+    /// Set to look up what is typed as soon as the cache has been read.
+    lookup_wanted: bool,
+    /// Set after signing in, to look at the loaded configs again now that sounds can be fetched.
+    recheck_configs: bool,
+    lookup_found: Vec<Found>,
+    lookup_job: Option<Receiver<LookupMsg>>,
+    lookup_progress: (usize, usize),
+    lookup_sounds: Vec<Sound>,
+    /// Pictures of the files that were fetched, by asset ID.
+    lookup_pictures: HashMap<u64, egui::TextureHandle>,
+    /// The Roblox accounts that have been added by pasting a cookie.
+    accounts: Accounts,
+    /// What is typed into the Account page's cookie box.
+    account_input: String,
+    account_job: Option<AddingAccount>,
+    account_error: Option<String>,
+    /// When the pre-submit warning opened, in egui's clock. The cookie is not sent until [`account::SUBMIT_HOLD`] has passed.
+    account_warn_from: Option<f64>,
+    /// Avatar pictures by user ID, those already asked for, and where the answers arrive.
+    avatars: HashMap<u64, egui::TextureHandle>,
+    avatar_asked: HashSet<u64>,
+    avatar_tx: std::sync::mpsc::Sender<(u64, Option<Vec<u8>>)>,
+    avatar_rx: Receiver<(u64, Option<Vec<u8>>)>,
     /// What changed in this version and the ones before it.
     changelog: Vec<Version>,
     /// Whether the changes since the version last used are waiting to be shown.
@@ -527,6 +626,7 @@ impl App {
         // Copies made by "Open" in earlier sessions.
         let _ = std::fs::remove_dir_all(open_dir());
         let settings = Settings::load();
+        let (avatar_tx, avatar_rx) = channel();
         let mut app = Self {
             dir,
             idmap_path,
@@ -592,6 +692,23 @@ impl App {
             catalog_note: None,
             pack_job: None,
             pack_undo: None,
+            lookup_input: String::new(),
+            lookup_wanted: false,
+            recheck_configs: false,
+            lookup_found: Vec::new(),
+            lookup_job: None,
+            lookup_progress: (0, 0),
+            lookup_sounds: Vec::new(),
+            lookup_pictures: HashMap::new(),
+            accounts: Accounts::load(),
+            account_input: String::new(),
+            account_job: None,
+            account_error: None,
+            account_warn_from: None,
+            avatars: HashMap::new(),
+            avatar_asked: HashSet::new(),
+            avatar_tx,
+            avatar_rx,
             changelog: changelog::bundled(),
             show_news: settings.seen_version != update::CURRENT,
             summons: None,
@@ -618,6 +735,7 @@ impl App {
         app.start_load(&cc.egui_ctx);
         app.check_update(&cc.egui_ctx, false);
         app.fetch_catalog(&cc.egui_ctx);
+        app.fetch_avatars(&cc.egui_ctx);
         app.show_tab(tab, &cc.egui_ctx);
         app
     }
@@ -725,6 +843,10 @@ impl App {
             self.last_browse = tab;
         } else {
             self.last_manage = tab;
+        }
+        // A sound started on one tab has no stop button on another.
+        if let Some(audio) = &mut self.audio {
+            audio.stop();
         }
     }
 
@@ -1027,6 +1149,7 @@ impl App {
         let (tx, rx) = channel();
         let (dir, entries, idmap, ctx) = (self.dir.clone(), self.entries.clone(), self.idmap.clone(), ctx.clone());
         std::thread::spawn(move || {
+            prepare_requests(&dir);
             let result = Store::open(&dir, true).map(|store| {
                 let mut originals = Originals::load_default().ok();
                 let reports = config::run(&store, &entries, &idmap, &rules, true, Some(&targets), originals.as_mut());
@@ -1229,7 +1352,15 @@ impl App {
         let harmless = harmless
             || matches!(
                 action,
-                Action::ToggleConfig(_) | Action::ToggleRule(..) | Action::Choose(..) | Action::RemoveConfig(_) | Action::RemoveAllConfigs
+                Action::ToggleConfig(_)
+                    | Action::ToggleRule(..)
+                    | Action::Choose(..)
+                    | Action::RemoveConfig(_)
+                    | Action::RemoveAllConfigs
+                    | Action::AskAddAccount
+                    | Action::AddAccount
+                    | Action::SignOut(_)
+                    | Action::UseAccount(_)
             );
         if self.busy().is_some() && !harmless {
             return;
@@ -1374,6 +1505,67 @@ impl App {
             }
             Action::Tag => self.tag_focused(),
             Action::PlayAudio => self.play_audio(),
+            Action::AskAddAccount => {
+                self.ask_add_account(ctx);
+                Ok(String::new())
+            }
+            Action::AddAccount => {
+                self.account_warn_from = None;
+                self.start_add_account(ctx);
+                Ok(String::new())
+            }
+            Action::SignOut(id) => self.sign_out(id),
+            Action::UseAccount(id) => self.accounts.set_active(id).map(|()| String::new()),
+            Action::RunLookup | Action::LookupFor(_) if self.accounts.is_empty() => Err(anyhow!("Sign in first: fetching IDs needs an account")),
+            Action::RunLookup => {
+                let ids = lookup::parse_ids(&self.lookup_input);
+                if ids.is_empty() {
+                    Err(anyhow!("Type an asset ID first: a number such as 16530229616"))
+                } else {
+                    self.start_lookup(ctx, ids);
+                    Ok(String::new())
+                }
+            }
+            Action::LookupFor(i) => {
+                let refused: Vec<u64> = self.configs.get(i).map_or(Vec::new(), |config| {
+                    let ids = config::asset_ids(&config.rules);
+                    ids.into_iter().filter(|id| self.idmap.assets.get(&id.to_string()).is_some_and(Vec::is_empty)).collect()
+                });
+                if !refused.is_empty() {
+                    self.lookup_input = refused.iter().map(u64::to_string).collect::<Vec<_>>().join(" ");
+                    self.show_tab(Tab::Lookup, ctx);
+                    self.start_lookup(ctx, refused);
+                }
+                Ok(String::new())
+            }
+            Action::PlaySound(id) => Store::open(&self.dir, false).and_then(|store| store.read_body(&id)).and_then(|body| self.play(id, body)),
+            Action::PlayFetched(i) => match self.lookup_found.get(i).and_then(|found| Some((found.id, found.file.as_ref()?.1.to_vec()))) {
+                Some((asset, body)) => self.play(fetched_id(asset), body),
+                None => Ok(String::new()),
+            },
+            Action::SaveFetched(i) => self.save_fetched(i),
+            Action::Pick(asset, entry) => self.pick(asset, entry),
+            Action::ShowEntry(id) => {
+                self.show_tab(Tab::All, ctx);
+                (self.search, self.kind_filter, self.category_filter) = (String::new(), None, None);
+                self.rebuild_view();
+                self.selected = BTreeSet::from([id]);
+                self.focus = Some(id);
+                self.scroll_to = self.view.iter().position(|&i| self.entries[i].id == id);
+                Ok(String::new())
+            }
+            Action::CopyFingerprints => {
+                let mut known = IdMap::default();
+                for found in &self.lookup_found {
+                    for fp in self.idmap.assets.get(&found.id.to_string()).into_iter().flatten() {
+                        known.add(found.id, fp.clone());
+                    }
+                }
+                serde_json::to_string_pretty(&known).map_err(Into::into).map(|json| {
+                    ctx.copy_text(json);
+                    format!("Copied the fingerprints of {}", format::count(known.assets.len(), "asset ID", "asset IDs"))
+                })
+            }
             Action::ExportConverted => self.export_converted(),
             Action::ForcePreview => {
                 self.force_preview = true;
@@ -1597,6 +1789,7 @@ impl App {
         let (tx, rx) = channel();
         let (dir, entries, mut idmap, ctx) = (self.dir.clone(), self.entries.clone(), self.idmap.clone(), ctx.clone());
         std::thread::spawn(move || {
+            prepare_requests(&dir);
             let result = Store::open(&dir, false).map(|store| {
                 let mut lookup = String::new();
                 if !ids.is_empty() {
@@ -1691,6 +1884,7 @@ impl App {
         let (tx, rx) = channel();
         let (dir, entries, idmap, ctx) = (self.dir.clone(), self.entries.clone(), self.idmap.clone(), ctx.clone());
         std::thread::spawn(move || {
+            prepare_requests(&dir);
             let result = Store::open(&dir, true).and_then(|store| {
                 let mut originals = Originals::load_default()?;
                 let (reports, restored) = config::sync(&store, &entries, &idmap, &rules, &mut originals);
@@ -1740,16 +1934,234 @@ impl App {
             return Ok(String::new());
         }
         let id = e.id;
+        let body = Store::open(&self.dir, false)?.read_body(&id)?;
+        self.play(id, body)
+    }
+
+    /// Plays a sound, or pauses and resumes it when it is the one already playing.
+    fn play(&mut self, id: Id, body: Vec<u8>) -> Result<String> {
         if let Some(audio) = self.audio.as_mut().filter(|a| a.current == Some(id) && a.active()) {
             audio.toggle_pause();
             return Ok(String::new());
         }
-        let body = Store::open(&self.dir, false)?.read_body(&id)?;
         if self.audio.is_none() {
             self.audio = Some(Audio::open()?);
         }
         self.audio.as_mut().expect("audio was just opened").play(id, body)?;
         Ok(String::new())
+    }
+
+    /// Opens the warning. The cookie is not sent until it has been up for [`account::SUBMIT_HOLD`].
+    fn ask_add_account(&mut self, ctx: &egui::Context) {
+        if self.account_warn_from.is_some() || self.account_job.is_some() {
+            return;
+        }
+        if account::extract(&self.account_input).is_none() {
+            self.account_error = Some("That did not look like a cookie. Paste the whole .ROBLOSECURITY value.".to_string());
+            return;
+        }
+        self.account_error = None;
+        self.account_warn_from = Some(ctx.input(|i| i.time));
+    }
+
+    /// Checks the pasted cookie with Roblox on a worker thread: this is a
+    /// network call, too slow for the window to wait on directly.
+    fn start_add_account(&mut self, ctx: &egui::Context) {
+        if self.account_job.is_some() {
+            return;
+        }
+        let Some(cookie) = account::extract(&self.account_input) else {
+            self.account_error = Some("That did not look like a cookie. Paste the whole .ROBLOSECURITY value.".to_string());
+            return;
+        };
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = account::whoami(&cookie).map(|who| (who, cookie)).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        self.account_job = Some(AddingAccount { result: rx });
+        self.account_error = None;
+    }
+
+    fn poll_add_account(&mut self, ctx: &egui::Context) {
+        let Some(result) = self.account_job.as_ref().and_then(|job| finished(&job.result)) else { return };
+        self.account_job = None;
+        match result {
+            Ok((who, cookie)) => {
+                // What is on disk may have changed since this window opened, so add to that.
+                let mut accounts = Accounts::load();
+                match accounts.add(who.clone(), &cookie) {
+                    Ok(()) => {
+                        self.accounts = accounts;
+                        self.account_input.clear();
+                        self.fetch_avatars(ctx);
+                        self.notify(ctx, format!("Added {}", who.display), false);
+                        // What a guest was refused may be there for this account.
+                        self.recheck_configs = self.configs.iter().any(|c| c.enabled && id_stats(&c.rules, &self.idmap).2 > 0);
+                    }
+                    Err(e) => self.notify(ctx, format!("{e:#}"), true),
+                }
+            }
+            Err(e) => {
+                self.account_error = Some(e.clone());
+                self.notify(ctx, e, true);
+            }
+        }
+    }
+
+    /// Removes an account from this computer at once. This cannot end the
+    /// account's session on Roblox's side; there is no API for that with a
+    /// cookie, unlike the OAuth tokens this app no longer uses.
+    fn sign_out(&mut self, id: u64) -> Result<String> {
+        let mut accounts = Accounts::load();
+        accounts.remove(id)?;
+        self.accounts = accounts;
+        self.avatars.remove(&id);
+        self.avatar_asked.remove(&id);
+        if self.accounts.is_empty() {
+            resolve::set_auth(None);
+        }
+        Ok("Removed from this computer. To end that account's Roblox session too, sign out of it on roblox.com.".to_string())
+    }
+
+    /// Asks for the avatar of every signed-in account that has none yet.
+    fn fetch_avatars(&mut self, ctx: &egui::Context) {
+        for id in self.accounts.accounts.iter().map(|a| a.user_id) {
+            if self.avatar_asked.insert(id) {
+                let (tx, ctx) = (self.avatar_tx.clone(), ctx.clone());
+                std::thread::spawn(move || {
+                    let _ = tx.send((id, account::avatar(id)));
+                    ctx.request_repaint();
+                });
+            }
+        }
+    }
+
+    fn poll_avatars(&mut self, ctx: &egui::Context) {
+        for (id, bytes) in self.avatar_rx.try_iter().collect::<Vec<_>>() {
+            let picture = bytes.and_then(|bytes| image::load_from_memory(&bytes).ok()).map(|picture| picture.to_rgba8());
+            match picture {
+                Some(picture) if self.accounts.accounts.iter().any(|a| a.user_id == id) => {
+                    let pixels = egui::ColorImage::from_rgba_unmultiplied([picture.width() as usize, picture.height() as usize], picture.as_raw());
+                    self.avatars.insert(id, ctx.load_texture(format!("avatar-{id}"), pixels, egui::TextureOptions::LINEAR));
+                }
+                // Not found, or signed out in the meantime: asked for again next time round.
+                _ => drop(self.avatar_asked.remove(&id)),
+            }
+        }
+    }
+
+    /// Looks asset IDs up on a worker thread: what they are, the file when
+    /// Roblox hands it out, and the cached sounds one of them might be.
+    fn start_lookup(&mut self, ctx: &egui::Context, ids: Vec<u64>) {
+        if self.lookup_job.is_some() {
+            return;
+        }
+        let (tx, rx) = channel();
+        let (dir, entries, mut idmap, ctx) = (self.dir.clone(), self.entries.clone(), self.idmap.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            prepare_requests(&dir);
+            // Fetches are sent as the active account, so it must still be signed in before anything is asked for.
+            let result = account::check_active().and_then(|_| Store::open(&dir, false)).map(|store| {
+                let report = |done, total| {
+                    let _ = tx.send(LookupMsg::Progress(done, total));
+                    ctx.request_repaint();
+                };
+                let found = lookup::find(&store, &entries, &mut idmap, &ids, &report);
+                let sounds = lookup::sounds(&store, &entries, &idmap);
+                (found, sounds, idmap)
+            });
+            let _ = tx.send(LookupMsg::Done(result.map_err(|e| format!("{e:#}"))));
+            ctx.request_repaint();
+        });
+        self.lookup_job = Some(rx);
+        self.lookup_progress = (0, 0);
+    }
+
+    fn poll_lookup(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.lookup_job else { return };
+        let mut finished = None;
+        loop {
+            match rx.try_recv() {
+                Ok(LookupMsg::Progress(done, total)) => self.lookup_progress = (done, total),
+                Ok(LookupMsg::Done(result)) => finished = Some(result),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    finished.get_or_insert(Err("the lookup stopped unexpectedly".to_string()));
+                    break;
+                }
+            }
+        }
+        let Some(result) = finished else { return };
+        self.lookup_job = None;
+        match result {
+            Ok((found, sounds, idmap)) => {
+                self.idmap = idmap;
+                self.idmap.merge(&self.catalog.fingerprints);
+                // A map that failed to load is never written, so the broken file stays as it was.
+                if self.idmap_error.is_none() {
+                    if let Err(e) = self.idmap.save(&self.idmap_path) {
+                        self.notify(ctx, format!("The ID map could not be saved: {e:#}"), true);
+                    }
+                }
+                for item in &found {
+                    let picture = item
+                        .file
+                        .as_ref()
+                        .filter(|(kind, _)| matches!(*kind, "png" | "jpeg" | "gif" | "webp"))
+                        .and_then(|(_, body)| image::load_from_memory(body).ok());
+                    if let Some(picture) = picture {
+                        let small = picture.thumbnail(256, 256).to_rgba8();
+                        let pixels = egui::ColorImage::from_rgba_unmultiplied([small.width() as usize, small.height() as usize], small.as_raw());
+                        self.lookup_pictures.insert(item.id, ctx.load_texture("fetched", pixels, egui::TextureOptions::LINEAR));
+                    }
+                }
+                // The newest answers go on top; an ID asked about again replaces its earlier answer.
+                self.lookup_found.retain(|old| !found.iter().any(|new| new.id == old.id));
+                self.lookup_found.splice(0..0, found);
+                self.lookup_sounds = sounds;
+                self.lookup_input.clear();
+                self.preview = None;
+                self.tab_time = ctx.input(|i| i.time);
+                // What was learned may be what a config was waiting for.
+                (self.sync_wanted, self.quiet) = (true, true);
+            }
+            Err(e) => self.notify(ctx, e, true),
+        }
+    }
+
+    /// Ties an asset ID to the cached entry the user says it is.
+    fn pick(&mut self, asset: u64, entry: Id) -> Result<String> {
+        if let Some(error) = &self.idmap_error {
+            return Err(anyhow!("The ID map at {} could not be read ({error}); fix or remove it first", self.idmap_path.display()));
+        }
+        let fp = config::fingerprint(&Store::open(&self.dir, false)?.read_body(&entry)?);
+        if self.idmap.add(asset, fp) {
+            self.idmap.save(&self.idmap_path)?;
+        }
+        if let Some(sound) = self.lookup_sounds.iter_mut().find(|s| s.id == entry) {
+            sound.taken = Some(asset.to_string());
+        }
+        if let Some(found) = self.lookup_found.iter_mut().find(|f| f.id == asset) {
+            found.outcome = resolve::Outcome::Known;
+        }
+        self.preview = None;
+        (self.sync_wanted, self.quiet) = (true, true);
+        Ok(format!("Asset {asset} is now tied to {}; configs that name it will use it", &store::hex(&entry)[..12]))
+    }
+
+    fn save_fetched(&mut self, index: usize) -> Result<String> {
+        let Some((id, kind, body)) = self.lookup_found.get(index).and_then(|f| f.file.as_ref().map(|(kind, body)| (f.id, *kind, body.clone())))
+        else {
+            return Ok(String::new());
+        };
+        let Some(path) = rfd::FileDialog::new().set_file_name(format!("{id}.{}", format::extension(kind))).save_file() else {
+            return Ok(String::new());
+        };
+        std::fs::write(&path, &body[..]).with_context(|| format!("writing {}", path.display()))?;
+        Ok(format!("Saved {} to {}", human_size(body.len() as u64), path.display()))
     }
 
     fn tag_focused(&mut self) -> Result<String> {
@@ -2281,6 +2693,28 @@ impl App {
         painter.with_clip_rect(clip).set(slot, Shape::Vec(shapes));
     }
 
+    /// Who is signed in, at the bottom right: their avatar and name, or a way to sign in.
+    fn account_chip(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let (label, hint) = match self.accounts.active() {
+            Some(account) => (
+                if account.display.is_empty() { account.name.clone() } else { account.display.clone() },
+                "Your Roblox account: open the Account page",
+            ),
+            None => ("Sign in".to_string(), "Sign in with Roblox to fetch sounds and other assets guests cannot get"),
+        };
+        let avatar = self.accounts.active().and_then(|account| self.avatars.get(&account.user_id));
+        let response = match avatar {
+            Some(texture) => {
+                let picture = egui::Image::new(texture).fit_to_exact_size(Vec2::splat(18.0)).corner_radius(CornerRadius::same(9));
+                ui.add(egui::Button::image_and_text(picture, egui::RichText::new(label).size(12.5)))
+            }
+            None => ui.add(egui::Button::new(egui::RichText::new(label).size(12.5))),
+        };
+        if response.on_hover_text(hint).clicked() {
+            actions.push(Action::ShowTab(Tab::Account));
+        }
+    }
+
     /// The sidebar: the two halves of the app, Browse and Manage.
     fn sidebar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         let now = ui.input(|i| i.time);
@@ -2403,6 +2837,8 @@ impl App {
         let chips = [
             (Tab::Configs, "Configs", (enabled > 0).then_some(enabled), theme::ACCENT),
             (Tab::Packs, "Packs", Some(self.catalog.packs.len()), theme::LIME),
+            (Tab::Lookup, "IDs", None, if self.accounts.is_empty() { theme::MUTED } else { theme::WARN }),
+            (Tab::Account, "Account", None, if self.accounts.is_empty() { theme::MUTED } else { theme::OK }),
             (Tab::Guide, "Guide", None, theme::OK),
             (Tab::Info, "Info", None, if self.update.is_some() { theme::LIME } else { theme::MUTED }),
         ];
@@ -2482,6 +2918,8 @@ impl App {
                     match self.tab {
                         Tab::Configs => self.configs_page(ui, actions),
                         Tab::Packs => self.packs_page(ui, actions),
+                        Tab::Lookup => self.lookup_page(ui, actions),
+                        Tab::Account => self.account_page(ui, actions),
                         Tab::Guide => self.guide_page(ui, actions),
                         _ => self.info_page(ui, actions),
                     }
@@ -2504,6 +2942,7 @@ impl App {
     }
 
     fn configs_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let signed_in = !self.accounts.is_empty();
         self.page_header(
             ui,
             "Configs",
@@ -2553,6 +2992,23 @@ impl App {
             });
             return;
         }
+        let waiting: usize = self.configs.iter().filter(|c| c.enabled).map(|c| id_stats(&c.rules, &self.idmap).2).sum();
+        if waiting > 0 && !signed_in {
+            card(ui, self.entrance(ui.ctx(), 2), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Locked until you sign in").size(16.0).strong().color(theme::WARN));
+                    theme::pill(ui, &format::count(waiting, "asset ID", "asset IDs"), theme::WARN);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(primary_button("Sign in")).clicked() {
+                            actions.push(Action::ShowTab(Tab::Account));
+                        }
+                    });
+                });
+                let why = "Sounds, and anything else Roblox only gives to signed-in players, cannot be fetched without an account, so the rules \
+                           that name them do nothing for now. Everything else in your configs works as before.";
+                ui.add(egui::Label::new(egui::RichText::new(why).color(theme::MUTED)).wrap());
+            });
+        }
         self.conflicts_card(ui, actions);
         for (i, config) in self.configs.iter().enumerate() {
             card(ui, self.entrance(ui.ctx(), i + 3), |ui| {
@@ -2590,6 +3046,16 @@ impl App {
                         text.push_str(&format!(", {} not looked up yet", ids - known - refused));
                     }
                     ui.add(egui::Label::new(egui::RichText::new(text).color(theme::MUTED).small()).wrap());
+                    if refused > 0 {
+                        if signed_in {
+                            let hint = "Ask again as your account, and pick by ear what Roblox still refuses";
+                            if ui.add_enabled(idle, egui::Button::new("Identify them")).on_hover_text(hint).clicked() {
+                                actions.push(Action::LookupFor(i));
+                            }
+                        } else if ui.button("Sign in to use them").on_hover_text("Roblox only gives these to a signed-in player").clicked() {
+                            actions.push(Action::ShowTab(Tab::Account));
+                        }
+                    }
                 }
                 let keys = rule_keys(&config.rules);
                 egui::CollapsingHeader::new(egui::RichText::new("Rules").color(theme::MUTED)).id_salt(("rules", &config.path)).show(ui, |ui| {
@@ -2660,6 +3126,293 @@ impl App {
         });
     }
 
+    fn account_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        self.page_header(
+            ui,
+            "Account",
+            "Add a Roblox account by its cookie to unlock fetching IDs and replacing sounds, which Roblox only allows for signed-in players.",
+        );
+        let bold_red = |ui: &mut egui::Ui, text: &str| {
+            ui.add(egui::Label::new(egui::RichText::new(text).strong().size(15.0).color(theme::DANGER)).wrap());
+        };
+        card(ui, self.entrance(ui.ctx(), 1), |ui| {
+            bold_red(ui, "This can be a main account. An alternate account is recommended.");
+            bold_red(ui, "NEVER paste anyone else's cookie, and never paste this value anywhere other than rbxcache.");
+            ui.add_space(4.0);
+            let text = "A throwaway account works exactly as well as your main one: it only has to exist and be able to sign in. \
+                        Whoever holds this cookie can act as that account, including spending its Robux, so an alt with nothing of \
+                        value on it is what to use.";
+            ui.add(egui::Label::new(egui::RichText::new(text).color(theme::TEXT)).wrap());
+        });
+        card(ui, self.entrance(ui.ctx(), 2), |ui| {
+            ui.label(egui::RichText::new("Why an account").size(16.0).strong());
+            for (title, text) in [
+                (
+                    "Why it is needed",
+                    "Roblox only hands most sounds to signed-in players. Without an account rbxcache cannot download a sound to compare it \
+                     with your cache, so it cannot tell which cached sound belongs to which ID, and the sound rules in a config do nothing.",
+                ),
+                (
+                    "What is pasted",
+                    "rbxcache has no Roblox login page of its own. You copy your account's .ROBLOSECURITY cookie out of your own, already \
+                     signed-in browser and paste it here; rbxcache never reads it from your browser or from Roblox's own files by itself.",
+                ),
+                (
+                    "Where it is kept",
+                    "Encrypted for your Windows user, in accounts.json in the data folder, so the file is no use on another user or computer. \
+                     Remove deletes it from this computer at once.",
+                ),
+                (
+                    "Ending the session",
+                    "Remove only deletes the cookie from this computer; it does not end the Roblox session itself, since there is no way to \
+                     do that with a cookie alone. To be sure a cookie can never be used again, sign that account out on roblox.com.",
+                ),
+                ("What works without it", "Browsing, previews, exporting, replacing and deleting entries, and configs for images, fonts, meshes and anything else Roblox gives to everyone. Fetching IDs and replacing sounds need an account, and stay locked until one is added."),
+            ] {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(title).color(theme::LIME));
+                ui.add(egui::Label::new(text).wrap());
+            }
+        });
+
+        let active = self.accounts.active().map(|a| a.user_id);
+        for (index, account) in self.accounts.accounts.iter().enumerate() {
+            card(ui, self.entrance(ui.ctx(), index + 3), |ui| {
+                ui.horizontal(|ui| {
+                    match self.avatars.get(&account.user_id) {
+                        Some(texture) => {
+                            ui.add(egui::Image::new(texture).fit_to_exact_size(Vec2::splat(52.0)).corner_radius(CornerRadius::same(26)));
+                        }
+                        None => {
+                            let (rect, _) = ui.allocate_exact_size(Vec2::splat(52.0), egui::Sense::hover());
+                            ui.painter().circle_filled(rect.center(), 26.0, theme::RAISED);
+                        }
+                    }
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            let name = if account.display.is_empty() { &account.name } else { &account.display };
+                            ui.label(egui::RichText::new(name).size(16.0).strong());
+                            if active == Some(account.user_id) {
+                                theme::pill(ui, "In use", theme::OK);
+                            }
+                        });
+                        ui.label(egui::RichText::new(format!("@{}  -  {}", account.name, account.user_id)).color(theme::MUTED).small());
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let out = egui::RichText::new("Remove").color(theme::DANGER).strong();
+                        if ui.button(out).on_hover_text("Delete this cookie from this computer. Does not end its Roblox session.").clicked() {
+                            actions.push(Action::SignOut(account.user_id));
+                        }
+                        if active != Some(account.user_id) && ui.button("Use this account").clicked() {
+                            actions.push(Action::UseAccount(account.user_id));
+                        }
+                    });
+                });
+            });
+        }
+
+        card(ui, self.entrance(ui.ctx(), self.accounts.accounts.len() + 3), |ui| {
+            let label = if self.accounts.is_empty() { "Add an account" } else { "Add another account" };
+            ui.label(egui::RichText::new(label).size(16.0).strong());
+            bold_red(ui, "This can be a main account. An alternate account is recommended.");
+            let hint = "How to copy it: in your browser, with that account signed in, open developer tools (F12), go to \
+                        Application (or Storage) > Cookies > https://www.roblox.com, find .ROBLOSECURITY, and copy its value.";
+            ui.add(egui::Label::new(egui::RichText::new(hint).color(theme::MUTED).small()).wrap());
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let field = ui
+                    .add(egui::TextEdit::singleline(&mut self.account_input).password(true).hint_text(".ROBLOSECURITY cookie").desired_width(420.0));
+                let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let busy = self.account_job.is_some();
+                if (ui.add_enabled(!busy, primary_button("Check and add")).clicked() || entered) && !busy {
+                    actions.push(Action::AskAddAccount);
+                }
+                if busy {
+                    ui.spinner();
+                    ui.label(egui::RichText::new("Checking with Roblox").color(theme::MUTED));
+                }
+            });
+            if let Some(error) = &self.account_error {
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(egui::RichText::new(error).color(theme::WARN)).wrap());
+            }
+        });
+    }
+
+    fn lookup_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        self.page_header(
+            ui,
+            "IDs",
+            "Type a Roblox asset ID to see what it is, get the file when Roblox hands it out, and tie it to the entry in your cache.",
+        );
+        if self.accounts.is_empty() {
+            card(ui, self.entrance(ui.ctx(), 1), |ui| {
+                ui.label(egui::RichText::new("Locked until an account is added").size(17.0).strong().color(theme::WARN));
+                let why = "Fetching an ID asks Roblox for the asset as a signed-in player. Sounds and many other assets are only given to them, so \
+                           without an account there is nothing to fetch. Browsing, previews and the rest of rbxcache work as before.";
+                ui.add(egui::Label::new(egui::RichText::new(why).color(theme::TEXT)).wrap());
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("This can be a main account. An alternate account is recommended.").strong().color(theme::DANGER),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(4.0);
+                if ui.add(primary_button("Go to the Account page")).clicked() {
+                    actions.push(Action::ShowTab(Tab::Account));
+                }
+            });
+            return;
+        }
+        let idle = self.busy().is_none();
+        ui.horizontal(|ui| {
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut self.lookup_input).hint_text("Asset IDs, links or rbxassetid:// addresses").desired_width(420.0),
+            );
+            let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.add_enabled(idle, primary_button("Fetch")).clicked() || entered) && idle {
+                actions.push(Action::RunLookup);
+            }
+            if !self.lookup_found.is_empty()
+                && ui
+                    .button("Copy fingerprints")
+                    .on_hover_text("What is known about these IDs, in the form the fingerprints section of packs.json takes")
+                    .clicked()
+            {
+                actions.push(Action::CopyFingerprints);
+            }
+        });
+        if let Some(who) = self.accounts.active() {
+            let name = if who.display.is_empty() { &who.name } else { &who.display };
+            let note =
+                format!("Fetches are sent as {name} (@{}). Each fetch first checks with Roblox that this account is still signed in.", who.name);
+            ui.label(egui::RichText::new(note).color(theme::MUTED).small());
+        }
+        ui.add_space(8.0);
+        if self.lookup_found.is_empty() {
+            card(ui, self.entrance(ui.ctx(), 1), |ui| {
+                let about = "Images, meshes, fonts and other public assets are downloaded as a guest, shown here, and matched to your cache. \
+                             Roblox does not hand most sounds out that way. With an account signed in on the Account tab they are asked for again as \
+                             that account. What is still refused is listed as the cached sounds of the right length: play them, pick the one it is, \
+                             and configs that name the ID will work from then on.";
+                ui.add(egui::Label::new(egui::RichText::new(about).color(theme::MUTED)).wrap());
+            });
+            return;
+        }
+        let playing = self.audio.as_ref().filter(|a| a.active() && !a.paused()).and_then(|a| a.current);
+        if playing.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        for (index, found) in self.lookup_found.iter().enumerate() {
+            card(ui, self.entrance(ui.ctx(), index + 1), |ui| {
+                let details = found.details.clone().unwrap_or_default();
+                ui.horizontal(|ui| {
+                    let name = if details.name.is_empty() { format!("Asset {}", found.id) } else { details.name.clone() };
+                    ui.label(egui::RichText::new(name).size(16.0).strong());
+                    if let Some(kind) = details.type_id {
+                        theme::pill(ui, format::asset_type_name(kind), theme::ACCENT);
+                    }
+                    ui.label(egui::RichText::new(found.id.to_string()).monospace().color(theme::MUTED));
+                    if !details.creator.is_empty() {
+                        ui.label(egui::RichText::new(format!("by {}", details.creator)).color(theme::MUTED));
+                    }
+                });
+                if let Some((kind, body)) = &found.file {
+                    ui.horizontal(|ui| {
+                        theme::pill(ui, kind, theme::kind_color(kind));
+                        ui.label(format!("Roblox handed it out: {}", human_size(body.len() as u64)));
+                        if ui.button("Save as...").clicked() {
+                            actions.push(Action::SaveFetched(index));
+                        }
+                        if format::is_audio(kind) {
+                            let label = if playing == Some(fetched_id(found.id)) { "Pause" } else { "Play" };
+                            if ui.button(label).clicked() {
+                                actions.push(Action::PlayFetched(index));
+                            }
+                        }
+                    });
+                    if let Some(picture) = self.lookup_pictures.get(&found.id) {
+                        let (rect, _) = ui.allocate_exact_size(picture.size_vec2().min(Vec2::splat(160.0)), egui::Sense::hover());
+                        checkerboard(ui.painter(), rect);
+                        ui.painter().image(picture.id(), rect, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                    }
+                }
+                use resolve::Outcome;
+                match &found.outcome {
+                    Outcome::Known | Outcome::Exact | Outcome::Rendition => {
+                        ui.horizontal(|ui| {
+                            theme::pill(ui, "In your cache", theme::OK);
+                            ui.label(egui::RichText::new("Configs that name this ID will find it.").color(theme::MUTED));
+                        });
+                    }
+                    Outcome::NotCached => {
+                        ui.label(
+                            egui::RichText::new("Known, but not in your cache right now. It will be recognised when Roblox downloads it.")
+                                .color(theme::MUTED),
+                        );
+                    }
+                    Outcome::Gone => drop(ui.colored_label(theme::WARN, "Roblox has no asset with this ID.")),
+                    Outcome::Failed(why) => drop(ui.colored_label(theme::DANGER, format!("The lookup failed: {why}"))),
+                    Outcome::Denied(_) => self.pick_by_ear(ui, found, playing, actions),
+                }
+            });
+        }
+    }
+
+    /// For an ID Roblox would not hand out: the cached sounds it could be, to play and choose from.
+    fn pick_by_ear(&self, ui: &mut egui::Ui, found: &Found, playing: Option<Id>, actions: &mut Vec<Action>) {
+        ui.colored_label(theme::WARN, "Roblox does not hand this one out to a guest.");
+        if self.accounts.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Signing in with an account may get it directly.").color(theme::MUTED));
+                if ui.small_button("Sign in").clicked() {
+                    actions.push(Action::ShowTab(Tab::Account));
+                }
+            });
+        } else {
+            ui.label(egui::RichText::new("Asked again as each of its creator's games, and none of them handed it out.").color(theme::MUTED));
+        }
+        // With nothing known about it, a refused asset is taken to be a sound: those are the ones Roblox keeps back.
+        if found.details.is_some() && !found.is_sound() {
+            let how = "To tie it to an entry by hand: find the entry under Browse, type this ID in its Asset ID box and press Tag.";
+            ui.add(egui::Label::new(egui::RichText::new(how).color(theme::MUTED)).wrap());
+            return;
+        }
+        let about = found.details.as_ref().and_then(|d| d.seconds);
+        let candidates: Vec<&Sound> = lookup::candidates(&self.lookup_sounds, about).into_iter().filter(|s| self.index.contains_key(&s.id)).collect();
+        let length = about.map_or(String::new(), |seconds| format!(" about {seconds} s long"));
+        if candidates.is_empty() {
+            let none = format!("No cached sound{length} is free to be it. Play the game with rbxcache running so Roblox downloads the sound, then fetch this ID again.");
+            ui.add(egui::Label::new(egui::RichText::new(none).color(theme::MUTED)).wrap());
+            return;
+        }
+        let which = format!(
+            "It is one of these {}{length}. Play them and pick the one it is.",
+            format::count(candidates.len(), "cached sound", "cached sounds")
+        );
+        ui.add(egui::Label::new(which).wrap());
+        egui::ScrollArea::vertical().id_salt(("candidates", found.id)).max_height(230.0).show(ui, |ui| {
+            for sound in candidates {
+                ui.horizontal(|ui| {
+                    let label = if playing == Some(sound.id) { "Pause" } else { "Play" };
+                    if ui.button(label).clicked() {
+                        actions.push(Action::PlaySound(sound.id));
+                    }
+                    if ui.button("This is it").on_hover_text("Tie the asset ID to this entry").clicked() {
+                        actions.push(Action::Pick(found.id, sound.id));
+                    }
+                    let seconds = sound.seconds.map_or("length unknown".to_string(), |s| format!("{s:.2} s"));
+                    ui.label(egui::RichText::new(seconds).monospace());
+                    ui.label(egui::RichText::new(human_size(sound.size)).color(theme::MUTED));
+                    ui.label(egui::RichText::new(format!("last used {}", format_time_ms(sound.atime))).color(theme::MUTED).small());
+                    if ui.small_button("Show").on_hover_text("Open this entry under Browse").clicked() {
+                        actions.push(Action::ShowEntry(sound.id));
+                    }
+                });
+            }
+        });
+    }
+
     fn guide_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         self.page_header(ui, "Guide", "Using a config, from getting one to seeing it in game.");
         let steps = [
@@ -2688,7 +3441,7 @@ impl App {
         card(ui, self.entrance(ui.ctx(), steps.len() + 1), |ui| {
             ui.label(egui::RichText::new("When something does not change").size(16.0).strong());
             for (what, why) in [
-                ("Sounds", "Roblox only gives most sounds to players who are logged in and in the game, and rbxcache never logs in, so it cannot tell which cached sound is which. Those rules are counted as needing a login and skipped. Tagging the entry by hand (select it, type the asset ID, press Tag) makes the rule work."),
+                ("Sounds", "Roblox only gives most sounds to signed-in players, so the rules that name them are locked until you sign in on the Account tab (an alternate account is fine). Once signed in, rbxcache asks again as that account, and then as each of the sound's creator's games, so the game does not have to have been joined first. What is still refused is listed on the IDs tab as the cached sounds of the right length, to play and pick from."),
                 ("It still looks the same", "The asset was loaded before it was replaced. Rejoin or restart Roblox."),
                 ("It changed, then changed back", "Roblox downloaded the asset again. With rbxcache open and Live > Watch cache live on, it is replaced again as it arrives."),
                 ("Nothing matched", "Roblox has not downloaded those assets on this computer yet. Play the game once with rbxcache running."),
@@ -2762,9 +3515,9 @@ impl App {
                 ui.label(egui::RichText::new("The list has no packs right now.").color(theme::MUTED));
             });
         }
-        let note = "Images and fonts are matched by looking each asset ID up with Roblox, with no login. Roblox refuses that for most sounds and \
-                    for some images, so the parts of a pack that change those are skipped unless you tag the entries yourself. The Guide tab \
-                    has more.";
+        let note = "Images and fonts are matched by looking each asset ID up with Roblox, as a guest. Roblox refuses that for most sounds and \
+                    for some images. Signed in on the Account tab, rbxcache asks again as that account; for what is still refused, pick the sound \
+                    by ear on the IDs tab or tag the entries yourself. The Guide tab has more.";
         ui.add_space(4.0);
         ui.add(egui::Label::new(egui::RichText::new(note).color(theme::MUTED).small()).wrap());
     }
@@ -2831,9 +3584,10 @@ impl App {
 
         card(ui, self.entrance(ui.ctx(), 3), |ui| {
             ui.label(egui::RichText::new("Lightweight by design").size(17.0).strong());
-            let text = "rbxcache changes what Roblox has already saved to disk, and nothing else. It is not a proxy, it installs no \
-                        certificate, and it never asks for or reads a login. While it sits in the tray it looks at the cache index once a \
-                        second and puts your configs on what is new. A texture is written at the size of the one it replaces.";
+            let text = "rbxcache changes what Roblox has already saved to disk, and nothing else. It is not a proxy and it installs no \
+                        certificate. Adding an account is optional, and it is a cookie you paste yourself; rbxcache never reads it from your \
+                        browser or Roblox's own files on its own, and never asks for a password. While it sits in the tray it looks at the \
+                        cache index once a second and puts your configs on what is new. A texture is written at the size of the one it replaces.";
             ui.add(egui::Label::new(egui::RichText::new(text).color(theme::TEXT)).wrap());
             ui.add_space(4.0);
             for (n, step) in [
@@ -2927,24 +3681,63 @@ impl App {
         });
     }
 
-    /// What the app is busy with, if anything: a caption and, when it can be
-    /// measured, how far along it is.
-    fn busy(&self) -> Option<(String, Option<f32>)> {
+    /// What the app is busy with, if anything: a short title, a sentence of
+    /// what that work is doing, and, when it can be measured, how far along it is.
+    fn busy(&self) -> Option<(String, String, Option<f32>)> {
         let fraction = |(done, total): (usize, usize)| (total > 0).then(|| done as f32 / total as f32);
         if self.clearing.is_some() {
-            Some(("Clearing the cache".to_string(), None))
+            Some((
+                "Clearing the cache".into(),
+                "Deleting every cached entry on this computer so Roblox can download them fresh. Replacements made here go with them.".into(),
+                None,
+            ))
         } else if self.loading.is_some() {
             let (done, total) = self.progress;
-            let caption = if total > 0 { format!("Scanning files  {done} / {total}") } else { "Opening the index".to_string() };
-            Some((caption, fraction(self.progress)))
+            let caption = if total > 0 { format!("Reading the Roblox cache  {done} / {total}") } else { "Opening the cache index".into() };
+            let detail = if total > 0 {
+                "Classifying each file in rbx-storage so Browse and Live have something to show, without changing any of them.".into()
+            } else {
+                "Opening rbx-storage.db and preparing to walk the files Roblox has kept on this computer.".into()
+            };
+            Some((caption, detail, fraction(self.progress)))
+        } else if self.lookup_job.is_some() {
+            let (done, total) = self.lookup_progress;
+            let caption = if total > 0 { format!("Fetching asset IDs  {done} / {total}") } else { "Preparing to fetch asset IDs".into() };
+            let detail = if resolve::signed_in() {
+                "Asking Roblox as your signed-in account, matching what comes back to your cache, and listing sounds that still need a pick by ear."
+                    .into()
+            } else {
+                "Asking Roblox for each ID and matching what comes back to your cache. Sign in on the Account tab for sounds and other locked assets."
+                    .into()
+            };
+            Some((caption, detail, fraction(self.lookup_progress)))
         } else if let Some((_, name)) = &self.pack_job {
-            Some((format!("Downloading {name}"), None))
+            Some((
+                format!("Downloading {name}"),
+                "Fetching the pack's config so it can be checked against your cache before anything is written.".into(),
+                None,
+            ))
         } else if self.apply_job.is_some() {
-            Some(("Applying configs".to_string(), None))
+            Some((
+                "Applying configs".into(),
+                "Rewriting the cached entries your enabled configs name, and putting back anything no longer wanted from the copies rbxcache kept."
+                    .into(),
+                None,
+            ))
         } else if self.config_job.is_some() {
             let (done, total) = self.config_progress;
-            let caption = if total > 0 { format!("Looking up asset IDs  {done} / {total}") } else { "Checking configs".to_string() };
-            Some((caption, fraction(self.config_progress)))
+            let caption = if total > 0 { format!("Checking configs  {done} / {total}") } else { "Checking configs".into() };
+            Some((
+                caption,
+                "Looking up every asset ID the configs name so rbxcache knows which cached entries they hit, before anything is written.".into(),
+                fraction(self.config_progress),
+            ))
+        } else if self.account_job.is_some() {
+            Some((
+                "Checking the account".into(),
+                "Asking Roblox who this cookie belongs to. Nothing is written until that answer comes back.".into(),
+                None,
+            ))
         } else {
             None
         }
@@ -2961,7 +3754,7 @@ impl App {
         const PATIENCE: f64 = 0.15;
         /// A switch on the Configs page gets this long before its work is given a splash.
         const QUIET_PATIENCE: f64 = 2.5;
-        use theme::{LIME, SPLASH_BG as BACKGROUND, SPLASH_INK as INK, SPLASH_MUTED as MUTED};
+        use theme::{SPLASH_BAR, SPLASH_INK as INK, SPLASH_MUTED as MUTED};
 
         let now = ctx.input(|i| i.time);
         let busy = self.busy();
@@ -2970,7 +3763,7 @@ impl App {
                 let since = *self.busy_since.get_or_insert(now);
                 let patience = if self.quiet { QUIET_PATIENCE } else { PATIENCE };
                 if now - since >= patience || (self.entries.is_empty() && !self.quiet) {
-                    self.splash = Some(Splash { shown: now, leaving: None, caption: String::new(), fraction: None });
+                    self.splash = Some(Splash { shown: now, leaving: None, caption: String::new(), detail: String::new(), fraction: None });
                 } else {
                     ctx.request_repaint();
                 }
@@ -2988,8 +3781,8 @@ impl App {
             (self.busy_since, self.quiet) = (None, false);
         }
         let Some(splash) = &mut self.splash else { return };
-        if let Some((caption, fraction)) = busy {
-            (splash.caption, splash.fraction) = (caption, fraction);
+        if let Some((caption, detail, fraction)) = busy {
+            (splash.caption, splash.detail, splash.fraction) = (caption, detail, fraction);
         }
         let leaving = splash.leaving.map_or(0.0, |at| ((now - at) as f32 / if self.settings.animations { DISSOLVE } else { 0.001 }).clamp(0.0, 1.0));
         if leaving >= 1.0 {
@@ -3008,7 +3801,7 @@ impl App {
         let opacity = (entered / 0.55).min(1.0) * (1.0 - leaving);
         let scale = scale * (1.0 + 0.04 * leaving);
 
-        let (caption, fraction, motion) = (splash.caption.clone(), splash.fraction, self.settings.animations);
+        let (caption, detail, fraction, motion) = (splash.caption.clone(), splash.detail.clone(), splash.fraction, self.settings.animations);
         let shown = ctx.animate_value_with_time(egui::Id::new("splash_progress"), fraction.unwrap_or(0.0), 0.25);
         let screen = ctx.screen_rect();
         egui::Area::new(egui::Id::new("splash")).order(egui::Order::Foreground).fixed_pos(screen.min).show(ctx, |ui| {
@@ -3017,19 +3810,20 @@ impl App {
                 ui.allocate_rect(screen, egui::Sense::click_and_drag());
             }
             let painter = ui.painter();
-            painter.rect_filled(screen, CornerRadius::ZERO, alpha(BACKGROUND, 1.0 - leaving));
+            theme::splash_gradient(painter, screen, 1.0 - leaving);
 
             let size = (screen.width() * 0.12).clamp(52.0, 120.0) * scale;
             let mut job = egui::text::LayoutJob::default();
             let format = egui::TextFormat {
                 font_id: egui::FontId::new(size, theme::wordmark_font()),
-                color: INK,
+                // The wordmark stays white on every splash, over the purple gradient.
+                color: Color32::WHITE,
                 extra_letter_spacing: -0.07 * size,
                 ..Default::default()
             };
             job.append("pirxcy", 0.0, format);
             let galley = ui.fonts(|f| f.layout_job(job));
-            let at = screen.center() - galley.size() / 2.0 + Vec2::new(0.0, rise - 18.0);
+            let at = screen.center() - galley.size() / 2.0 + Vec2::new(0.0, rise - 28.0);
             // Dissolving, the word spreads into soft copies of itself, which reads as a blur.
             if leaving > 0.0 {
                 let spread = 10.0 * leaving;
@@ -3041,12 +3835,20 @@ impl App {
             }
             painter.galley_with_override_text_color(at, galley.clone(), alpha(INK, opacity * (1.0 - leaving * 0.6)));
 
-            // Below the word: what is happening, and a thin line for how far along it is.
-            let below = at.y + galley.size().y + 14.0;
-            let font = egui::FontId::proportional(13.0);
-            painter.text(egui::pos2(screen.center().x, below), egui::Align2::CENTER_TOP, &caption, font, alpha(MUTED, opacity));
-            let track = Rect::from_center_size(egui::pos2(screen.center().x, below + 30.0), Vec2::new(220.0, 2.0));
-            painter.rect_filled(track, CornerRadius::same(1), alpha(Color32::WHITE, 0.08 * opacity));
+            // Below the word: a short title, a sentence of what the work is doing, and a purple line for how far along it is.
+            let below = at.y + galley.size().y + 16.0;
+            let title_font = egui::FontId::proportional(14.0);
+            let detail_font = egui::FontId::proportional(12.0);
+            painter.text(egui::pos2(screen.center().x, below), egui::Align2::CENTER_TOP, &caption, title_font, alpha(Color32::WHITE, opacity * 0.92));
+            let detail_width = (screen.width() * 0.55).clamp(260.0, 460.0);
+            let mut detail_job = egui::text::LayoutJob::default();
+            detail_job.append(&detail, 0.0, egui::TextFormat { font_id: detail_font, color: alpha(MUTED, opacity), ..Default::default() });
+            detail_job.wrap.max_width = detail_width;
+            let detail_galley = ui.fonts(|f| f.layout_job(detail_job));
+            let detail_at = egui::pos2(screen.center().x - detail_galley.size().x / 2.0, below + 22.0);
+            painter.galley(detail_at, detail_galley.clone(), alpha(MUTED, opacity));
+            let track = Rect::from_center_size(egui::pos2(screen.center().x, detail_at.y + detail_galley.size().y + 18.0), Vec2::new(220.0, 3.0));
+            painter.rect_filled(track, CornerRadius::same(2), alpha(SPLASH_BAR, 0.18 * opacity));
             let filled = match fraction {
                 Some(_) => Rect::from_min_size(track.min, Vec2::new(track.width() * shown.clamp(0.0, 1.0), track.height())),
                 // Work that cannot be measured gets a short bar sweeping across.
@@ -3056,7 +3858,7 @@ impl App {
                     Rect::from_min_size(egui::pos2(left, track.top()), Vec2::new(60.0, track.height())).intersect(track)
                 }
             };
-            painter.rect_filled(filled, CornerRadius::same(1), alpha(LIME, opacity));
+            painter.rect_filled(filled, CornerRadius::same(2), alpha(SPLASH_BAR, opacity));
         });
         ctx.request_repaint();
     }
@@ -3083,6 +3885,40 @@ impl App {
                 add(ui);
             });
         open && response.should_close()
+    }
+
+    /// The warning that has to sit for [`account::SUBMIT_HOLD`] before the cookie is sent.
+    fn account_warn_dialog(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let Some(opened) = self.account_warn_from else { return };
+        let left = (account::SUBMIT_HOLD.as_secs_f64() - (ctx.input(|i| i.time) - opened)).max(0.0);
+        if left > 0.0 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        let mut close = false;
+        let mut send = false;
+        let dismissed = self.modal(ctx, "account-warn", true, |ui| {
+            ui.label(egui::RichText::new("Before this cookie is sent").size(18.0));
+            ui.add_space(4.0);
+            ui.add(egui::Label::new(egui::RichText::new(account::WARNING).strong().color(theme::DANGER)).wrap());
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let ready = left <= 0.0;
+                let label = if ready { "Add this account".to_string() } else { format!("Add in {}", left.ceil() as u32) };
+                if ui.add_enabled(ready, primary_button(&label)).clicked() {
+                    send = true;
+                    close = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if send {
+            actions.push(Action::AddAccount);
+        }
+        if close || dismissed {
+            self.account_warn_from = None;
+        }
     }
 
     fn clear_dialog(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
@@ -3282,7 +4118,7 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
-        if self.confirm_delete || self.confirm_clear || self.confirm_configs || self.show_news {
+        if self.confirm_delete || self.confirm_clear || self.confirm_configs || self.show_news || self.account_warn_from.is_some() {
             return;
         }
         let typing = ctx.wants_keyboard_input();
@@ -3506,10 +4342,21 @@ impl eframe::App for App {
         self.poll_update(ctx);
         self.poll_catalog(ctx);
         self.poll_pack(ctx);
+        self.poll_lookup(ctx);
+        self.poll_add_account(ctx);
+        self.poll_avatars(ctx);
         self.poll_config(ctx);
         self.poll_apply(ctx);
         self.poll_clear(ctx);
         self.poll_reapply(ctx);
+        if self.recheck_configs && self.busy().is_none() {
+            self.recheck_configs = false;
+            self.run_action(Action::ReapplyConfigs, ctx);
+        }
+        if self.lookup_wanted && self.busy().is_none() {
+            self.lookup_wanted = false;
+            self.run_action(Action::RunLookup, ctx);
+        }
         if self.sync_wanted && self.busy().is_none() && self.reapply_job.is_none() {
             self.start_sync(ctx);
         }
@@ -3525,7 +4372,7 @@ impl eframe::App for App {
         }
         self.roblox_running = self.roblox.load(Ordering::Relaxed);
         // A sound belongs to the entry it was started from.
-        if let Some(audio) = self.audio.as_mut().filter(|a| a.current.is_some() && a.current != self.focus) {
+        if let Some(audio) = self.audio.as_mut().filter(|a| self.tab.lists() && a.current.is_some() && a.current != self.focus) {
             audio.stop();
         }
         self.ensure_preview(ctx);
@@ -3538,6 +4385,7 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(&self.status).color(theme::MUTED).small());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.account_chip(ui, &mut actions);
                     if self.watch.is_some() {
                         theme::pill(ui, "Live", theme::OK);
                     }
@@ -3600,6 +4448,7 @@ impl eframe::App for App {
         }
         self.delete_dialog(ctx, &mut actions);
         self.clear_dialog(ctx, &mut actions);
+        self.account_warn_dialog(ctx, &mut actions);
         self.configs_dialog(ctx, &mut actions);
         self.news_dialog(ctx);
         self.show_toast(ctx);
