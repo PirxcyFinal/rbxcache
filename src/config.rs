@@ -121,19 +121,13 @@ fn collect_rules(entries: &[Value], base: &Path, out: &mut Vec<Rule>) {
         let action = match mode.as_str() {
             "remove" => Action::Remove,
             "local" => match text("local_path") {
-                Some(p) => {
-                    let p = PathBuf::from(p);
-                    Action::Local(if p.is_absolute() { p } else { base.join(p) })
-                }
+                Some(p) => Action::Local(absolute_or_beside(base, p)),
                 None => Action::Remove,
             },
             "cdn" => match text("cdn_url") {
                 Some(url) if url.starts_with("http://") || url.starts_with("https://") => Action::Cdn(url.to_string()),
                 // Some configs put a path on this computer where the address goes.
-                Some(path) => {
-                    let path = PathBuf::from(path.strip_prefix("file:///").unwrap_or(path));
-                    Action::Local(if path.is_absolute() { path } else { base.join(path) })
-                }
+                Some(path) => Action::Local(absolute_or_beside(base, path.strip_prefix("file:///").unwrap_or(path))),
                 None => Action::Remove,
             },
             "id" => match obj.get("with_id") {
@@ -151,6 +145,31 @@ fn collect_rules(entries: &[Value], base: &Path, out: &mut Vec<Rule>) {
         let name = text("name").map_or_else(|| format!("rule {}", out.len() + 1), str::to_string);
         out.push(Rule { name, targets, action });
     }
+}
+
+/// A path that is absolute on this computer, or beside `base` when it is not.
+/// Windows drive paths (`C:\…`, `C:/…`) and UNC paths stay absolute even when
+/// the config is read on another OS, so a Fleasion config written on Windows
+/// still parses the same way on the Linux and macOS builds.
+fn absolute_or_beside(base: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() || looks_windows_absolute(&path) {
+        path
+    } else {
+        base.join(path)
+    }
+}
+
+/// True for `C:\…`, `C:/…` and `\\server\share` shapes, which Unix `is_absolute` does not recognise.
+fn looks_windows_absolute(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let bytes = text.as_bytes();
+    // Drive letter: X:\ or X:/
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/') {
+        return true;
+    }
+    // UNC: \\server\share
+    bytes.starts_with(br"\\")
 }
 
 /// Parses a config. Relative `local_path` values are taken relative to `base`.
@@ -889,13 +908,19 @@ mod tests {
     fn a_path_given_as_an_address_is_read_from_disk() {
         let text = r#"[
             {"name": "sound", "replace_ids": [5], "mode": "cdn", "cdn_url": "C:\\Users\\me\\Downloads\\mambo.mp3"},
+            {"name": "slash", "replace_ids": [5], "mode": "cdn", "cdn_url": "C:/Users/me/Downloads/mambo.mp3"},
             {"name": "beside", "replace_ids": [5], "mode": "cdn", "cdn_url": "slide.mp3"},
             {"name": "online", "replace_ids": [5], "mode": "cdn", "cdn_url": "https://example.com/a.mp3"}
         ]"#;
         let rules = parse(text, Path::new("packs")).unwrap();
-        assert_eq!(rules[0].action, Action::Local(PathBuf::from("C:\\Users\\me\\Downloads\\mambo.mp3")));
-        assert_eq!(rules[1].action, Action::Local(Path::new("packs").join("slide.mp3")));
-        assert_eq!(rules[2].action, Action::Cdn("https://example.com/a.mp3".into()));
+        // A Windows drive path stays absolute on every OS, so Linux and macOS builds parse the same configs.
+        assert_eq!(rules[0].action, Action::Local(PathBuf::from(r"C:\Users\me\Downloads\mambo.mp3")));
+        assert_eq!(rules[1].action, Action::Local(PathBuf::from("C:/Users/me/Downloads/mambo.mp3")));
+        assert_eq!(rules[2].action, Action::Local(Path::new("packs").join("slide.mp3")));
+        assert_eq!(rules[3].action, Action::Cdn("https://example.com/a.mp3".into()));
+        assert!(looks_windows_absolute(Path::new(r"C:\Users\me")));
+        assert!(looks_windows_absolute(Path::new("D:/x")));
+        assert!(!looks_windows_absolute(Path::new("slide.mp3")));
     }
 
     #[test]
