@@ -1,0 +1,252 @@
+{
+  "replacement_rules": [
+    {
+      "name": "Dark Heaven Textures",
+      "replace_ids": [
+        7658055825
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://files.catbox.moe/5ctk9w.png"
+    },
+    {
+      "name": "Dark Heaven Font",
+      "replace_ids": [
+        12187323909,
+        12187323909,
+        12187320363,
+        12187354260,
+        12187342816,
+        12187280273,
+        12187303601,
+        12187262242,
+        12187288714,
+        12187341500,
+        12187271237,
+        12187341020
+      ],
+      "mode": "cdn",
+      "enabled": false,
+      "cdn_url": "https://files.catbox.moe/w01jtv.otf"
+    },
+    {
+      "name": "Kill Sound MAMBOOO",
+      "replace_ids": [
+        16530229616,
+        16530229541,
+        16530229695
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://files.catbox.moe/ub7f65.mp3"
+    },
+    {
+      "name": "Dark Heaven logo 1",
+      "replace_ids": [
+        13854780042
+      ],
+      "mode": "cdn",
+      "enabled": false,
+      "cdn_url": "https://files.catbox.moe/e25tbs.png"
+    },
+    {
+      "name": "Dark Heaven logo 2",
+      "replace_ids": [
+        13854780213
+      ],
+      "mode": "cdn",
+      "enabled": false,
+      "cdn_url": "https://files.catbox.moe/hw44jm.jpeg"
+    },
+    {
+      "name": "Items design",
+      "replace_ids": [
+        13220167337,
+        13188242420,
+        13220167472,
+        13188153054,
+        13188242287
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://files.catbox.moe/lt4npd.png"
+    },
+    {
+      "name": "Win Streak Deisgn",
+      "replace_ids": [
+        17175092502,
+        17094014569
+      ],
+      "mode": "local",
+      "enabled": true,
+      "local_path": "C:\\Users\\Acer\\Downloads\\d36e6635-c976-4788-8d18-6967afed0ba9-removebg-preview.png"
+    },
+    {
+      "name": "Kairo Avatar loading screen",
+      "replace_ids": [
+        133917828562858,
+        121503061771505
+      ],
+      "mode": "cdn",
+      "enabled": false,
+      "cdn_url": "https://files.catbox.moe/mz5kbm.png"
+    },
+    {
+      "name": "Osu body hit",
+      "replace_ids": [
+        13110130082
+      ],
+      "mode": "id",
+      "enabled": true,
+      "with_id": 7149255551
+    },
+    {
+      "name": "Level background image",
+      "replace_ids": [
+        81461991645938
+      ],
+      "mode": "local",
+      "enabled": true,
+      "local_path": "C:\\Users\\Acer\\Downloads\\d7cee140-50ec-424c-be39-f45f3df12219-removebg-preview.png"
+    },
+    {
+      "name": "Win Round Sound",
+      "replace_ids": [
+        16810041280
+      ],
+      "mode": "id",
+      "enabled": false,
+      "with_id": 8573766100
+    },
+    {
+      "name": "Click sound",
+      "replace_ids": [
+        177266782
+      ],
+      "mode": "id",
+      "enabled": true,
+      "with_id": 15675059323
+    },
+    {
+      "name": "Loading sound",
+      "replace_ids": [
+        6384899588
+      ],
+      "mode": "id",
+      "enabled": true,
+      "with_id": 128842283247970
+    },
+    {
+      "name": "Double Jump Sound",
+      "replace_ids": [
+        16770456156,
+        16492958314
+      ],
+      "mode": "id",
+      "enabled": true,
+      "with_id": 139862334730263
+    },
+    {
+      "name": "Skybox Bk",
+      "replace_ids": [
+        2108482005,
+        14147881792,
+        135908632589654,
+        84214501374682,
+        10196550937,
+        12261809766
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://files.catbox.moe/zf8vzl.png"
+    },
+    {
+      "name": "Skybox Dn",
+      "replace_ids": [
+        2108545280,
+        10196550667,
+        14147882149,
+        103020541883227,
+        89972436184102,
+        12261813110
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://files.catbox.moe/5bcuo3.png"
+    },
+    {
+      "name": "Skybox Ft",
+      "replace_ids": [
+        14147882761,
+        12261809766,
+        135908632589654,
+        84214501374682,
+        10196550367,
+        2108482231
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://files.catbox.moe/u4fieb.png"
+    },
+    {
+      "name": "Skybox Lf",
+      "replace_ids": [
+        14147883091,
+        135908632589654,
+        84214501374682,
+        2108482395,
+        12261809766,
+        10196550128
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://files.catbox.moe/fnj2yp.png"
+    },
+    {
+      "name": "Skybox Rt",
+      "replace_ids": [
+        14147882405,
+        135908632589654,
+        84214501374682,
+        2108482542,
+        12261809766,
+        10196549902
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://files.catbox.moe/3lznl9.png"
+    },
+    {
+      "name": "Skybox Up",
+      "replace_ids": [
+        14147881297,
+        72960281658487,
+        92138082970751,
+        2108482676,
+        10196567794,
+        12261813678
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://files.catbox.moe/3mohks.png"
+    },
+    {
+      "name": "Slide sound effect",
+      "replace_ids": [
+        16737738420
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://files.catbox.moe/tkv2hj.mp3"
+    },
+    {
+      "name": "Round loss sound",
+      "replace_ids": [
+        16810321565
+      ],
+      "mode": "id",
+      "enabled": false,
+      "with_id": 117549414117960
+    }
+  ]
+}

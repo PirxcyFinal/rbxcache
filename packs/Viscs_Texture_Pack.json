@@ -1,0 +1,679 @@
+{
+  "replacement_rules": [
+    {
+      "name": "Start Logo",
+      "replace_ids": [
+        96198404149077
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/ViscLogoTexute3.png"
+    },
+    {
+      "name": "sky (bk)",
+      "replace_ids": [
+        2108482005,
+        14147881792,
+        135908632589654,
+        84214501374682,
+        10196550937,
+        12261809766
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/raw/refs/heads/main/sky512_bk.tex"
+    },
+    {
+      "name": "sky (dn)",
+      "replace_ids": [
+        2108545280,
+        10196550667,
+        14147882149,
+        103020541883227,
+        89972436184102,
+        12261813110
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/raw/refs/heads/main/sky512_dn.tex"
+    },
+    {
+      "name": "sky (lf)",
+      "replace_ids": [
+        14147883091,
+        135908632589654,
+        84214501374682,
+        2108482395,
+        12261809766,
+        10196550128
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/raw/refs/heads/main/sky512_lf.tex"
+    },
+    {
+      "name": "sky (rt)",
+      "replace_ids": [
+        14147882405,
+        135908632589654,
+        84214501374682,
+        2108482542,
+        12261809766,
+        10196549902
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/raw/refs/heads/main/sky512_rt.tex"
+    },
+    {
+      "name": "sky (up)",
+      "replace_ids": [
+        14147881297,
+        72960281658487,
+        92138082970751,
+        2108482676,
+        10196567794,
+        12261813678
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/raw/refs/heads/main/sky512_up.tex"
+    },
+    {
+      "name": "sky (ft)",
+      "replace_ids": [
+        14147882761,
+        12261809766,
+        135908632589654,
+        84214501374682,
+        10196550367,
+        2108482231
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/raw/refs/heads/main/sky512_ft.tex"
+    },
+    {
+      "name": "Map Preview",
+      "replace_ids": [
+        108088064658436
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/ArenaImage3.png"
+    },
+    {
+      "name": "item background 1",
+      "replace_ids": [
+        13220167337
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/UnselectedItems2.png"
+    },
+    {
+      "name": "item background 2",
+      "replace_ids": [
+        13188242420
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/Selectedupitem2.png"
+    },
+    {
+      "name": "item background 3",
+      "replace_ids": [
+        13220167472
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/SelectedItem2.png"
+    },
+    {
+      "name": "item background 4",
+      "replace_ids": [
+        13188153054
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/SelecteddownItem2.png"
+    },
+    {
+      "name": "Texture",
+      "replace_ids": [
+        7658055825
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/blob/main/visctexture.png?raw=true"
+    },
+    {
+      "name": "Emote Wheel",
+      "replace_ids": [
+        123683377625866
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/EmoteWheelCustom2.png"
+    },
+    {
+      "name": "Dark Heart Start Sound",
+      "replace_ids": [
+        133729942047865
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://github.com/ViscNova/CustomSounds/raw/refs/heads/main/BarkFarting.MP3"
+    },
+    {
+      "name": "Dark Heart Finish Remove",
+      "replace_ids": [
+        90611785538933
+      ],
+      "mode": "id",
+      "enabled": true
+    },
+    {
+      "name": "Premium Logo",
+      "replace_ids": [
+        108431611670429
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/ViscLogo1.png"
+    },
+    {
+      "name": "Loading Charactor",
+      "replace_ids": [
+        133917828562858
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/StartingCharacter1.png"
+    },
+    {
+      "name": "Nosniy Shirt",
+      "replace_ids": [
+        4837870032
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/FinalShirt.png"
+    },
+    {
+      "name": "Damage Indicator",
+      "replace_ids": [
+        13853836511
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/DamageIndicator.png"
+    },
+    {
+      "name": "Level Icon",
+      "replace_ids": [
+        81461991645938
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/LevelLogo.png"
+    },
+    {
+      "name": "Level Icon",
+      "replace_ids": [
+        17175092502,
+        17094014569
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/StreakIcon2.png"
+    },
+    {
+      "name": "NoteBook",
+      "replace_ids": [
+        116853310110686
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/NotebookImage2.png"
+    },
+    {
+      "name": "Death Icon",
+      "replace_ids": [
+        16802957270
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/DeathIcon9.png"
+    },
+    {
+      "name": "Spawn Logo",
+      "replace_ids": [
+        75502723232812
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/ViscLogoSpawn.png"
+    },
+    {
+      "name": "Random Logo",
+      "replace_ids": [
+        130413597135596
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/Logorandom.png"
+    },
+    {
+      "name": "Random Logo 2",
+      "replace_ids": [
+        97418037278150
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/Images_sensei_global_97418037278150.png"
+    },
+    {
+      "name": "Random Logo 3",
+      "replace_ids": [
+        128753883492748
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/Texture_128753883492748.png"
+    },
+    {
+      "name": "Random Logo 4",
+      "replace_ids": [
+        137407893443909
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/Randomlogo4.png"
+    },
+    {
+      "name": "Left Loading Logo",
+      "replace_ids": [
+        13854780042
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/blob/main/LSLogo.png?raw=true"
+    },
+    {
+      "name": "Right Loading Logo",
+      "replace_ids": [
+        13854780213
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/blob/main/RSLogo.png?raw=true"
+    },
+    {
+      "name": "Ping Marker",
+      "replace_ids": [
+        17269776216
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/PingHIghlight2.png"
+    },
+    {
+      "name": "Timer Icon",
+      "replace_ids": [
+        135568567816402
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/timericon5.png"
+    },
+    {
+      "name": "Double Jump Sound",
+      "replace_ids": [
+        16770456156
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://github.com/ViscNova/ViscPackSounds/raw/refs/heads/main/DoubleJump2.mp3"
+    },
+    {
+      "name": "Kill Sound",
+      "replace_ids": [
+        16530229616,
+        16530229541,
+        16530229695
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/raw/refs/heads/main/FinisherKill4.MP3"
+    },
+    {
+      "name": "Midas Touch",
+      "replace_ids": [
+        120916927127339
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://github.com/ViscNova/ViscPackSounds/raw/refs/heads/main/0720.MP3"
+    },
+    {
+      "name": "Diamond Hands remove",
+      "replace_ids": [
+        126265374362193,
+        104909327141208
+      ],
+      "mode": "cdn",
+      "enabled": false
+    },
+    {
+      "name": "Diamond Hands Sound",
+      "replace_ids": [
+        94496162153937
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://github.com/ViscNova/ViscPackSounds/raw/refs/heads/main/diamond%20hands.MP3"
+    },
+    {
+      "name": "key icon",
+      "replace_ids": [
+        17860673529
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/DiamondKey4.png"
+    },
+    {
+      "name": "key icon2",
+      "replace_ids": [
+        17860400428
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/DiamondKey3.png"
+    },
+    {
+      "name": "keyBG1",
+      "replace_ids": [
+        18175187129
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/DIamondBG1.png"
+    },
+    {
+      "name": "keyBG2",
+      "replace_ids": [
+        17495953455
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/DIamondBG2.png"
+    },
+    {
+      "name": "keyBG3",
+      "replace_ids": [
+        17495953350
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/DIamondBG3.png"
+    },
+    {
+      "name": "hp icon",
+      "replace_ids": [
+        8276600102
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/heart_hp2.png"
+    },
+    {
+      "name": "win sound",
+      "replace_ids": [
+        16810041280
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://github.com/ViscNova/ViscPackSounds/raw/refs/heads/main/WinSFX2.mp3"
+    },
+    {
+      "name": "lose sound",
+      "replace_ids": [
+        16810321565
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://github.com/ViscNova/ViscPackSounds/raw/refs/heads/main/LoseSFX2.mp3"
+    },
+    {
+      "name": "Spectate icon",
+      "replace_ids": [
+        77908042044589
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/spectatoricon7.png"
+    },
+    {
+      "name": "Computer icon",
+      "replace_ids": [
+        88012714630436,
+        17136633356
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/KeyboardIcon3.png"
+    },
+    {
+      "name": "Controller icon",
+      "replace_ids": [
+        17136633629,
+        110291144710849
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/ControllerIcon4.png"
+    },
+    {
+      "name": "Phone icon",
+      "replace_ids": [
+        17136633510,
+        113510944677126
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/PhoneIcon.png"
+    },
+    {
+      "name": "Click sound",
+      "replace_ids": [
+        177266782
+      ],
+      "mode": "cdn",
+      "enabled": true,
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/raw/refs/heads/main/u_o8xh7gwsrj-app_interface_click_2-476372.mp3"
+    },
+    {
+      "name": "font Rubik-Light",
+      "replace_ids": [
+        12187342816
+      ],
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/raw/refs/heads/main/Nexa-Heavy.ttf",
+      "mode": "cdn",
+      "enabled": true
+    },
+    {
+      "name": "font Rubik-Regular",
+      "replace_ids": [
+        12187288714
+      ],
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/raw/refs/heads/main/Nexa-Heavy.ttf",
+      "mode": "cdn",
+      "enabled": true
+    },
+    {
+      "name": "font Rubik-Medium",
+      "replace_ids": [
+        12187271237
+      ],
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/raw/refs/heads/main/Nexa-Heavy.ttf",
+      "mode": "cdn",
+      "enabled": true
+    },
+    {
+      "name": "font Rubik-SemiBold",
+      "replace_ids": [
+        12187320363
+      ],
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/raw/refs/heads/main/Nexa-Heavy.ttf",
+      "mode": "cdn",
+      "enabled": true
+    },
+    {
+      "name": "font Rubik-Bold",
+      "replace_ids": [
+        12187303601
+      ],
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/raw/refs/heads/main/MetalManiav2.otf",
+      "mode": "cdn",
+      "enabled": true
+    },
+    {
+      "name": "font Rubik-ExtraBold",
+      "replace_ids": [
+        12187262242
+      ],
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/raw/refs/heads/main/MetalManiav2.otf",
+      "mode": "cdn",
+      "enabled": true
+    },
+    {
+      "name": "font Rubik-Black",
+      "replace_ids": [
+        12187280273
+      ],
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/raw/refs/heads/main/MetalManiav2.otf",
+      "mode": "cdn",
+      "enabled": true
+    },
+    {
+      "name": "font Rubik-MediumItalic",
+      "replace_ids": [
+        12187354260
+      ],
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/raw/refs/heads/main/MetalManiav2.otf",
+      "mode": "cdn",
+      "enabled": true
+    },
+    {
+      "name": "font Rubik-BoldItalic",
+      "replace_ids": [
+        12187341500
+      ],
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/raw/refs/heads/main/MetalManiav2.otf",
+      "mode": "cdn",
+      "enabled": true
+    },
+    {
+      "name": "font Rubik-BlackItalic",
+      "replace_ids": [
+        12187320081
+      ],
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/raw/refs/heads/main/MetalManiav2.otf",
+      "mode": "cdn",
+      "enabled": true
+    },
+    {
+      "name": "font Rubik-ExtraBoldItalic",
+      "replace_ids": [
+        12187323909
+      ],
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/raw/refs/heads/main/MetalManiav2.otf",
+      "mode": "cdn",
+      "enabled": true
+    },
+    {
+      "name": "Shooting range remove",
+      "replace_ids": [
+        88290917081936,
+        83344064919079,
+        120069809499441
+      ],
+      "mode": "cdn",
+      "enabled": true
+    },
+    {
+      "name": "Shooting Range text",
+      "replace_ids": [
+        112533350155197
+      ],
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/blob/main/SRL2.png?raw=true",
+      "mode": "cdn",
+      "enabled": true
+    },
+    {
+      "name": "Shooting Range Model",
+      "replace_ids": [
+        104783205832487
+      ],
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/raw/refs/heads/main/ShootingrangeModel3.obj",
+      "mode": "cdn",
+      "enabled": true
+    },
+    {
+      "name": "Ground Logo",
+      "replace_ids": [
+        111704836710381
+      ],
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/raw/refs/heads/main/Visclogocenter2.obj",
+      "mode": "cdn",
+      "enabled": true
+    },
+    {
+      "name": "Ground Logo 2",
+      "replace_ids": [
+        83060242813604
+      ],
+      "cdn_url": "https://github.com/ViscNova/ViscTexturePack/raw/refs/heads/main/ViscCENTER3.fbx",
+      "mode": "cdn",
+      "enabled": true
+    },
+    {
+      "name": "speed 1",
+      "replace_ids": [
+        16469372946
+      ],
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/speed1.png",
+      "mode": "cdn",
+      "enabled": true
+    },
+    {
+      "name": "speed 2",
+      "replace_ids": [
+        16469373111
+      ],
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/speed2.png",
+      "mode": "cdn",
+      "enabled": true
+    },
+    {
+      "name": "unranked",
+      "replace_ids": [
+        111599878354131
+      ],
+      "cdn_url": "https://raw.githubusercontent.com/ViscNova/ViscTexturePack/refs/heads/main/8434234324234.png",
+      "mode": "cdn",
+      "enabled": true
+    },
+    {
+      "name": "background blur",
+      "replace_ids": [
+        78667945674716,
+        71305144748855
+      ],
+      "mode": "cdn",
+      "enabled": false
+    }
+  ]
+}
