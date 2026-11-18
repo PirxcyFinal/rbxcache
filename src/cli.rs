@@ -155,6 +155,12 @@ pub enum Cmd {
         #[arg(long)]
         close_roblox: bool,
     },
+    /// Delete cached Rivals map skyboxes so Roblox downloads them again
+    ClearSkyboxes {
+        /// Only list the entries that would be deleted. The cache is opened for reading and nothing is changed
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Delete entries (Roblox downloads them again when needed)
     Delete {
         #[arg(required = true)]
@@ -601,6 +607,41 @@ pub fn run(dir: &Path, idmap_path: &Path, cmd: Cmd) -> Result<()> {
         Cmd::Clear { close_roblox } => {
             for step in store::clear_cache(dir, close_roblox)? {
                 println!("{step}");
+            }
+            Ok(())
+        }
+        Cmd::ClearSkyboxes { dry_run } => {
+            let mut idmap = IdMap::load(idmap_path)?;
+            idmap.merge(&crate::packs::bundled().fingerprints);
+            let store = Store::open(dir, !dry_run)?;
+            let entries = store.list(|_, _| {})?;
+            // With the saved originals, a skybox a config has replaced is still known as that skybox.
+            let originals = crate::originals::Originals::load_default().ok();
+            if dry_run {
+                let ids = config::entries_of(&store, &entries, &idmap, config::RIVALS_SKYBOX_IDS, originals.as_ref())?;
+                for entry in entries.iter().filter(|entry| ids.contains(&entry.id)) {
+                    let replaced = originals.as_ref().is_some_and(|originals| originals.probably_replaced(entry).is_some());
+                    let note = if replaced { "  holds a config's replacement" } else { "" };
+                    println!("{}  {:<6} {:>10}{note}", entry.id_hex, entry.kind, human_size(entry.body_len));
+                }
+                let known = |id: &&u64| idmap.assets.get(&id.to_string()).is_some_and(|prints| !prints.is_empty());
+                println!(
+                    "{} would be deleted. {} of {} skybox IDs have been looked up; the rest cannot be recognised yet.",
+                    format::count(ids.len(), "skybox entry", "skybox entries"),
+                    config::RIVALS_SKYBOX_IDS.iter().filter(known).count(),
+                    config::RIVALS_SKYBOX_IDS.len()
+                );
+                return Ok(());
+            }
+            warn_if_running();
+            let (deleted, failed, _) = config::delete_assets(&store, &entries, &idmap, config::RIVALS_SKYBOX_IDS, originals.as_ref())?;
+            if deleted == 0 && failed == 0 {
+                println!("No Rivals skyboxes were in the cache");
+            } else {
+                println!("Deleted {}", format::count(deleted, "skybox entry", "skybox entries"));
+            }
+            if failed > 0 {
+                bail!("{failed} skybox entries could not be deleted");
             }
             Ok(())
         }

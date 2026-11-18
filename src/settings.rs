@@ -19,6 +19,8 @@ pub struct Settings {
     pub winners: BTreeMap<String, PathBuf>,
     /// The version whose changes were last shown on launch.
     pub seen_version: String,
+    /// Whether the Rivals skyboxes are deleted from the cache whenever Roblox writes them.
+    pub remove_skyboxes: bool,
 }
 
 /// A loaded config as it is remembered between runs.
@@ -39,7 +41,15 @@ fn enabled_by_default() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { close_to_tray: true, animations: true, watch: true, configs: Vec::new(), winners: BTreeMap::new(), seen_version: String::new() }
+        Self {
+            close_to_tray: true,
+            animations: true,
+            watch: true,
+            configs: Vec::new(),
+            winners: BTreeMap::new(),
+            seen_version: String::new(),
+            remove_skyboxes: false,
+        }
     }
 }
 

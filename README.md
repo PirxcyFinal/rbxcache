@@ -66,7 +66,7 @@ cached asset.
   - fonts, JSON and other text
 - Export an asset as it is, or converted: KTX2 to PNG, mesh to OBJ.
 - Replace an asset's content with a file of your own, or delete it so Roblox
-  downloads it again.
+  downloads it again. 3D models are the exception; see below.
 - Apply replacement configs in the JSON format Fleasion uses, or pick a known
   pack from the list in the app. Each config and each rule in it has a switch;
   switching one off puts back what it replaced. Where two configs change the
@@ -75,6 +75,41 @@ cached asset.
   they are written, loaded configs are re-applied to them, and the tool
   reports whether Roblox read a replacement or wrote over it. Manual replacements
   are stored outside Roblox's cache and restored whenever Roblox overwrites them.
+
+### Skies (Windows)
+
+The Skies tab replaces the sky in every game with an animated one, by
+rewriting the sky shaders in Roblox's shader pack. It covers stock Roblox,
+Voidstrap, Bloxstrap and Fishstrap, and games that use an Atmosphere as well
+as those that draw the classic sky, such as Rivals.
+
+| Best looking | Work in progress |
+| --- | --- |
+| Neo Tokyo (pirxcy's recommended) | Rain, Snow, Storm |
+| Aurora | Sakura |
+| Synthwave | Shooting Stars |
+| Blood Moon | Lantern Festival, Sunset Ocean |
+
+A GIF of your own can be used as the sky too. Applying a sky closes Roblox
+if it is open; start it again and join a game with a visible sky. Turn off
+puts Roblox's own shaders back. Skies are experimental: they add shader work
+to every frame, work best on NVIDIA GPUs and can lower the frame rate. The
+first time a sky is applied its shaders are compiled, which takes up to about
+a minute and a half for Neo Tokyo; after that it is kept and applies at once.
+
+### No 3D model swapping or downloading
+
+rbxcache does not swap 3D models and does not download them. It will not
+write over a mesh, a model, a place, a package, an accessory, a body part or
+the collision data Roblox keeps for them, and it will not write any of those
+into another entry, whether they come from the cache, a file, a link, a pack
+or a config. FBX, glTF, OBJ, STL, PLY and Draco files are refused the same
+way. Asset IDs that turn out to be 3D are not downloaded: a lookup says so
+instead. Config rules leave such entries alone and say how many. Animations
+are stored like models and are still allowed when that is all a file holds.
+
+Meshes and models can still be browsed, previewed and exported from your own
+cache.
 
 ## Getting it
 
@@ -284,18 +319,23 @@ before adding it.
   pasted cookie can never be used again, sign that account out on roblox.com.
 
 Once an account is in use, every asset request is sent with its cookie, so
-Roblox answers as that account. Before each fetch, rbxcache checks with Roblox
-that the account is still signed in, and stops with a message if it is not
-(the cookie has expired, or the account was signed out on roblox.com). When
-Roblox still refuses, the same request is sent again naming a game, with the
-`Roblox-Place-Id` header the client itself sends: first the game you last
-joined, then each game belonging to the asset's creator, looked up from
-Roblox's public games list. The first game that hands the file out is the one
-used, and it is remembered for that creator's other assets. Joining the game
-first is not required.
+Roblox answers as that account, which gets anything the account itself can
+reach. When Roblox still refuses, the request is sent once more naming the game
+you last joined, with the `Roblox-Place-Id` header the real client sends for
+the game it is in. That is as far as it goes: rbxcache does not hunt for a game
+that will unlock an asset the account was denied.
+
+Most game sounds stay refused this way, because Roblox keeps them to the game
+that uses them and hands them only to a client actually in that game. There is
+no way to pull those bytes from Roblox after the fact, so they are matched by
+ear instead: the bytes are already in your cache from playing the game, and the
+IDs tab lists the cached sounds of the right length for you to play and pick
+(see [Looking an ID up](#looking-an-id-up)). Pick once, and
+[Copy fingerprints](#looking-an-id-up) lets you publish the match so no one
+else has to.
 
 Signing in is only built for Windows so far; on other platforms the by-ear
-matching below is the way to get sounds working.
+matching is the way to get sounds working.
 
 ### Looking an ID up
 
@@ -471,7 +511,7 @@ are wrapped in an `RBXH` header:
 | response headers | body
 ```
 
-`headerSum` and `bodySum` are XXH32 with seed `0x00C4E564` over the response
+`headerSum` and `bodySum` are XXH32 with a fixed seed over the response
 headers and the body, and zero when those are empty. `rbxcache probe` checks
 this against every entry.
 
@@ -499,3 +539,16 @@ this against every entry.
 
 The wordmark on the loading screen is set in Manrope ExtraBold, used under the
 SIL Open Font License (`assets/Manrope-OFL.txt`).
+
+The Japanese words on the Neo Tokyo sky's signs are drawn from M PLUS Rounded 1c
+ExtraBold (Copyright 2016 The Rounded M+ Project Authors), and the names of the
+made-up brands on its adverts from Pacifico (Copyright 2018 The Pacifico Project
+Authors), Anton (Copyright 2020 The Anton Project Authors), Orbitron (Copyright 2018
+The Orbitron Project Authors), Bungee (Copyright 2023 The Bungee Project Authors),
+Lobster (Copyright 2010 The Lobster Project Authors), Bangers (Copyright 2010 The
+Bangers Project Authors) and Righteous (Copyright 2011 Brian J. Bonislawsky, Astigmatic),
+all used under the SIL Open Font License. Only
+distance fields of the characters it needs are kept, in
+`src/skies/hlsl/neotokyo_glyphs.hlsl`, made by `skies/neotokyo_glyphs.py`; the fonts
+themselves are not included. The brands (Kira Cola, ZAPP, HOSHI, KURO Coffee, Sora
+Beer, BIG BUN, ONPU) are invented.

@@ -9,19 +9,25 @@ use crate::cli::{describe, export_name, matches};
 use crate::config::{self, IdMap};
 use crate::format::{self, human_size};
 use crate::instance::{self, Claim};
+use crate::integrity;
+use crate::lab;
 use crate::lookup::{self, Found, Sound};
+use crate::motion::{self, Entrance};
 use crate::originals::Originals;
 use crate::packs::{self, Catalog};
 use crate::protection::Protections;
+use crate::removed::Removed;
 use crate::resolve;
+use crate::scenes;
 use crate::settings::{SavedConfig, Settings};
+use crate::skies::{self, Effect as SkyEffect};
 use crate::store::{self, category_name, format_time_ms, Entry, Id, Store};
 use crate::theme::{self, alpha};
 use crate::tray::{Tray, TrayEvent};
 use crate::update::{self, Release};
 use crate::viewers;
 use crate::watch::{self, Change, Tracker, Verdict, Watcher};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use eframe::egui::{self, Color32, CornerRadius, Margin, Rect, Shape, Stroke, Vec2};
 use egui_extras::{Column, TableBuilder};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -62,7 +68,7 @@ const GROUPS: [(&str, &[&str]); 8] = [
 pub fn run(dir: PathBuf, idmap_path: PathBuf, tab: Option<&str>, fetch: String) -> Result<()> {
     let tab = match tab {
         Some(name) => Tab::named(name).with_context(|| {
-            format!("there is no tab '{name}'; try all, live, configs, packs, ids, account, guide, info or a kind such as textures")
+            format!("there is no tab '{name}'; try all, live, configs, packs, ids, account, lab, guide, info or a kind such as textures")
         })?,
         None => Tab::All,
     };
@@ -115,6 +121,10 @@ enum Tab {
     Lookup,
     /// Signing in with Roblox.
     Account,
+    /// Testing whether Roblox reads a file again mid-game.
+    Lab,
+    /// Animated Direct3D skies (experimental).
+    Skies,
     Guide,
     Info,
 }
@@ -132,6 +142,8 @@ impl Tab {
             "packs" => Some(Tab::Packs),
             "ids" => Some(Tab::Lookup),
             "account" => Some(Tab::Account),
+            "lab" => Some(Tab::Lab),
+            "skies" => Some(Tab::Skies),
             "guide" => Some(Tab::Guide),
             "info" => Some(Tab::Info),
             _ => None,
@@ -140,7 +152,7 @@ impl Tab {
 
     /// True for the tabs that show a list of cache entries.
     fn lists(self) -> bool {
-        !matches!(self, Tab::Configs | Tab::Packs | Tab::Lookup | Tab::Account | Tab::Guide | Tab::Info)
+        !matches!(self, Tab::Configs | Tab::Packs | Tab::Lookup | Tab::Account | Tab::Lab | Tab::Skies | Tab::Guide | Tab::Info)
     }
 
     /// Whether an entry of this content type belongs on the tab.
@@ -179,6 +191,30 @@ enum LoadMsg {
     Done(Result<Vec<Entry>, String>),
 }
 
+/// Progress and the outcome of fetching the Rivals skyboxes and deleting them.
+enum SkyboxMsg {
+    Progress(usize, usize),
+    Done(Result<SkyboxClear, String>),
+}
+
+struct SkyboxClear {
+    idmap: IdMap,
+    deleted: Vec<Id>,
+    failed: usize,
+    /// How many deleted entries there is a copy of, to put back on revert.
+    kept: usize,
+    summary: String,
+}
+
+/// What putting the rules in force on newly written entries came to.
+struct Reapplied {
+    rewritten: Vec<Entry>,
+    /// Rivals skyboxes that were deleted as they arrived.
+    deleted: Vec<Id>,
+    /// How many deleted skyboxes there is a copy of now, when any were deleted.
+    kept: Option<usize>,
+}
+
 #[derive(Clone)]
 enum Action {
     Reload,
@@ -189,7 +225,9 @@ enum Action {
     OpenExternally,
     AskDelete,
     AskClear,
+    AskClearSkyboxes,
     Clear,
+    ClearSkyboxes,
     Delete,
     AddConfigs,
     ReapplyConfigs,
@@ -213,6 +251,23 @@ enum Action {
     PlayAudio,
     /// Looks up the asset IDs typed on the IDs tab.
     RunLookup,
+    /// The Lab: choosing what to swap and with what, and running the test.
+    LabAdd,
+    LabClear,
+    LabPickFolder,
+    LabColours,
+    LabStart,
+    LabStop,
+    /// Skies: apply one of the built-in effects, a GIF, or turn them off.
+    SkyApply(SkyEffect),
+    SkyPickGif,
+    SkyRefreshClients,
+    /// Asks before fetching the Rivals skybox IDs and deleting the cache files that hold them.
+    AskRemoveRivalsSkyboxes,
+    /// Fetches those IDs, deletes the matching cache entries, and goes on deleting them as Roblox writes them.
+    RemoveRivalsSkyboxes,
+    /// Stops deleting the skyboxes and puts the deleted ones back.
+    RevertSkyboxes,
     /// Opens the warning that has to be read before a cookie is sent.
     AskAddAccount,
     /// Checks a pasted cookie and, if it is one, adds the account.
@@ -388,6 +443,48 @@ fn rules_in_force(configs: &[LoadedConfig], winners: &BTreeMap<String, PathBuf>)
     config::combine(kept.iter().map(|(name, rules)| (*name, rules.as_slice())))
 }
 
+/// The rules of one config that set a Rivals skybox and are in use.
+#[derive(Clone, Debug, PartialEq)]
+struct SkyRules {
+    /// The config, by index.
+    config: usize,
+    /// Each rule by its key in the config (see [`rule_keys`]) and by name.
+    rules: Vec<(String, String)>,
+    /// The skies they change, by name.
+    skies: Vec<&'static str>,
+}
+
+/// The rules in use that set a Rivals skybox, config by config. `holding` is
+/// the cache entries that hold a skybox now, for rules that name an entry.
+/// Rules and configs that are switched off change nothing, so they are left out.
+/// These rules have nothing to set while the skyboxes are being removed.
+fn skybox_rules(configs: &[LoadedConfig], holding: &HashSet<Id>) -> Vec<SkyRules> {
+    let found = configs.iter().enumerate().filter_map(|(index, config)| {
+        let keys = rule_keys(&config.rules);
+        let mut faces = Vec::new();
+        let mut rules = Vec::new();
+        for (i, rule) in active_rules(config) {
+            if let Some(set) = config::skybox_targets(rule, holding) {
+                faces.extend(set);
+                rules.push((keys[i].clone(), rule.name.clone()));
+            }
+        }
+        (!rules.is_empty()).then(|| SkyRules { config: index, rules, skies: config::rivals_skies_of(&faces) })
+    });
+    found.collect()
+}
+
+/// The skies a set of rules changes, in words.
+fn skies_in_words(skies: &[&str]) -> String {
+    if skies.len() >= config::RIVALS_SKIES.len() {
+        "every Rivals sky".into()
+    } else if skies.is_empty() {
+        "a cached skybox".into()
+    } else {
+        format!("the {} {}", skies.join(", "), if skies.len() == 1 { "sky" } else { "skies" })
+    }
+}
+
 /// The rules of `configs` as one list; see [`config::combine`].
 fn combined<'a>(configs: impl IntoIterator<Item = &'a LoadedConfig>) -> Vec<config::Rule> {
     config::combine(configs.into_iter().map(|c| (c.name.as_str(), c.rules.as_slice())))
@@ -438,6 +535,16 @@ enum ConfigMsg {
     Done(Result<(PendingConfigs, IdMap), String>),
 }
 
+/// Where the backdrop's purple is: how far through its rise, 0 to 1 before easing, and how
+/// brightly its front glows. See [`App::step_backdrop`].
+#[derive(Default)]
+struct Backdrop {
+    progress: f32,
+    glow: f32,
+    /// How far into the live look, 0 to 1; see [`theme::BackdropLook::live`].
+    live: f32,
+}
+
 /// The full-window loading screen; see [`App::show_splash`].
 struct Splash {
     /// When it appeared.
@@ -449,6 +556,18 @@ struct Splash {
     /// A sentence under the title that says what that work is doing.
     detail: String,
     fraction: Option<f32>,
+    /// How it comes in, picked at random when it appears. It always leaves by the zoom.
+    entrance: Entrance,
+}
+
+/// Short strokes shooting out round a control the pointer has just come onto.
+struct HoverBurst {
+    born: f64,
+    /// Where each stroke starts, the way out, and how long it may grow before it would reach
+    /// the next thing over.
+    rays: Vec<(egui::Pos2, Vec2, f32)>,
+    /// Throw small shapes instead of strokes, for a small square control.
+    shapes: bool,
 }
 
 struct Toast {
@@ -521,6 +640,10 @@ struct App {
     preview: Option<Preview>,
     confirm_delete: bool,
     confirm_clear: bool,
+    confirm_clear_skyboxes: bool,
+    confirm_remove_skyboxes: bool,
+    /// How many skybox cache entries the confirm dialog would delete.
+    clear_skyboxes_count: usize,
     /// The outcome of a cache clear that is under way.
     clearing: Option<Receiver<Result<Vec<String>, String>>>,
     delete_prompt: String,
@@ -533,12 +656,19 @@ struct App {
     apply_job: Option<Receiver<Result<Synced, String>>>,
     /// Entries Roblox has written that the configs have not been put on yet, and the worker doing so.
     reapply_targets: HashSet<Id>,
-    reapply_job: Option<Receiver<Result<Vec<Entry>, String>>>,
+    reapply_job: Option<Receiver<Result<Reapplied, String>>>,
     /// Set when the configs, their rules or the choices between them changed, so the cache has to follow.
     sync_wanted: bool,
     /// True while the work going on was started by a switch on the Configs page, which should not take over the window.
     quiet: bool,
     splash: Option<Splash>,
+    backdrop: Backdrop,
+    /// True when Windows is set to show no animations; read again each time a splash appears.
+    reduced_motion: bool,
+    /// The control under the pointer, so a burst goes off only when the pointer comes onto one.
+    hovering: Option<egui::Id>,
+    /// The burst of lines round the control the pointer came onto last; see [`App::hover_burst`].
+    hover_burst: Option<HoverBurst>,
     /// When the current stretch of work began, for deciding whether it merits a splash.
     busy_since: Option<f64>,
     confirm_configs: bool,
@@ -589,6 +719,28 @@ struct App {
     avatar_asked: HashSet<u64>,
     avatar_tx: std::sync::mpsc::Sender<(u64, Option<Vec<u8>>)>,
     avatar_rx: Receiver<(u64, Option<Vec<u8>>)>,
+    /// The Lab: the entries to swap, the folder of pictures (the built-in colours when none),
+    /// the interval, and whether the originals go back afterwards.
+    lab_targets: Vec<Id>,
+    lab_folder: Option<PathBuf>,
+    lab_interval_ms: u32,
+    lab_restore: bool,
+    /// The test that is running, with the flag that stops it, how it is going, and what went wrong.
+    lab_job: Option<(Receiver<lab::Msg>, Arc<AtomicBool>)>,
+    lab_progress: lab::Progress,
+    lab_error: Option<String>,
+    /// Skies: GIF path, clients list, active effect note, and a job applying a pack.
+    sky_gif: Option<PathBuf>,
+    sky_clients: String,
+    sky_status: String,
+    sky_job: Option<Receiver<Result<String, String>>>,
+    /// Fetching the Rivals skybox IDs so their cache files can be deleted.
+    skybox_job: Option<Receiver<SkyboxMsg>>,
+    skybox_progress: (usize, usize),
+    /// The config rules in use that set a Rivals skybox, as found when a skybox dialog was opened.
+    skybox_rules: Vec<SkyRules>,
+    /// How many deleted skyboxes there is a copy of, to put back on revert.
+    skybox_kept: usize,
     /// What changed in this version and the ones before it.
     changelog: Vec<Version>,
     /// Whether the changes since the version last used are waiting to be shown.
@@ -667,6 +819,9 @@ impl App {
             preview: None,
             confirm_delete: false,
             confirm_clear: false,
+            confirm_clear_skyboxes: false,
+            confirm_remove_skyboxes: false,
+            clear_skyboxes_count: 0,
             clearing: None,
             delete_prompt: String::new(),
             pending_configs: None,
@@ -678,6 +833,10 @@ impl App {
             reapply_job: None,
             quiet: false,
             splash: None,
+            backdrop: Backdrop::default(),
+            reduced_motion: crate::motion::reduced_motion(),
+            hovering: None,
+            hover_burst: None,
             busy_since: None,
             confirm_configs: false,
             configs: Vec::new(),
@@ -709,6 +868,21 @@ impl App {
             avatar_asked: HashSet::new(),
             avatar_tx,
             avatar_rx,
+            lab_targets: Vec::new(),
+            lab_folder: None,
+            lab_interval_ms: 1000,
+            lab_restore: true,
+            lab_job: None,
+            lab_progress: lab::Progress::default(),
+            lab_error: None,
+            sky_gif: None,
+            sky_clients: String::new(),
+            sky_status: skies::load_state().map(|s| format!("Last applied: {}", s.effect)).unwrap_or_default(),
+            sky_job: None,
+            skybox_job: None,
+            skybox_progress: (0, 0),
+            skybox_rules: Vec::new(),
+            skybox_kept: Removed::load_default().map_or(0, |removed| removed.len()),
             changelog: changelog::bundled(),
             show_news: settings.seen_version != update::CURRENT,
             summons: None,
@@ -732,6 +906,7 @@ impl App {
             app.summons = Some(rx);
         }
         app.restore_configs();
+        app.learn_fingerprints(&cc.egui_ctx);
         app.start_load(&cc.egui_ctx);
         app.check_update(&cc.egui_ctx, false);
         app.fetch_catalog(&cc.egui_ctx);
@@ -839,6 +1014,9 @@ impl App {
         if tab == Tab::Packs && !self.catalog_fetched {
             self.fetch_catalog(ctx);
         }
+        if tab == Tab::Skies && self.sky_clients.is_empty() {
+            self.sky_clients = skies::list_clients().unwrap_or_else(|e| format!("{e:#}"));
+        }
         if tab.lists() {
             self.last_browse = tab;
         } else {
@@ -847,6 +1025,63 @@ impl App {
         // A sound started on one tab has no stop button on another.
         if let Some(audio) = &mut self.audio {
             audio.stop();
+        }
+    }
+
+    /// Moves the backdrop's purple toward where it belongs. While the window has the focus
+    /// it rises from the bottom, its front glowing on the way up; that is what plays when
+    /// the app opens, and again each time you come back to it. While another window has
+    /// the focus it sinks back and the window is plain black.
+    fn step_backdrop(&mut self, ctx: &egui::Context) {
+        /// Seconds to rise the whole way, and to sink back.
+        const RISE: f32 = 2.2;
+        const SINK: f32 = 0.7;
+        /// Seconds the live look takes to come in or go.
+        const LIVE: f32 = 1.4;
+        let (focused, dt) = ctx.input(|i| (i.focused, i.stable_dt.min(0.1)));
+        let target = if focused { 1.0 } else { 0.0 };
+        // The live look: the app in front while Roblox runs.
+        let live = if focused && self.roblox_running { 1.0 } else { 0.0 };
+        let moving = self.settings.animations && !self.reduced_motion;
+        let backdrop = &mut self.backdrop;
+        backdrop.live = if self.settings.animations { theme::approach(backdrop.live, live, 3.0 / LIVE, dt) } else { live };
+        if (backdrop.live - live).abs() > 0.002 {
+            ctx.request_repaint();
+        } else {
+            backdrop.live = live;
+        }
+        // It drifts slowly, so a frame every 33 ms is plenty.
+        if backdrop.live > 0.0 && moving {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
+        if !self.settings.animations {
+            (backdrop.progress, backdrop.glow) = (target, 0.0);
+            theme::set_glow_front(ctx, ctx.screen_rect(), target, 0.0);
+            return;
+        }
+        let rising = backdrop.progress < target;
+        backdrop.progress = if rising { (backdrop.progress + dt / RISE).min(1.0) } else { (backdrop.progress - dt / SINK).max(target) };
+        // Brightest in the middle of the rise, nothing at either end and nothing on the way down.
+        let wanted = if rising { (std::f32::consts::PI * backdrop.progress).sin() } else { 0.0 };
+        backdrop.glow = theme::approach(backdrop.glow, wanted, 12.0, dt);
+        if backdrop.progress != target || backdrop.glow > 0.004 {
+            ctx.request_repaint();
+        } else {
+            backdrop.glow = 0.0;
+        }
+        // Records, tabs and cards light up as the glow passes them; see `theme::glow_wrap`.
+        theme::set_glow_front(ctx, ctx.screen_rect(), theme::ease_in_out(backdrop.progress), backdrop.glow);
+    }
+
+    /// How the backdrop is painted this frame.
+    fn backdrop_look(&self, ctx: &egui::Context) -> theme::BackdropLook {
+        let moving = self.settings.animations && !self.reduced_motion;
+        theme::BackdropLook {
+            rise: theme::ease_in_out(self.backdrop.progress),
+            glow: self.backdrop.glow,
+            live: self.backdrop.live,
+            // Kept to a few hours' worth, so the drift does not lose its smoothness to rounding.
+            time: if moving { ctx.input(|i| i.time % 10_000.0) as f32 } else { 0.0 },
         }
     }
 
@@ -910,6 +1145,10 @@ impl App {
                 self.reindex();
                 if self.settings.watch {
                     self.start_watch(ctx);
+                }
+                // Skyboxes Roblox wrote while this was closed are dealt with as if they had just arrived.
+                if self.settings.remove_skyboxes {
+                    self.reapply_targets.extend(self.skybox_entries());
                 }
                 if self.status.is_empty() {
                     self.status = format!("Loaded {}", format::count(self.entries.len(), "entry", "entries"));
@@ -1026,7 +1265,12 @@ impl App {
         if !ctx.input(|i| i.viewport().close_requested()) {
             return;
         }
-        if self.apply_job.is_some() || self.reapply_job.is_some() {
+        if let Some((_, stop)) = &self.lab_job {
+            // The Lab's test puts the originals back as it stops; `poll_lab` closes afterwards.
+            stop.store(true, Ordering::Relaxed);
+            self.quitting = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        } else if self.apply_job.is_some() || self.reapply_job.is_some() {
             // Leaving now could stop between writing a blob and its index row; the worker's poll closes afterwards.
             self.quitting = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1141,19 +1385,37 @@ impl App {
         if self.reapply_targets.is_empty() || self.reapply_job.is_some() || self.busy().is_some() {
             return;
         }
-        let targets = std::mem::take(&mut self.reapply_targets);
+        let mut targets = std::mem::take(&mut self.reapply_targets);
         let rules = rules_in_force(&self.configs, &self.settings.winners);
-        if rules.is_empty() {
+        let removing = self.settings.remove_skyboxes;
+        if rules.is_empty() && !removing {
             return;
         }
         let (tx, rx) = channel();
-        let (dir, entries, idmap, ctx) = (self.dir.clone(), self.entries.clone(), self.idmap.clone(), ctx.clone());
+        let (dir, mut entries, idmap, ctx) = (self.dir.clone(), self.entries.clone(), self.idmap.clone(), ctx.clone());
         std::thread::spawn(move || {
             prepare_requests(&dir);
             let result = Store::open(&dir, true).map(|store| {
                 let mut originals = Originals::load_default().ok();
-                let reports = config::run(&store, &entries, &idmap, &rules, true, Some(&targets), originals.as_mut());
-                reports.into_iter().flat_map(|r| r.written).collect()
+                // While the Rivals skyboxes are being removed, one that has just arrived is deleted
+                // before any config can set it, and the configs see the cache without it.
+                let (mut deleted, mut kept) = (Vec::new(), None);
+                if removing {
+                    if let Ok(mut removed) = Removed::load_default() {
+                        match config::remove_skyboxes(&store, &entries, &idmap, originals.as_mut(), &mut removed, Some(&targets)) {
+                            Ok((gone, _)) => deleted = gone,
+                            Err(e) => crate::log::write(&format!("removing new skyboxes while reapplying failed: {e:#}")),
+                        }
+                        kept = (!deleted.is_empty()).then(|| removed.len());
+                    }
+                    targets.retain(|id| !deleted.contains(id));
+                    entries.retain(|entry| !deleted.contains(&entry.id));
+                }
+                let reports = match rules.is_empty() || targets.is_empty() {
+                    true => Vec::new(),
+                    false => config::run(&store, &entries, &idmap, &rules, true, Some(&targets), originals.as_mut()),
+                };
+                Reapplied { rewritten: reports.into_iter().flat_map(|r| r.written).collect(), deleted, kept }
             });
             let _ = tx.send(result.map_err(|e| format!("{e:#}")));
             ctx.request_repaint();
@@ -1165,23 +1427,49 @@ impl App {
         let Some(result) = self.reapply_job.as_ref().and_then(finished) else { return };
         self.reapply_job = None;
         match result {
-            Ok(rewritten) if rewritten.is_empty() => {}
-            Ok(rewritten) => {
-                self.status = format!("Re-applied configs to {}", format::count(rewritten.len(), "entry", "entries"));
-                for entry in &rewritten {
-                    self.tracker.record(entry);
+            Ok(done) => {
+                let changed = !done.deleted.is_empty() || !done.rewritten.is_empty();
+                if let Some(kept) = done.kept {
+                    self.skybox_kept = kept;
                 }
-                if self.focus.is_some_and(|id| rewritten.iter().any(|e| e.id == id)) {
-                    self.preview = None;
+                if !done.deleted.is_empty() {
+                    self.status =
+                        format!("Deleted {} as Roblox wrote them", format::count(done.deleted.len(), "Rivals skybox entry", "Rivals skybox entries"));
+                    self.sky_status = self.status.clone();
+                    self.forget_entries(&done.deleted);
                 }
-                watch::merge(&mut self.entries, &Change { written: rewritten, ..Default::default() });
-                self.reindex();
+                if !done.rewritten.is_empty() {
+                    self.status = format!("Re-applied configs to {}", format::count(done.rewritten.len(), "entry", "entries"));
+                    for entry in &done.rewritten {
+                        self.tracker.record(entry);
+                    }
+                    if self.focus.is_some_and(|id| done.rewritten.iter().any(|e| e.id == id)) {
+                        self.preview = None;
+                    }
+                    watch::merge(&mut self.entries, &Change { written: done.rewritten, ..Default::default() });
+                }
+                if changed {
+                    self.reindex();
+                }
             }
             Err(e) => self.status = format!("Configs could not be re-applied: {e}"),
         }
         // A quit asked for while the cache was being written was held back until now.
         if self.quitting {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// Takes entries that were deleted out of the list and out of everything that refers to them.
+    /// The caller rebuilds the index.
+    fn forget_entries(&mut self, deleted: &[Id]) {
+        let gone: BTreeSet<_> = deleted.iter().copied().collect();
+        self.entries.retain(|e| !gone.contains(&e.id));
+        self.selected.retain(|id| !gone.contains(id));
+        self.arrivals.retain(|id| !gone.contains(id));
+        if self.focus.is_some_and(|id| gone.contains(&id)) {
+            self.focus = None;
+            self.preview = None;
         }
     }
 
@@ -1313,6 +1601,11 @@ impl App {
         self.scroll_to = Some(pos);
     }
 
+    /// False when the focused entry is plainly a 3D model or mesh, which is never replaced.
+    fn swappable(&self) -> bool {
+        self.focused().is_none_or(|e| !integrity::looks_3d(e.kind, e.asset_type, e.category))
+    }
+
     fn focused(&self) -> Option<&Entry> {
         self.focus.and_then(|id| self.index.get(&id)).map(|&i| &self.entries[i])
     }
@@ -1358,6 +1651,9 @@ impl App {
                     | Action::RemoveConfig(_)
                     | Action::RemoveAllConfigs
                     | Action::AskAddAccount
+                    | Action::LabStop
+                    | Action::SkyPickGif
+                    | Action::SkyRefreshClients
                     | Action::AddAccount
                     | Action::SignOut(_)
                     | Action::UseAccount(_)
@@ -1383,10 +1679,21 @@ impl App {
                 self.confirm_clear = true;
                 Ok(String::new())
             }
+            Action::AskClearSkyboxes => {
+                let holding = self.skybox_entries();
+                self.clear_skyboxes_count = holding.len();
+                self.skybox_rules = skybox_rules(&self.configs, &holding);
+                self.confirm_clear_skyboxes = true;
+                Ok(String::new())
+            }
             Action::Clear => {
                 self.start_clear(ctx);
                 Ok(String::new())
             }
+            Action::ClearSkyboxes if self.reapply_job.is_some() || self.lab_job.is_some() => {
+                Err(anyhow!("Configs are being applied or the Lab is running; try again in a moment"))
+            }
+            Action::ClearSkyboxes => self.clear_skyboxes(),
             Action::AskDelete => {
                 if !self.selected.is_empty() {
                     let entries = format::count(self.selected.len(), "cache entry", "cache entries");
@@ -1505,6 +1812,62 @@ impl App {
             }
             Action::Tag => self.tag_focused(),
             Action::PlayAudio => self.play_audio(),
+            Action::LabAdd => {
+                if let Some(id) = self.focus.filter(|id| !self.lab_targets.contains(id)) {
+                    self.lab_targets.push(id);
+                }
+                Ok(String::new())
+            }
+            Action::LabClear => {
+                self.lab_targets.clear();
+                Ok(String::new())
+            }
+            Action::LabPickFolder => {
+                if let Some(folder) = rfd::FileDialog::new().set_title("Choose a folder of pictures").pick_folder() {
+                    // Checked now, so a folder with no pictures in it is refused before the test starts.
+                    lab::load_frames(&folder).map(|frames| {
+                        self.lab_folder = Some(folder);
+                        format!("{} to cycle through", format::count(frames.len(), "picture", "pictures"))
+                    })
+                } else {
+                    Ok(String::new())
+                }
+            }
+            Action::LabColours => {
+                self.lab_folder = None;
+                Ok(String::new())
+            }
+            Action::LabStart => self.start_lab(ctx),
+            Action::LabStop => {
+                if let Some((_, stop)) = &self.lab_job {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                Ok(String::new())
+            }
+            Action::SkyPickGif => {
+                if let Some(path) = rfd::FileDialog::new().set_title("Choose a GIF for the sky").add_filter("GIF", &["gif"]).pick_file() {
+                    self.sky_gif = Some(path);
+                }
+                Ok(String::new())
+            }
+            Action::SkyRefreshClients => {
+                self.sky_clients = skies::list_clients().unwrap_or_else(|e| format!("{e:#}"));
+                Ok(String::new())
+            }
+            Action::SkyApply(effect) => {
+                self.start_sky(ctx, effect);
+                Ok(String::new())
+            }
+            Action::AskRemoveRivalsSkyboxes => {
+                self.skybox_rules = skybox_rules(&self.configs, &self.skybox_entries());
+                self.confirm_remove_skyboxes = true;
+                Ok(String::new())
+            }
+            Action::RemoveRivalsSkyboxes => {
+                self.start_remove_skyboxes(ctx);
+                Ok(String::new())
+            }
+            Action::RevertSkyboxes => self.revert_skyboxes(ctx),
             Action::AskAddAccount => {
                 self.ask_add_account(ctx);
                 Ok(String::new())
@@ -1712,6 +2075,31 @@ impl App {
             Some(e) => Err(anyhow!("Deleted {}, {failed} failed: {e:#}", deleted.len())),
             None => Ok(format!("Deleted {}", format::count(deleted.len(), "entry", "entries"))),
         }
+    }
+
+    /// The cache entries that hold a Rivals skybox now, going by the IDs that
+    /// have been looked up. One a config has replaced still counts.
+    fn skybox_entries(&self) -> HashSet<Id> {
+        let originals = Originals::load_default().ok();
+        let found = Store::open(&self.dir, false)
+            .and_then(|store| config::entries_of(&store, &self.entries, &self.idmap, config::RIVALS_SKYBOX_IDS, originals.as_ref()));
+        found.unwrap_or_default().into_iter().collect()
+    }
+
+    /// Deletes every cached Rivals skybox face so Roblox downloads them again.
+    fn clear_skyboxes(&mut self) -> Result<String> {
+        let store = Store::open(&self.dir, true)?;
+        let originals = Originals::load_default().ok();
+        let (n, failed, deleted) = config::delete_assets(&store, &self.entries, &self.idmap, config::RIVALS_SKYBOX_IDS, originals.as_ref())?;
+        self.forget_entries(&deleted);
+        self.reindex();
+        if n == 0 && failed == 0 {
+            return Ok("No Rivals skyboxes were in the cache".into());
+        }
+        if failed > 0 {
+            bail!("Deleted {}, {failed} failed", format::count(n, "skybox entry", "skybox entries"));
+        }
+        Ok(format!("Deleted {}", format::count(n, "skybox entry", "skybox entries")))
     }
 
     /// Remembers which configs are loaded for the next run.
@@ -2183,12 +2571,14 @@ impl App {
     fn menu_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         let one = self.focus.is_some() && self.selected.len() <= 1;
         let any = !self.selected.is_empty();
+        let swappable = self.swappable();
         egui::menu::bar(ui, |ui| {
             ui.menu_button("File", |ui| {
                 ui.set_min_width(230.0);
                 item(ui, actions, true, "Reload cache", "F5", Action::Reload);
                 item(ui, actions, true, "Open cache folder", "", Action::OpenFolder);
                 item(ui, actions, true, "Clear cache...", "", Action::AskClear);
+                item(ui, actions, true, "Clear skyboxes...", "", Action::AskClearSkyboxes);
                 ui.separator();
                 if self.tray.is_some() {
                     item(ui, actions, true, "Hide to tray", "", Action::HideToTray);
@@ -2197,7 +2587,7 @@ impl App {
             });
             ui.menu_button("Entry", |ui| {
                 ui.set_min_width(230.0);
-                entry_items(ui, actions, one, any, self.source.is_some());
+                entry_items(ui, actions, one, any, self.source.is_some(), swappable);
             });
             ui.menu_button("Configs", |ui| {
                 ui.set_min_width(280.0);
@@ -2320,26 +2710,30 @@ impl App {
                 actions.push(Action::SortByArrival);
             }
             let search_id = egui::Id::new("search");
-            let mut changed = ui
-                .add(egui::TextEdit::singleline(&mut self.search).id(search_id).hint_text("Search id, type or URL   (Ctrl+F)").desired_width(300.0))
-                .changed();
+            let search = ui
+                .add(egui::TextEdit::singleline(&mut self.search).id(search_id).hint_text("Search id, type or URL   (Ctrl+F)").desired_width(300.0));
+            let mut changed = search.changed();
             if std::mem::take(&mut self.focus_search) {
                 ui.memory_mut(|m| m.request_focus(search_id));
             }
             let kind_text = self.kind_filter.unwrap_or("All types");
-            egui::ComboBox::from_id_salt("kind").selected_text(kind_text).height(420.0).show_ui(ui, |ui| {
+            let kind = egui::ComboBox::from_id_salt("kind").selected_text(kind_text).height(420.0).show_ui(ui, |ui| {
                 changed |= ui.selectable_value(&mut self.kind_filter, None, "All types").changed();
                 for &(kind, n) in self.kinds.iter().filter(|(kind, _)| self.tab.holds(kind)) {
                     changed |= ui.selectable_value(&mut self.kind_filter, Some(kind), format!("{kind}  ({n})")).changed();
                 }
             });
             let category_text = self.category_filter.map_or("All categories".to_string(), |c| format!("{c} {}", category_name(c)));
-            egui::ComboBox::from_id_salt("category").selected_text(category_text).show_ui(ui, |ui| {
+            let category = egui::ComboBox::from_id_salt("category").selected_text(category_text).show_ui(ui, |ui| {
                 changed |= ui.selectable_value(&mut self.category_filter, None, "All categories").changed();
                 for &(c, n) in &self.categories {
                     changed |= ui.selectable_value(&mut self.category_filter, Some(c), format!("{c} {}  ({n})", category_name(c))).changed();
                 }
             });
+            // Search and the two filters are their own shapes, so the glow goes round each one.
+            for rect in [search.rect, kind.response.rect, category.response.rect] {
+                ui.painter().add(theme::glow_pop(ui.ctx(), rect, CornerRadius::same(7)));
+            }
             if changed {
                 self.rebuild_view();
             }
@@ -2415,7 +2809,14 @@ impl App {
                         actions.push(Action::ExportConverted);
                     }
                 }
-                if ui.button("Replace...").on_hover_text("Swap the payload for a file of your choice").clicked() {
+                let swappable = entry.is_none_or(|e| !integrity::looks_3d(e.kind, e.asset_type, e.category));
+                let replace = ui.add_enabled(swappable, egui::Button::new("Replace..."));
+                let replace = if swappable {
+                    replace.on_hover_text("Swap the payload for a file of your choice")
+                } else {
+                    replace.on_disabled_hover_text("rbxcache does not swap 3D models or meshes")
+                };
+                if replace.clicked() {
                     actions.push(Action::Replace);
                 }
                 if ui.button("Open").on_hover_text("Open a copy in the default program").clicked() {
@@ -2530,6 +2931,7 @@ impl App {
                     ui.add(egui::Label::new(egui::RichText::new(&preview.hex).monospace()).extend().selectable(true));
                 });
             }
+            ui.add_space(48.0);
         });
     }
 
@@ -2539,11 +2941,15 @@ impl App {
         let mut context_row: Option<usize> = None;
         let mut focus_rect: Option<Rect> = None;
         let mut body_clip: Option<Rect> = None;
+        let mut header_rect: Option<Rect> = None;
         let (sort, ascending, focus) = (self.sort, self.ascending, self.focus);
         let (one, any) = (self.focus.is_some() && self.selected.len() <= 1, !self.selected.is_empty());
-        // Reserved now so the focus highlight ends up underneath the row text.
+        let swappable = self.swappable();
+        // Reserved now so the focus highlight ends up underneath the row text. The glow round
+        // each row is added afterwards, so it lies over the row.
         let painter = ui.painter().clone();
         let blob_slot = painter.add(Shape::Noop);
+        let mut rows: Vec<Rect> = Vec::new();
 
         let mut table = TableBuilder::new(ui)
             .striped(false)
@@ -2578,6 +2984,7 @@ impl App {
                         }
                     });
                 }
+                header_rect = Some(header.response().rect);
             })
             .body(|mut body| {
                 body_clip = Some(body.ui_mut().clip_rect());
@@ -2611,6 +3018,7 @@ impl App {
                         ui.label(egui::RichText::new(&e.id_hex).monospace());
                     });
                     let response = row.response();
+                    rows.push(response.rect);
                     if is_focus {
                         focus_rect = Some(response.rect);
                     }
@@ -2625,12 +3033,26 @@ impl App {
                     }
                     response.context_menu(|ui| {
                         ui.set_min_width(220.0);
-                        entry_items(ui, actions, one, any, self.source.is_some());
+                        entry_items(ui, actions, one, any, self.source.is_some(), swappable);
                     });
                 });
             });
 
         self.paint_blob(&painter, blob_slot, focus_rect, body_clip);
+        // Each record, and the header, gets its own outline as the backdrop's glow passes it.
+        if let Some(rect) = header_rect {
+            painter.add(theme::glow_wrap(painter.ctx(), rect.shrink2(Vec2::new(4.0, 3.0)), CornerRadius::same(6)));
+        }
+        if let Some(clip) = body_clip {
+            let lit: Vec<Shape> = rows
+                .iter()
+                .map(|row| theme::glow_wrap(painter.ctx(), row.shrink2(Vec2::new(4.0, 2.0)), CornerRadius::same(6)))
+                .filter(|shape| !matches!(shape, Shape::Noop))
+                .collect();
+            if !lit.is_empty() {
+                painter.with_clip_rect(clip).add(Shape::Vec(lit));
+            }
+        }
         if let Some(pos) = clicked {
             let modifiers = ui.input(|i| i.modifiers);
             self.click_row(pos, modifiers);
@@ -2693,6 +3115,531 @@ impl App {
         painter.with_clip_rect(clip).set(slot, Shape::Vec(shapes));
     }
 
+    /// Starts the Lab's test on a worker thread. The watcher is paused for it:
+    /// it would take every swap for something to protect or put a config on.
+    fn start_lab(&mut self, ctx: &egui::Context) -> Result<String> {
+        if self.lab_job.is_some() {
+            return Ok(String::new());
+        }
+        self.lab_targets.retain(|id| self.index.contains_key(id));
+        if self.lab_targets.is_empty() {
+            return Err(anyhow!("Add an entry to test first: select it under Browse, then press Add selected entry here"));
+        }
+        let frames = match &self.lab_folder {
+            Some(folder) => lab::load_frames(folder)?,
+            None => lab::colour_frames(),
+        };
+        self.stop_watch();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = channel();
+        let setup = lab::Setup {
+            dir: self.dir.clone(),
+            entries: self.entries.clone(),
+            targets: self.lab_targets.clone(),
+            frames,
+            interval: std::time::Duration::from_millis(self.lab_interval_ms as u64),
+            restore: self.lab_restore,
+        };
+        let (flag, ctx) = (stop.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            lab::run(setup, &flag, |msg| {
+                let _ = tx.send(msg);
+                ctx.request_repaint();
+            });
+        });
+        self.lab_job = Some((rx, stop));
+        self.lab_progress = lab::Progress::default();
+        self.lab_error = None;
+        Ok(String::new())
+    }
+
+    fn poll_lab(&mut self, ctx: &egui::Context) {
+        let Some((rx, _)) = &self.lab_job else { return };
+        let mut done = None;
+        loop {
+            match rx.try_recv() {
+                Ok(lab::Msg::Progress(progress)) => self.lab_progress = progress,
+                Ok(lab::Msg::Done(entries, problem)) => done = Some((entries, problem)),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    done.get_or_insert((Vec::new(), Some("the test stopped unexpectedly".to_string())));
+                    break;
+                }
+            }
+        }
+        let Some((entries, problem)) = done else { return };
+        self.lab_job = None;
+        self.lab_error = problem;
+        watch::merge(&mut self.entries, &Change { written: entries, ..Default::default() });
+        self.preview = None;
+        self.reindex();
+        if self.settings.watch {
+            self.start_watch(ctx);
+        }
+        // A quit asked for while the test was running was held back until the originals were put back.
+        if self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    fn start_sky(&mut self, ctx: &egui::Context, effect: SkyEffect) {
+        if self.sky_job.is_some() {
+            return;
+        }
+        let gif = self.sky_gif.clone();
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        // A roomy stack, and a panic is caught and reported (it is also in the log) rather than
+        // leaving the page waiting for work that has already died.
+        let spawned = std::thread::Builder::new().name("sky".into()).stack_size(64 * 1024 * 1024).spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| skies::apply(effect, gif.as_deref())));
+            let result = match outcome {
+                Ok(result) => result.map_err(|e| format!("{e:#}")),
+                Err(_) => Err("the sky build crashed; see the log for the details".to_string()),
+            };
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        if let Err(e) = spawned {
+            crate::log::write(&format!("could not start the sky build thread: {e}"));
+        }
+        self.sky_job = Some(rx);
+        self.sky_status = format!("Applying {}…", effect.label());
+    }
+
+    /// Starts removing the Rivals skyboxes, and goes on doing so.
+    ///
+    /// Each skybox is downloaded by its asset ID to learn what it looks like,
+    /// and every cache entry that holds one is deleted, a copy of it kept for
+    /// [`App::revert_skyboxes`]. From then on the same is done to each skybox
+    /// Roblox writes, in [`App::start_reapply`], for as long as this is
+    /// switched on: across restarts, and whatever the configs say. A config
+    /// that sets a skybox has nothing to set while there is no skybox.
+    fn start_remove_skyboxes(&mut self, ctx: &egui::Context) {
+        if self.skybox_job.is_some() || self.reapply_job.is_some() || self.lab_job.is_some() {
+            self.status = "Configs are being applied or the Lab is running; try again in a moment".into();
+            return;
+        }
+        self.skybox_rules.clear();
+        self.settings.remove_skyboxes = true;
+        self.settings.save();
+        // The watcher would report the deletions one by one; the list is brought up to date when this is done.
+        self.stop_watch();
+        let (tx, rx) = channel();
+        let (dir, entries, mut idmap, ctx) = (self.dir.clone(), self.entries.clone(), self.idmap.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            prepare_requests(&dir);
+            let result = (|| -> Result<SkyboxClear> {
+                let store = Store::open(&dir, true)?;
+                let report = |done, total| {
+                    let _ = tx.send(SkyboxMsg::Progress(done, total));
+                    ctx.request_repaint();
+                };
+                let outcomes = resolve::identify(&store, &entries, &mut idmap, config::RIVALS_SKYBOX_IDS, true, &report);
+                let mut summary = resolve::summarize(&outcomes);
+                let mut originals = Originals::load_default().ok();
+                let mut removed = Removed::load_default()?;
+                let (deleted, failed) = config::remove_skyboxes(&store, &entries, &idmap, originals.as_mut(), &mut removed, None)?;
+                if deleted.is_empty() && failed == 0 {
+                    summary.push_str(". None of them were in the cache.");
+                } else {
+                    summary.push_str(&format!(". Deleted {}.", format::count(deleted.len(), "cache entry", "cache entries")));
+                }
+                Ok(SkyboxClear { idmap, deleted, failed, kept: removed.len(), summary })
+            })();
+            let _ = tx.send(SkyboxMsg::Done(result.map_err(|e| format!("{e:#}"))));
+            ctx.request_repaint();
+        });
+        self.skybox_job = Some(rx);
+        self.skybox_progress = (0, 0);
+        self.sky_status = format!("Fetching {} Rivals skybox IDs…", config::RIVALS_SKYBOX_IDS.len());
+    }
+
+    fn poll_skyboxes(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.skybox_job else { return };
+        let mut finished = None;
+        loop {
+            match rx.try_recv() {
+                Ok(SkyboxMsg::Progress(done, total)) => {
+                    self.skybox_progress = (done, total);
+                    self.sky_status = format!("Fetching Rivals skyboxes  {done} / {total}");
+                }
+                Ok(SkyboxMsg::Done(result)) => finished = Some(result),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    finished.get_or_insert(Err("the skybox fetch stopped unexpectedly".to_string()));
+                    break;
+                }
+            }
+        }
+        let Some(result) = finished else { return };
+        self.skybox_job = None;
+        match result {
+            Ok(cleared) => {
+                self.idmap = cleared.idmap;
+                if self.idmap_error.is_none() {
+                    if let Err(e) = self.idmap.save(&self.idmap_path) {
+                        self.notify(ctx, format!("The ID map could not be saved: {e:#}"), true);
+                    }
+                }
+                self.skybox_kept = cleared.kept;
+                self.forget_entries(&cleared.deleted);
+                self.reindex();
+                self.sky_status = if cleared.failed > 0 {
+                    format!("{} {} could not be deleted.", cleared.summary, cleared.failed)
+                } else {
+                    format!("{} They will be deleted again whenever Roblox downloads them.", cleared.summary)
+                };
+                self.notify(ctx, self.sky_status.clone(), cleared.failed > 0);
+            }
+            Err(e) => {
+                self.sky_status = e.clone();
+                self.notify(ctx, format!("Rivals skyboxes were not removed: {e}"), true);
+            }
+        }
+        if self.settings.watch {
+            self.start_watch(ctx);
+        }
+    }
+
+    /// Stops removing the Rivals skyboxes and puts back the ones that were
+    /// deleted, as Roblox wrote them. The configs are then brought to bear on
+    /// them like on anything else Roblox writes, so a config's sky returns too.
+    fn revert_skyboxes(&mut self, ctx: &egui::Context) -> Result<String> {
+        if self.reapply_job.is_some() || self.lab_job.is_some() {
+            bail!("Configs are being applied or the Lab is running; try again in a moment");
+        }
+        self.settings.remove_skyboxes = false;
+        self.settings.save();
+        self.reapply_targets.clear();
+        let store = Store::open(&self.dir, true)?;
+        let mut removed = Removed::load_default()?;
+        // Entries put back would look to the watcher like downloads; it starts again from the list as it is afterwards.
+        self.stop_watch();
+        let (restored, failed) = removed.restore_all(&store);
+        let saved = removed.save();
+        self.skybox_kept = removed.len();
+        let count = restored.len();
+        if count > 0 {
+            watch::merge(&mut self.entries, &Change { written: restored, ..Default::default() });
+            self.preview = None;
+            self.reindex();
+        }
+        if self.settings.watch {
+            self.start_watch(ctx);
+        }
+        (self.sync_wanted, self.quiet) = (true, true);
+        saved?;
+        let message = match (count, failed) {
+            (0, 0) => "Stopped removing Rivals skyboxes. There were none to put back; Roblox downloads them when a match needs them.".to_string(),
+            (n, 0) => format!("Stopped removing Rivals skyboxes and put {} back.", format::count(n, "entry", "entries")),
+            (n, failed) => bail!("Stopped removing Rivals skyboxes and put {n} back, but {failed} could not be put back yet. Press Revert again once Roblox is closed."),
+        };
+        self.sky_status = message.clone();
+        Ok(message)
+    }
+
+    fn poll_sky(&mut self, ctx: &egui::Context) {
+        let Some(result) = self.sky_job.as_ref().and_then(finished) else { return };
+        self.sky_job = None;
+        match result {
+            Ok(message) => {
+                self.sky_status = message.clone();
+                self.notify(ctx, "Sky shaders updated. Close Roblox fully and join again.".into(), false);
+                self.sky_clients = skies::list_clients().unwrap_or_else(|e| format!("{e:#}"));
+            }
+            Err(e) => {
+                self.sky_status = e.clone();
+                self.notify(ctx, format!("Sky shaders were not applied: {e}"), true);
+            }
+        }
+    }
+
+    fn skies_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        self.page_header(ui, "Skies", "Animated weather, city, night, sunset, festival and moon skies, or a GIF, via Roblox's Direct3D shaders.");
+        card(ui, self.entrance(ui.ctx(), 1), |ui| {
+            ui.colored_label(theme::WARN, "⚠ Experimental — works best on NVIDIA GPUs and can cause FPS drops.");
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "These skies run extra shader work on every frame, so expect a lower frame rate, most on weaker or non-NVIDIA GPUs. \
+                         Turn it off here if the game stutters. Applying rewrites the sky shaders in every Roblox client on this PC \
+                         (stock Roblox, Voidstrap, Bloxstrap, Fishstrap) and closes Roblox if it is open; start it again and join a game \
+                         with a visible sky. Everything runs inside rbxcache.",
+                    )
+                    .color(theme::MUTED),
+                )
+                .wrap(),
+            );
+        });
+
+        let busy = self.sky_job.is_some() || self.skybox_job.is_some() || self.busy().is_some();
+        card(ui, self.entrance(ui.ctx(), 2), |ui| {
+            ui.label(egui::RichText::new("Effect").size(16.0).strong());
+            // The best looking skies first, with pirxcy's pick marked, then the ones still being
+            // worked on under their own heading.
+            ui.label(egui::RichText::new("Best looking").size(13.0).color(theme::MUTED));
+            ui.horizontal_wrapped(|ui| {
+                for effect in SkyEffect::OFFERED.into_iter().filter(|e| e.best_looking()) {
+                    let mut button = ui.add_enabled(!busy, primary_button(effect.label()));
+                    // pirxcy's pick says so when the pointer rests on it, rather than with a
+                    // label of its own like the headings.
+                    if effect.recommended() {
+                        const PICK: &str = "\u{2605} pirxcy's recommended";
+                        button = button.on_hover_text(PICK).on_disabled_hover_text(PICK);
+                    }
+                    if button.clicked() {
+                        actions.push(Action::SkyApply(effect));
+                    }
+                }
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| theme::pill(ui, "WORK IN PROGRESS", theme::WARN));
+            ui.horizontal_wrapped(|ui| {
+                for effect in SkyEffect::OFFERED.into_iter().filter(|e| !e.best_looking()) {
+                    if ui.add_enabled(!busy, egui::Button::new(effect.label())).clicked() {
+                        actions.push(Action::SkyApply(effect));
+                    }
+                }
+            });
+            ui.add_space(6.0);
+            if ui.add_enabled(!busy, egui::Button::new("Turn off")).clicked() {
+                actions.push(Action::SkyApply(SkyEffect::Off));
+            }
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("GIF sky").size(14.0).strong());
+            ui.horizontal(|ui| {
+                let label = self
+                    .sky_gif
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "No GIF chosen".into());
+                ui.label(egui::RichText::new(label).color(theme::MUTED));
+                if ui.add_enabled(!busy, egui::Button::new("Choose GIF…")).clicked() {
+                    actions.push(Action::SkyPickGif);
+                }
+                if ui.add_enabled(!busy && self.sky_gif.is_some(), primary_button("Apply GIF")).clicked() {
+                    actions.push(Action::SkyApply(SkyEffect::Gif));
+                }
+            });
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("Rivals skyboxes").size(14.0).strong());
+            let removing = self.settings.remove_skyboxes;
+            ui.horizontal_wrapped(|ui| {
+                if removing {
+                    if ui.add_enabled(!busy, primary_button("Revert")).clicked() {
+                        actions.push(Action::RevertSkyboxes);
+                    }
+                    let kept = match self.skybox_kept {
+                        0 => "none deleted yet".to_string(),
+                        n => format!("{} deleted and kept to put back", format::count(n, "entry", "entries")),
+                    };
+                    ui.label(egui::RichText::new(format!("Removing Rivals skyboxes: {kept}.")).color(theme::WARN));
+                } else {
+                    if ui.add_enabled(!busy, egui::Button::new("Remove Rivals skyboxes")).clicked() {
+                        actions.push(Action::AskRemoveRivalsSkyboxes);
+                    }
+                    // Copies left over from before, when a revert could not put everything back.
+                    if self.skybox_kept > 0 && ui.add_enabled(!busy, egui::Button::new("Put the deleted ones back")).clicked() {
+                        actions.push(Action::RevertSkyboxes);
+                    }
+                }
+            });
+            let note = if removing {
+                "Every Rivals skybox is deleted from the cache as soon as Roblox writes it, the way configs are re-applied. \
+                 Revert stops that and puts the deleted skyboxes back."
+            } else {
+                "Deletes the Rivals map skyboxes from the cache and keeps deleting them whenever Roblox downloads them again, \
+                 until you press Revert, which puts them back."
+            };
+            ui.add(egui::Label::new(egui::RichText::new(note).color(theme::MUTED).small()).wrap());
+            if removing && !self.settings.watch {
+                ui.colored_label(theme::WARN, "Live is off, so the cache is not being followed: skyboxes are only deleted when rbxcache starts.");
+            }
+            if self.sky_job.is_some() || self.skybox_job.is_some() {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    let note = if self.skybox_job.is_some() {
+                        "Fetching the skybox IDs and deleting them…"
+                    } else {
+                        "Building and installing the sky pack…"
+                    };
+                    ui.label(egui::RichText::new(note).color(theme::MUTED));
+                });
+            }
+            if !self.sky_status.is_empty() {
+                ui.add_space(6.0);
+                ui.add(egui::Label::new(egui::RichText::new(&self.sky_status).color(theme::MUTED).small()).wrap());
+            }
+        });
+
+        card(ui, self.entrance(ui.ctx(), 3), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Log").size(16.0).strong());
+                if ui.button("Open log").clicked() {
+                    crate::log::open();
+                }
+                if ui.button("Copy path").clicked() {
+                    if let Some(path) = crate::log::path() {
+                        ui.ctx().copy_text(path.display().to_string());
+                    }
+                }
+            });
+            ui.label(
+                egui::RichText::new("Every sky build writes its timings and any error here, so a slow or failed build can be traced.")
+                    .color(theme::MUTED)
+                    .small(),
+            );
+            egui::CollapsingHeader::new("Recent lines").id_salt("sky-log").show(ui, |ui| {
+                let text = crate::log::tail(40);
+                if text.is_empty() {
+                    ui.label(egui::RichText::new("Nothing logged yet.").color(theme::MUTED));
+                } else {
+                    egui::ScrollArea::vertical().max_height(220.0).stick_to_bottom(true).show(ui, |ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(text).monospace().small()).wrap());
+                    });
+                }
+            });
+        });
+
+        card(ui, self.entrance(ui.ctx(), 4), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Roblox clients").size(16.0).strong());
+                if ui.add_enabled(self.sky_job.is_none(), egui::Button::new("Refresh")).clicked() {
+                    actions.push(Action::SkyRefreshClients);
+                }
+            });
+            if self.sky_clients.is_empty() {
+                ui.label(egui::RichText::new("Press Refresh to list every install this PC can update.").color(theme::MUTED));
+            } else {
+                ui.add(egui::Label::new(egui::RichText::new(&self.sky_clients).monospace().small()).wrap());
+            }
+            if self.roblox_running {
+                ui.add_space(4.0);
+                ui.colored_label(theme::WARN, "Roblox is running. Applying or turning off a sky will close it.");
+            }
+        });
+    }
+
+    fn lab_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        self.page_header(ui, "Lab", "A test: does Roblox look at a cached file again while you are in a game?");
+        card(ui, self.entrance(ui.ctx(), 1), |ui| {
+            let about = "Pick an entry, a sky texture for instance, and this swaps it for a new picture over and over while counting how often \
+                         Roblox reads it. If Roblox only reads an asset when it first loads it, the count stays at zero and nothing changes on \
+                         screen, however fast the swapping. If the count climbs, live swapping works for that asset.";
+            ui.add(egui::Label::new(egui::RichText::new(about).color(theme::TEXT)).wrap());
+            let how = "To run it: join a game, find the texture under Browse (the Live tab lists what the game has just downloaded), select it, \
+                       come back here and press Add selected entry, then Start. Watch the game while it runs.";
+            ui.add(egui::Label::new(egui::RichText::new(how).color(theme::MUTED).small()).wrap());
+        });
+
+        let running = self.lab_job.is_some();
+        card(ui, self.entrance(ui.ctx(), 2), |ui| {
+            ui.label(egui::RichText::new("What to swap").size(16.0).strong());
+            if self.lab_targets.is_empty() {
+                ui.label(egui::RichText::new("No entry chosen yet.").color(theme::MUTED));
+            }
+            for id in &self.lab_targets {
+                if let Some(e) = self.index.get(id).map(|&i| &self.entries[i]) {
+                    ui.horizontal(|ui| {
+                        theme::pill(ui, e.kind, theme::kind_color(e.kind));
+                        ui.label(egui::RichText::new(&e.id_hex[..12]).monospace());
+                        ui.label(egui::RichText::new(human_size(e.size)).color(theme::MUTED));
+                    });
+                }
+            }
+            ui.horizontal(|ui| {
+                let selected = self.focus.filter(|id| !self.lab_targets.contains(id));
+                if ui
+                    .add_enabled(!running && selected.is_some(), egui::Button::new("Add selected entry"))
+                    .on_hover_text("The entry selected under Browse")
+                    .clicked()
+                {
+                    actions.push(Action::LabAdd);
+                }
+                if ui.add_enabled(!running && !self.lab_targets.is_empty(), egui::Button::new("Clear")).clicked() {
+                    actions.push(Action::LabClear);
+                }
+            });
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("What to swap it for").size(16.0).strong());
+            ui.horizontal(|ui| {
+                let label = match &self.lab_folder {
+                    Some(folder) => format!("Pictures from {}", folder.display()),
+                    None => "Eight solid colours, one after another".to_string(),
+                };
+                ui.label(label);
+                if ui.add_enabled(!running, egui::Button::new("Choose a folder...")).on_hover_text("Use your own pictures, in name order").clicked() {
+                    actions.push(Action::LabPickFolder);
+                }
+                if self.lab_folder.is_some() && ui.add_enabled(!running, egui::Button::new("Use the colours")).clicked() {
+                    actions.push(Action::LabColours);
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("A new picture every");
+                ui.add_enabled(!running, egui::Slider::new(&mut self.lab_interval_ms, 100..=5000).suffix(" ms").logarithmic(true));
+            });
+            ui.add_enabled(!running, egui::Checkbox::new(&mut self.lab_restore, "Put the original back when the test stops"));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if running {
+                    if ui.add(egui::Button::new(egui::RichText::new("Stop").color(Color32::WHITE)).fill(alpha(theme::DANGER, 0.75))).clicked() {
+                        actions.push(Action::LabStop);
+                    }
+                    ui.spinner();
+                    ui.label(egui::RichText::new("Swapping. Watching the cache is paused until this stops.").color(theme::MUTED));
+                } else if ui.add_enabled(self.busy().is_none(), primary_button("Start")).clicked() {
+                    actions.push(Action::LabStart);
+                }
+            });
+            if !self.roblox_running {
+                ui.colored_label(theme::WARN, "Roblox is not running. The test only says something while you are in a game.");
+            }
+            if let Some(error) = &self.lab_error {
+                ui.add(egui::Label::new(egui::RichText::new(error).color(theme::DANGER)).wrap());
+            }
+        });
+
+        let progress = &self.lab_progress;
+        if running || progress.swaps > 0 {
+            card(ui, self.entrance(ui.ctx(), 3), |ui| {
+                ui.label(egui::RichText::new("What happened").size(16.0).strong());
+                ui.columns(4, |columns| {
+                    let figures = [
+                        ("Swaps written", progress.swaps.to_string(), theme::TEXT),
+                        ("Read by Roblox", progress.reads.to_string(), if progress.reads > 0 { theme::OK } else { theme::TEXT }),
+                        ("Rewritten by Roblox", progress.overwritten.to_string(), if progress.overwritten > 0 { theme::WARN } else { theme::TEXT }),
+                        ("Last swap took", format!("{:.0} ms", progress.write_ms), theme::TEXT),
+                    ];
+                    for (column, (label, value, colour)) in columns.iter_mut().zip(figures) {
+                        column.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                            ui.label(egui::RichText::new(value).size(26.0).strong().color(colour));
+                            ui.label(egui::RichText::new(label).color(theme::MUTED).small());
+                        });
+                    }
+                });
+                ui.add_space(6.0);
+                let (verdict, colour) = if progress.reads > 0 {
+                    ("Roblox read the entry during the test. If the picture in game changed too, live swapping works for this asset.", theme::OK)
+                } else if progress.swaps >= 5 {
+                    ("Roblox has not read the entry once since the test began. It is using the copy it loaded, so swapping the file changes nothing until the asset is loaded again.", theme::WARN)
+                } else {
+                    ("Too early to say. Let it run for a few swaps.", theme::MUTED)
+                };
+                ui.add(egui::Label::new(egui::RichText::new(verdict).color(colour)).wrap());
+                if progress.write_ms > self.lab_interval_ms as f32 {
+                    let slow =
+                        "A swap takes longer than the interval, so the pictures are changing as fast as they can be written, not as fast as asked.";
+                    ui.add(egui::Label::new(egui::RichText::new(slow).color(theme::MUTED).small()).wrap());
+                }
+            });
+        }
+    }
+
     /// Who is signed in, at the bottom right: their avatar and name, or a way to sign in.
     fn account_chip(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         let (label, hint) = match self.accounts.active() {
@@ -2741,7 +3688,7 @@ impl App {
                 opens: self.last_manage,
             },
         ];
-        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.spacing_mut().item_spacing.y = 8.0;
         let highlight = ui.painter().add(Shape::Noop);
         let mut active = None;
         for (index, row) in rows.iter().enumerate() {
@@ -2768,7 +3715,7 @@ impl App {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
-                    let label = egui::RichText::new(format!("Update to {}", release.version)).color(theme::LIME);
+                    let label = egui::RichText::new(format!("Update to {}", release.version)).color(theme::HIGHLIGHT);
                     if ui.button(label).on_hover_text("See what is new").clicked() {
                         actions.push(Action::ShowTab(Tab::Info));
                     }
@@ -2810,6 +3757,7 @@ impl App {
             let at = egui::pos2(rect.right() - 16.0, rect.center().y - 8.0);
             painter.text(at, egui::Align2::RIGHT_CENTER, count.to_string(), egui::FontId::proportional(12.0), alpha(theme::MUTED, t));
         }
+        painter.add(theme::glow_pop(ui.ctx(), rect.shrink2(Vec2::new(6.0, 4.0)), CornerRadius::same(8)));
         if response.clicked() {
             actions.push(Action::ShowTab(row.opens));
         }
@@ -2836,11 +3784,13 @@ impl App {
         let enabled = self.configs.iter().filter(|c| c.enabled).count();
         let chips = [
             (Tab::Configs, "Configs", (enabled > 0).then_some(enabled), theme::ACCENT),
-            (Tab::Packs, "Packs", Some(self.catalog.packs.len()), theme::LIME),
+            (Tab::Packs, "Packs", Some(self.catalog.packs.len()), theme::HIGHLIGHT),
             (Tab::Lookup, "IDs", None, if self.accounts.is_empty() { theme::MUTED } else { theme::WARN }),
             (Tab::Account, "Account", None, if self.accounts.is_empty() { theme::MUTED } else { theme::OK }),
+            (Tab::Lab, "Lab", None, if self.lab_job.is_some() { theme::DANGER } else { theme::MUTED }),
+            (Tab::Skies, "Skies", None, if self.sky_job.is_some() { theme::WARN } else { theme::HIGHLIGHT }),
             (Tab::Guide, "Guide", None, theme::OK),
-            (Tab::Info, "Info", None, if self.update.is_some() { theme::LIME } else { theme::MUTED }),
+            (Tab::Info, "Info", None, if self.update.is_some() { theme::HIGHLIGHT } else { theme::MUTED }),
         ];
         self.chips(ui, &chips, actions);
     }
@@ -2851,7 +3801,7 @@ impl App {
         let now = ui.input(|i| i.time);
         egui::ScrollArea::horizontal().id_salt(chips[0].1).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.spacing_mut().item_spacing.x = 10.0;
                 for (index, &(tab, label, count, colour)) in chips.iter().enumerate() {
                     let seen = *self.nav_seen.entry(label).or_insert(now);
                     let t = if self.settings.animations { theme::ease_out(((now - seen) as f32 - index as f32 * 0.03) / 0.35) } else { 1.0 };
@@ -2895,7 +3845,7 @@ impl App {
         }
         shapes.push(Shape::rect_filled(at, radius, alpha(theme::ACCENT, 0.22)));
         let bar = Rect::from_min_size(at.min + Vec2::new(0.0, 10.0), Vec2::new(3.0, at.height() - 20.0));
-        shapes.push(Shape::rect_filled(bar, CornerRadius::same(2), theme::LIME));
+        shapes.push(Shape::rect_filled(bar, CornerRadius::same(2), theme::HIGHLIGHT));
         ui.painter().set(slot, Shape::Vec(shapes));
     }
 
@@ -2903,27 +3853,30 @@ impl App {
     fn page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         let width = ui.available_width().min(PAGE_WIDTH);
         let margin = ((ui.available_width() - width) / 2.0).max(0.0);
-        ui.add_space(12.0);
+        ui.add_space(14.0);
         ui.horizontal(|ui| {
             ui.add_space(margin);
             self.manage_chips(ui, actions);
         });
-        ui.add_space(6.0);
+        ui.add_space(8.0);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.horizontal_top(|ui| {
                 ui.add_space(margin);
                 ui.vertical(|ui| {
                     ui.set_width(width);
-                    ui.add_space(8.0);
+                    ui.add_space(10.0);
                     match self.tab {
                         Tab::Configs => self.configs_page(ui, actions),
                         Tab::Packs => self.packs_page(ui, actions),
                         Tab::Lookup => self.lookup_page(ui, actions),
                         Tab::Account => self.account_page(ui, actions),
+                        Tab::Lab => self.lab_page(ui, actions),
+                        Tab::Skies => self.skies_page(ui, actions),
                         Tab::Guide => self.guide_page(ui, actions),
                         _ => self.info_page(ui, actions),
                     }
-                    ui.add_space(24.0);
+                    // Enough under the last card that it can be scrolled clear of the window's edge.
+                    ui.add_space(64.0);
                 });
             });
         });
@@ -2938,7 +3891,7 @@ impl App {
             ui.label(egui::RichText::new(title).font(egui::FontId::new(30.0, theme::wordmark_font())).color(theme::SPLASH_INK));
             ui.add(egui::Label::new(egui::RichText::new(about).color(theme::MUTED)).wrap());
         });
-        ui.add_space(10.0);
+        ui.add_space(14.0);
     }
 
     fn configs_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
@@ -3170,7 +4123,7 @@ impl App {
                 ("What works without it", "Browsing, previews, exporting, replacing and deleting entries, and configs for images, fonts, meshes and anything else Roblox gives to everyone. Fetching IDs and replacing sounds need an account, and stay locked until one is added."),
             ] {
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new(title).color(theme::LIME));
+                ui.label(egui::RichText::new(title).color(theme::HIGHLIGHT));
                 ui.add(egui::Label::new(text).wrap());
             }
         });
@@ -3352,6 +4305,7 @@ impl App {
                         );
                     }
                     Outcome::Gone => drop(ui.colored_label(theme::WARN, "Roblox has no asset with this ID.")),
+                    Outcome::Withheld => drop(ui.colored_label(theme::WARN, "This is a 3D model or mesh. rbxcache does not download or swap those.")),
                     Outcome::Failed(why) => drop(ui.colored_label(theme::DANGER, format!("The lookup failed: {why}"))),
                     Outcome::Denied(_) => self.pick_by_ear(ui, found, playing, actions),
                 }
@@ -3361,16 +4315,16 @@ impl App {
 
     /// For an ID Roblox would not hand out: the cached sounds it could be, to play and choose from.
     fn pick_by_ear(&self, ui: &mut egui::Ui, found: &Found, playing: Option<Id>, actions: &mut Vec<Action>) {
-        ui.colored_label(theme::WARN, "Roblox does not hand this one out to a guest.");
+        ui.colored_label(theme::WARN, "Roblox keeps this one to the game it belongs to.");
         if self.accounts.is_empty() {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Signing in with an account may get it directly.").color(theme::MUTED));
-                if ui.small_button("Sign in").clicked() {
+                ui.label(egui::RichText::new("Adding an account may get it, if the account can reach it.").color(theme::MUTED));
+                if ui.small_button("Account").clicked() {
                     actions.push(Action::ShowTab(Tab::Account));
                 }
             });
         } else {
-            ui.label(egui::RichText::new("Asked again as each of its creator's games, and none of them handed it out.").color(theme::MUTED));
+            ui.label(egui::RichText::new("Your account cannot reach it either, so pick it by ear below.").color(theme::MUTED));
         }
         // With nothing known about it, a refused asset is taken to be a sound: those are the ones Roblox keeps back.
         if found.details.is_some() && !found.is_sound() {
@@ -3421,12 +4375,12 @@ impl App {
             ("Play", "Leave rbxcache open, or close it and let it sit in the tray. Roblox only saves an asset when a game first needs it, so most of a pack has nothing to replace until you have joined the game. Each asset is replaced as it arrives."),
             ("Rejoin", "Roblox keeps what it has already loaded in memory, so a replacement shows the next time the asset is loaded. The first time with a pack: join the game, leave, and join again. After that the replacements are already in place when you start."),
             ("Tune it", "Every config has a switch, and under Rules so does each thing it changes. When two configs change the same thing, a Conflicts box appears at the top of Configs and you choose which one has it."),
-            ("Undo it", "Switch a config or a rule off and what it replaced is put back from the copy rbxcache kept. Remove does that for the whole config. File > Clear cache makes Roblox download everything fresh."),
+            ("Undo it", "Switch a config or a rule off and what it replaced is put back from the copy rbxcache kept. Remove does that for the whole config. File > Clear skyboxes deletes only the Rivals map skies so Roblox fetches them again, and Skies > Remove Rivals skyboxes keeps deleting them until you press Revert; File > Clear cache empties everything."),
         ];
         for (n, (title, text)) in steps.iter().enumerate() {
             card(ui, self.entrance(ui.ctx(), n + 1), |ui| {
                 ui.horizontal(|ui| {
-                    theme::pill(ui, &(n + 1).to_string(), theme::LIME);
+                    theme::pill(ui, &(n + 1).to_string(), theme::HIGHLIGHT);
                     ui.label(egui::RichText::new(*title).size(16.0).strong());
                 });
                 ui.add(egui::Label::new(*text).wrap());
@@ -3447,7 +4401,7 @@ impl App {
                 ("Nothing matched", "Roblox has not downloaded those assets on this computer yet. Play the game once with rbxcache running."),
             ] {
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new(what).color(theme::LIME));
+                ui.label(egui::RichText::new(what).color(theme::HIGHLIGHT));
                 ui.add(egui::Label::new(why).wrap());
             }
         });
@@ -3490,7 +4444,7 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(&pack.name).size(17.0).strong());
                     if !pack.game.is_empty() {
-                        theme::pill(ui, &pack.game, theme::LIME);
+                        theme::pill(ui, &pack.game, theme::HIGHLIGHT);
                     }
                     if !pack.author.is_empty() {
                         ui.label(egui::RichText::new(format!("by {}", pack.author)).color(theme::MUTED));
@@ -3537,7 +4491,7 @@ impl App {
         if let Some(release) = &self.update {
             card(ui, self.entrance(ui.ctx(), 1), |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("Version {} is out", release.version)).size(17.0).strong().color(theme::LIME));
+                    ui.label(egui::RichText::new(format!("Version {} is out", release.version)).size(17.0).strong().color(theme::HIGHLIGHT));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(primary_button("Open the release page")).clicked() {
                             actions.push(Action::OpenUpdate);
@@ -3573,7 +4527,7 @@ impl App {
                             ui.set_min_height(118.0);
                             // Columns justify their content, which spreads the words of a wrapped line apart.
                             ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                                ui.label(egui::RichText::new(title).size(17.0).strong().color(theme::LIME));
+                                ui.label(egui::RichText::new(title).size(17.0).strong().color(theme::HIGHLIGHT));
                                 ui.add(egui::Label::new(egui::RichText::new(text).color(theme::TEXT)).wrap());
                             });
                         });
@@ -3691,6 +4645,16 @@ impl App {
                 "Deleting every cached entry on this computer so Roblox can download them fresh. Replacements made here go with them.".into(),
                 None,
             ))
+        } else if self.skybox_job.is_some() {
+            let (done, total) = self.skybox_progress;
+            let caption = if total > 0 { format!("Fetching Rivals skyboxes  {done} / {total}") } else { "Fetching Rivals skyboxes".into() };
+            Some((
+                caption,
+                "Downloading each map skybox by its asset ID to learn what it looks like, then deleting the cache files that hold it.".into(),
+                fraction(self.skybox_progress),
+            ))
+        } else if self.sky_job.is_some() {
+            Some(("Updating sky shaders".into(), "Rebuilding Roblox's Direct3D sky pack and installing it on every client on this PC.".into(), None))
         } else if self.loading.is_some() {
             let (done, total) = self.progress;
             let caption = if total > 0 { format!("Reading the Roblox cache  {done} / {total}") } else { "Opening the cache index".into() };
@@ -3743,13 +4707,18 @@ impl App {
         }
     }
 
-    /// The full-window splash shown while the app is busy: the "pirxcy" wordmark
-    /// bounces in, holds, and dissolves once the work is done.
+    /// The full-window loading screen shown while the app is busy: the "pirxcy" wordmark, what
+    /// the work is, and how far along it is. Each time it appears it picks one of two ways to
+    /// come in at random (see [`Entrance`]): it puffs in out of a blur, or it bounces up into
+    /// place. It always leaves the same way, diving through the hole in the "p" into the app.
+    /// With the app's animations off, or Windows set to show none, it appears and goes at
+    /// once, and nothing on it moves.
     fn show_splash(&mut self, ctx: &egui::Context) {
-        /// Seconds the wordmark takes to bounce in, stays at least, and takes to dissolve.
+        /// Seconds the wordmark takes to bounce in, and stays at least once it is in.
         const BOUNCE: f32 = 0.9;
         const HOLD: f32 = 0.28;
-        const DISSOLVE: f32 = 0.62;
+        /// Seconds the hole in the "p" takes to open, while the zoom has not set off yet.
+        const OPEN: f32 = 0.25;
         /// Work shorter than this passes without a splash, except the first load.
         const PATIENCE: f64 = 0.15;
         /// A switch on the Configs page gets this long before its work is given a splash.
@@ -3758,108 +4727,286 @@ impl App {
 
         let now = ctx.input(|i| i.time);
         let busy = self.busy();
+        let (pinned, stay) = motion::splash_override();
         match (&mut self.splash, &busy) {
             (None, Some(_)) => {
                 let since = *self.busy_since.get_or_insert(now);
                 let patience = if self.quiet { QUIET_PATIENCE } else { PATIENCE };
                 if now - since >= patience || (self.entries.is_empty() && !self.quiet) {
-                    self.splash = Some(Splash { shown: now, leaving: None, caption: String::new(), detail: String::new(), fraction: None });
+                    // Windows' animation setting can be changed while the app is open.
+                    self.reduced_motion = motion::reduced_motion();
+                    let moving = self.settings.animations && !self.reduced_motion;
+                    let entrance = if moving { pinned.unwrap_or_else(Entrance::random) } else { Entrance::Bounce };
+                    self.splash = Some(Splash { shown: now, leaving: None, caption: String::new(), detail: String::new(), fraction: None, entrance });
                 } else {
                     ctx.request_repaint();
                 }
             }
             // Let the entrance finish before leaving, however quick the work was.
             (Some(splash), None) if splash.leaving.is_none() => {
-                let earliest = splash.shown + if self.settings.animations { (BOUNCE + HOLD) as f64 } else { 0.0 };
-                splash.leaving = Some(now.max(earliest));
+                let entrance = if splash.entrance == Entrance::Puff { motion::PUFF_IN } else { BOUNCE } + HOLD;
+                let least = if self.settings.animations && !self.reduced_motion { entrance.max(stay) } else { 0.0 };
+                splash.leaving = Some(now.max(splash.shown + least as f64));
             }
-            // More work arrived while dissolving: stay.
-            (Some(splash), Some(_)) => splash.leaving = None,
+            // More work arrived. A leave that has not started stays for it; a zoom already on
+            // its way finishes, and a new splash follows if need be.
+            (Some(splash), Some(_)) if splash.leaving.is_some_and(|at| now < at) => {
+                splash.leaving = None;
+            }
             _ => {}
         }
         if busy.is_none() {
             (self.busy_since, self.quiet) = (None, false);
         }
+        let moving = self.settings.animations && !self.reduced_motion;
+        let screen = ctx.screen_rect();
+        let width = screen.width();
+        let look = self.backdrop_look(ctx);
         let Some(splash) = &mut self.splash else { return };
         if let Some((caption, detail, fraction)) = busy {
             (splash.caption, splash.detail, splash.fraction) = (caption, detail, fraction);
         }
-        let leaving = splash.leaving.map_or(0.0, |at| ((now - at) as f32 / if self.settings.animations { DISSOLVE } else { 0.001 }).clamp(0.0, 1.0));
-        if leaving >= 1.0 {
+        let age = (now - splash.shown) as f32;
+        // Seconds since it began to leave; None while it stays.
+        let out = splash.leaving.map(|at| (now - at) as f32).filter(|t| *t >= 0.0);
+        let length = if moving { motion::ZOOM_END } else { 0.0 };
+        if out.is_some_and(|t| t >= length) {
             self.splash = None;
             return;
         }
+        let (entrance, fraction) = (splash.entrance, splash.fraction);
+        let (caption, detail) = (splash.caption.clone(), splash.detail.clone());
+        let shown = ctx.animate_value_with_time(egui::Id::new("splash_progress"), fraction.unwrap_or(0.0), 0.25);
 
-        // The entrance: up from below, past its place, a small settle back.
-        let entered = if self.settings.animations { ((now - splash.shown) as f32 / BOUNCE).clamp(0.0, 1.0) } else { 1.0 };
+        // The bounce in: up from below, past its place, a small settle back.
+        let entered = if moving { (age / BOUNCE).clamp(0.0, 1.0) } else { 1.0 };
         let between = |from: f32, to: f32, start: f32, end: f32| from + (to - from) * theme::ease_out((entered - start) / (end - start));
-        let (rise, scale) = match entered {
+        let (bounce_rise, bounce_scale) = match entered {
             t if t < 0.55 => (between(22.0, -10.0, 0.0, 0.55), between(0.94, 1.02, 0.0, 0.55)),
             t if t < 0.78 => (between(-10.0, 4.0, 0.55, 0.78), between(1.02, 0.995, 0.55, 0.78)),
             _ => (between(4.0, 0.0, 0.78, 1.0), between(0.995, 1.0, 0.78, 1.0)),
         };
-        let opacity = (entered / 0.55).min(1.0) * (1.0 - leaving);
-        let scale = scale * (1.0 + 0.04 * leaving);
+        // How the content stands: scaled about its middle, blurred by so many points, its
+        // opacity, and how far it is from its place; and how solid the backdrop is.
+        let (mut scale, mut blur, mut opacity, mut lift, mut solid) = (bounce_scale, 0.0, (entered / 0.55).min(1.0), bounce_rise, 1.0);
+        if entrance == Entrance::Puff {
+            (scale, blur, opacity) = if moving { motion::puff(age) } else { (1.0, 0.0, 1.0) };
+            // The backdrop comes in with the puff.
+            (lift, solid) = (0.0, opacity);
+        }
 
-        let (caption, detail, fraction, motion) = (splash.caption.clone(), splash.detail.clone(), splash.fraction, self.settings.animations);
-        let shown = ctx.animate_value_with_time(egui::Id::new("splash_progress"), fraction.unwrap_or(0.0), 0.25);
-        let screen = ctx.screen_rect();
-        egui::Area::new(egui::Id::new("splash")).order(egui::Order::Foreground).fixed_pos(screen.min).show(ctx, |ui| {
-            // Takes the clicks while there is work going on; once dissolving, the app is usable again.
-            if leaving == 0.0 {
-                ui.allocate_rect(screen, egui::Sense::click_and_drag());
-            }
-            let painter = ui.painter();
-            theme::splash_gradient(painter, screen, 1.0 - leaving);
-
-            let size = (screen.width() * 0.12).clamp(52.0, 120.0) * scale;
-            let mut job = egui::text::LayoutJob::default();
-            let format = egui::TextFormat {
+        // The content, laid out at its own size: the wordmark, a short title, a sentence of
+        // what the work is doing, and a purple line for how far along it is.
+        let size = (width * 0.12).clamp(52.0, 120.0);
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
+            "pirxcy",
+            0.0,
+            egui::TextFormat {
                 font_id: egui::FontId::new(size, theme::wordmark_font()),
-                // The wordmark stays white on every splash, over the purple gradient.
                 color: Color32::WHITE,
                 extra_letter_spacing: -0.07 * size,
                 ..Default::default()
-            };
-            job.append("pirxcy", 0.0, format);
-            let galley = ui.fonts(|f| f.layout_job(job));
-            let at = screen.center() - galley.size() / 2.0 + Vec2::new(0.0, rise - 28.0);
-            // Dissolving, the word spreads into soft copies of itself, which reads as a blur.
-            if leaving > 0.0 {
-                let spread = 10.0 * leaving;
-                for step in 0..8 {
-                    let angle = step as f32 * std::f32::consts::TAU / 8.0;
-                    let offset = Vec2::new(angle.cos(), angle.sin()) * spread;
-                    painter.galley_with_override_text_color(at + offset, galley.clone(), alpha(INK, opacity * 0.12));
-                }
-            }
-            painter.galley_with_override_text_color(at, galley.clone(), alpha(INK, opacity * (1.0 - leaving * 0.6)));
+            },
+        );
+        let galley = ctx.fonts(|f| f.layout_job(job));
+        let wrap = (width * 0.55).clamp(260.0, 460.0);
+        let text = |text: &str, font: egui::FontId| {
+            let mut job = egui::text::LayoutJob::default();
+            job.append(text, 0.0, egui::TextFormat { font_id: font, color: Color32::WHITE, ..Default::default() });
+            job.wrap.max_width = wrap;
+            job.halign = egui::Align::Center;
+            ctx.fonts(|f| f.layout_job(job))
+        };
+        let caption = text(&caption, egui::FontId::proportional(14.0));
+        let detail = text(&detail, egui::FontId::proportional(12.0));
+        // The wordmark's middle; the lines under it are centred on it too.
+        let home = egui::pos2(screen.center().x, screen.center().y - 28.0 + lift);
+        let mark_at = home - galley.size() / 2.0;
+        let caption_top = home.y + galley.size().y / 2.0 + 16.0;
+        let detail_top = caption_top + caption.size().y + 8.0;
+        let track = Rect::from_center_size(egui::pos2(home.x, detail_top + detail.size().y + 18.0), Vec2::new(220.0, 3.0));
 
-            // Below the word: a short title, a sentence of what the work is doing, and a purple line for how far along it is.
-            let below = at.y + galley.size().y + 16.0;
-            let title_font = egui::FontId::proportional(14.0);
-            let detail_font = egui::FontId::proportional(12.0);
-            painter.text(egui::pos2(screen.center().x, below), egui::Align2::CENTER_TOP, &caption, title_font, alpha(Color32::WHITE, opacity * 0.92));
-            let detail_width = (screen.width() * 0.55).clamp(260.0, 460.0);
-            let mut detail_job = egui::text::LayoutJob::default();
-            detail_job.append(&detail, 0.0, egui::TextFormat { font_id: detail_font, color: alpha(MUTED, opacity), ..Default::default() });
-            detail_job.wrap.max_width = detail_width;
-            let detail_galley = ui.fonts(|f| f.layout_job(detail_job));
-            let detail_at = egui::pos2(screen.center().x - detail_galley.size().x / 2.0, below + 22.0);
-            painter.galley(detail_at, detail_galley.clone(), alpha(MUTED, opacity));
-            let track = Rect::from_center_size(egui::pos2(screen.center().x, detail_at.y + detail_galley.size().y + 18.0), Vec2::new(220.0, 3.0));
+        // The zoom: the scale about the hole in the "p", and the scale that brings the hole to
+        // the corners of the window.
+        let hole = out.is_some().then(|| scenes::wordmark_hole(&galley, mark_at, 180)).flatten();
+        let zoom = match (out, hole) {
+            (Some(t), Some((middle, radius, edge))) if moving => {
+                let most = motion::zoom_max_scale(middle, radius, screen);
+                Some((middle, edge, motion::zoom_scale(t, most), most, t))
+            }
+            (Some(t), None) if moving => {
+                // No hole to go through: it simply fades.
+                opacity *= 1.0 - t / motion::ZOOM_END;
+                solid = opacity;
+                None
+            }
+            _ => None,
+        };
+        let about = |middle: egui::Pos2, by: f32| egui::emath::TSTransform::new(middle.to_vec2() * (1.0 - by), by);
+        let (content_transform, overall) = match &zoom {
+            Some((middle, _, by, ..)) => (about(*middle, *by), *by),
+            None => (about(home, scale), scale),
+        };
+        // The soft edge round the drawn letters stays under a pixel wide however far they are scaled.
+        let edge = 0.75 / (ctx.pixels_per_point() * overall).max(1e-3);
+
+        let paint = |painter: &egui::Painter, shift: Vec2, opacity: f32, crisp: bool| {
+            let ink = alpha(INK, opacity);
+            // The sharp copy is drawn from the letters' outlines, so it holds up through the zoom;
+            // the soft copies of a puff are plain text.
+            let drawn = crisp.then(|| scenes::wordmark(&galley, mark_at + shift, ink, edge)).flatten();
+            match drawn {
+                Some(shapes) => painter.extend(shapes),
+                None => painter.galley_with_override_text_color(mark_at + shift, galley.clone(), ink),
+            }
+            // A centred galley is laid out round its own origin, so its middle is what lines up.
+            let centred = |g: &std::sync::Arc<egui::Galley>, top: f32| egui::pos2(home.x - g.rect.center().x, top) + shift;
+            painter.galley_with_override_text_color(centred(&caption, caption_top), caption.clone(), alpha(Color32::WHITE, opacity * 0.92));
+            painter.galley_with_override_text_color(centred(&detail, detail_top), detail.clone(), alpha(MUTED, opacity));
+            let track = track.translate(shift);
             painter.rect_filled(track, CornerRadius::same(2), alpha(SPLASH_BAR, 0.18 * opacity));
             let filled = match fraction {
                 Some(_) => Rect::from_min_size(track.min, Vec2::new(track.width() * shown.clamp(0.0, 1.0), track.height())),
                 // Work that cannot be measured gets a short bar sweeping across.
                 None => {
-                    let phase = if motion { (now * 0.9).fract() as f32 } else { 0.4 };
+                    let phase = if moving { (now * 0.9).fract() as f32 } else { 0.4 };
                     let left = track.left() + (track.width() + 60.0) * phase - 60.0;
                     Rect::from_min_size(egui::pos2(left, track.top()), Vec2::new(60.0, track.height())).intersect(track)
                 }
             };
             painter.rect_filled(filled, CornerRadius::same(2), alpha(SPLASH_BAR, opacity));
+        };
+
+        let splash_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("splash"));
+        let content_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("splash content"));
+        egui::Area::new(splash_layer.id).order(egui::Order::Foreground).fixed_pos(screen.min).show(ctx, |ui| {
+            // Takes the clicks until it has gone: during the zoom the app is not yet where it will be.
+            ui.allocate_rect(screen, egui::Sense::click_and_drag());
+            let mut painter = ui.painter().clone();
+            painter.multiply_opacity(solid);
+            // The app's own backdrop, so the app appears out of the splash without a change of colour.
+            match &zoom {
+                Some((middle, edge, _, _, t)) => {
+                    // The hole is the inside of the "p", so the letter's own edge is its rim.
+                    theme::backdrop_with_hole(&painter, screen, look, *middle, edge);
+                    // It opens before the zoom sets off.
+                    let closed = 1.0 - motion::ease_out(motion::progress(*t, 0.0, OPEN));
+                    if closed > 0.0 {
+                        painter.add(theme::hole_fill(*middle, edge, alpha(theme::backdrop_at(screen, *middle, look), closed)));
+                    }
+                }
+                None => theme::backdrop(&painter, screen, look, 1.0),
+            }
         });
+
+        let clip = content_transform.inverse() * screen;
+        let painter = ctx.layer_painter(content_layer).with_clip_rect(clip);
+        // A blur is soft copies round the content, in two rings, while the sharp one fades.
+        let spread = blur / scale.max(0.1);
+        if spread >= 0.4 {
+            let soft = (blur / 6.0).min(1.0);
+            for (radius, weight, count) in [(spread, 0.08, 10), (spread * 0.5, 0.13, 8)] {
+                for step in 0..count {
+                    let angle = step as f32 * std::f32::consts::TAU / count as f32 + radius * 0.1;
+                    paint(&painter, Vec2::new(angle.cos(), angle.sin()) * radius, opacity * weight * soft, false);
+                }
+            }
+            paint(&painter, Vec2::ZERO, opacity * (1.0 - 0.55 * soft), true);
+        } else {
+            paint(&painter, Vec2::ZERO, opacity, true);
+        }
+        ctx.transform_layer_shapes(content_layer, content_transform);
+
+        if let Some((middle, _, by, most, _)) = zoom {
+            // The splash is scaled about the hole, and the app inside it from a speck to its
+            // full size, which it reaches as the zoom ends.
+            ctx.transform_layer_shapes(splash_layer, about(middle, by));
+            let mut layers: Vec<egui::LayerId> = ctx.memory(|m| m.layer_ids().collect());
+            layers.push(egui::LayerId::background());
+            layers.sort_by_key(|l| (l.order, l.id.value()));
+            layers.dedup();
+            for layer in layers.into_iter().filter(|l| *l != splash_layer && *l != content_layer) {
+                ctx.transform_layer_shapes(layer, about(middle, by / most));
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    /// When the pointer comes onto a button, tab, field or other control, short strokes shoot
+    /// out from all round it and are gone a third of a second later. They are spaced evenly
+    /// round its outline; each grows out from its inner end and then is drawn in toward its
+    /// outer end. A stroke that would reach the next thing over is cut short to the gap there,
+    /// so a burst between close neighbours stays in the room it has. A small square control
+    /// throws little diamonds instead.
+    fn hover_burst(&mut self, ctx: &egui::Context) {
+        /// Points between the control's edge and where the strokes start, and the longest a
+        /// stroke grows where there is room.
+        const GAP: f32 = 3.0;
+        const REACH: f32 = 11.0;
+        /// A stroke with less room than this is left out.
+        const SHORTEST: f32 = 3.5;
+        /// Rows of the list, whole panels and cards are too big to burst.
+        const WIDEST: f32 = 360.0;
+        const TALLEST: f32 = 72.0;
+        /// Anything bigger than this round a control is a panel or a scrolling area it shares,
+        /// not a neighbour to keep the lines off.
+        const CONTAINER: Vec2 = Vec2::new(640.0, 160.0);
+        if !self.settings.animations || self.reduced_motion || self.splash.is_some() {
+            (self.hovering, self.hover_burst) = (None, None);
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        let hovered = ctx.interaction_snapshot(|s| s.hovered.clone());
+        let found = ctx.viewport(|viewport| {
+            let widgets = &viewport.this_pass.widgets;
+            let target = hovered
+                .iter()
+                .filter_map(|id| widgets.get(*id))
+                .filter(|w| w.enabled && w.sense.senses_click() && w.layer_id.order != egui::Order::Tooltip)
+                .filter(|w| (6.0..=WIDEST).contains(&w.rect.width()) && (6.0..=TALLEST).contains(&w.rect.height()))
+                // Mostly scrolled out of sight: leave it be.
+                .filter(|w| w.interact_rect.area() >= w.rect.area() * 0.6)
+                .min_by(|a, b| a.rect.area().total_cmp(&b.rect.area()))
+                .copied()?;
+            // What is round it on its layer, apart from what it sits inside.
+            let around: Vec<Rect> = widgets
+                .get_layer(target.layer_id)
+                .filter(|w| w.id != target.id && w.rect.is_positive() && !w.rect.contains_rect(target.rect))
+                .filter(|w| w.rect.width() <= CONTAINER.x && w.rect.height() <= CONTAINER.y)
+                .map(|w| w.rect.expand(1.0))
+                .collect();
+            Some((target, around))
+        });
+        match found {
+            Some((target, around)) if self.hovering != Some(target.id) => {
+                self.hovering = Some(target.id);
+                let rect = target.interact_rect;
+                let perimeter = 2.0 * (rect.width() + rect.height());
+                let small = rect.width() <= 34.0 && rect.height() <= 34.0;
+                let count = if small { 8 } else { ((perimeter / 20.0).round() as usize).clamp(10, 22) };
+                let radius = if small { rect.height() / 2.0 } else { 7.0 };
+                let rays = motion::ring_points(rect.expand(GAP), radius + GAP, count)
+                    .into_iter()
+                    .filter_map(|(from, dir)| {
+                        let room = motion::ray_room(from, dir, REACH + 2.0, &around) - 2.0;
+                        (room >= SHORTEST).then_some((from, dir, room.min(REACH)))
+                    })
+                    .collect();
+                self.hover_burst = Some(HoverBurst { born: now, rays, shapes: small });
+            }
+            Some(_) => {}
+            None => self.hovering = None,
+        }
+        let Some(burst) = &self.hover_burst else { return };
+        let t = (now - burst.born) as f32;
+        if t >= motion::BURST {
+            self.hover_burst = None;
+            return;
+        }
+        // Over popups and tooltips, and never clipped by the panel the control is in.
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("hover burst")));
+        painter.add(if burst.shapes { scenes::shape_burst(&burst.rays, t) } else { scenes::line_burst(&burst.rays, t) });
         ctx.request_repaint();
     }
 
@@ -3872,7 +5019,7 @@ impl App {
             return false;
         }
         let frame = egui::Frame::new()
-            .fill(alpha(theme::CARD, t))
+            .fill(alpha(theme::SURFACE, t))
             .stroke(Stroke::new(1.0_f32, alpha(theme::BORDER, t)))
             .corner_radius(CornerRadius::same(14))
             .inner_margin(Margin::same(22))
@@ -3951,6 +5098,146 @@ impl App {
         });
         if close || dismissed {
             self.confirm_clear = false;
+        }
+    }
+
+    fn clear_skyboxes_dialog(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let mut close = false;
+        let dismissed = self.modal(ctx, "clear-skyboxes", self.confirm_clear_skyboxes, |ui| {
+            ui.label(egui::RichText::new("Clear skyboxes").size(18.0));
+            ui.add_space(4.0);
+            ui.label(format!(
+                "Delete {} matching Rivals skybox {} from the cache?",
+                self.clear_skyboxes_count,
+                if self.clear_skyboxes_count == 1 { "entry" } else { "entries" }
+            ));
+            ui.label(
+                egui::RichText::new("Only the map skies are removed. Roblox downloads them again the next time a match needs them.")
+                    .color(theme::MUTED),
+            );
+            if !self.skybox_rules.is_empty() {
+                ui.add_space(8.0);
+                ui.colored_label(theme::WARN, "These configs change a Rivals skybox and will put their own skies back:");
+                self.skybox_rules_list(ui);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("Skies > Remove Rivals skyboxes keeps deleting them, so that those skies do not come back.")
+                            .color(theme::MUTED)
+                            .small(),
+                    )
+                    .wrap(),
+                );
+            }
+            if self.roblox_running {
+                ui.add_space(4.0);
+                ui.colored_label(theme::WARN, "Roblox is running and may still be using these.");
+            }
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let can_clear = self.clear_skyboxes_count > 0;
+                if ui
+                    .add_enabled(
+                        can_clear,
+                        egui::Button::new(egui::RichText::new("Clear skyboxes").color(Color32::WHITE)).fill(alpha(theme::DANGER, 0.75)),
+                    )
+                    .clicked()
+                    && self.confirm_clear_skyboxes
+                {
+                    actions.push(Action::ClearSkyboxes);
+                    close = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close || dismissed {
+            self.confirm_clear_skyboxes = false;
+        }
+    }
+
+    /// The configs whose rules set a Rivals skybox, one to a line, each with the skies and the first few rules.
+    fn skybox_rules_list(&self, ui: &mut egui::Ui) {
+        const SHOWN: usize = 3;
+        for sky in &self.skybox_rules {
+            let Some(config) = self.configs.get(sky.config) else { continue };
+            let rules = format::count(sky.rules.len(), "rule", "rules");
+            // Which maps each of those skies is on, for whoever knows the maps and not the skies.
+            let maps: Vec<String> = (config::RIVALS_SKIES.iter())
+                .filter(|known| sky.skies.contains(&known.name))
+                .map(|known| format!("{}: {}", known.name, known.maps.join(", ")))
+                .collect();
+            let line = ui.label(format!("•  {}: {rules}, {}", config.name, skies_in_words(&sky.skies)));
+            if !maps.is_empty() {
+                line.on_hover_text(maps.join("\n"));
+            }
+            let mut names: Vec<&str> = sky.rules.iter().take(SHOWN).map(|(_, name)| name.as_str()).collect();
+            let more = sky.rules.len().saturating_sub(SHOWN);
+            let more = (more > 0).then(|| format!("and {more} more"));
+            names.extend(more.as_deref());
+            ui.add(egui::Label::new(egui::RichText::new(format!("     {}", names.join(", "))).color(theme::MUTED).small()).wrap());
+        }
+    }
+
+    fn remove_skyboxes_dialog(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let mut close = false;
+        let dismissed = self.modal(ctx, "remove-rivals-skyboxes", self.confirm_remove_skyboxes, |ui| {
+            ui.label(egui::RichText::new("Remove Rivals skyboxes").size(18.0));
+            ui.add_space(4.0);
+            ui.label(format!(
+                "Fetch all {} Rivals skybox IDs, delete the cache files that hold them, and keep deleting them whenever Roblox downloads them again?",
+                config::RIVALS_SKYBOX_IDS.len()
+            ));
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "This stays on, also after rbxcache is restarted, until you press Revert on the Skies page. \
+                         Revert stops the deleting and puts the deleted skyboxes back.",
+                    )
+                    .color(theme::MUTED),
+                )
+                .wrap(),
+            );
+            if !self.skybox_rules.is_empty() {
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("These configs change a Rivals skybox:").strong());
+                self.skybox_rules_list(ui);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "Their rules stay switched on, but have no skybox to change while this is on. Their skies return on Revert.",
+                        )
+                        .color(theme::MUTED)
+                        .small(),
+                    )
+                    .wrap(),
+                );
+            }
+            if !self.settings.watch {
+                ui.add_space(4.0);
+                ui.colored_label(theme::WARN, "Live is off, so skyboxes will only be deleted when rbxcache starts.");
+            }
+            if self.roblox_running {
+                ui.add_space(4.0);
+                ui.colored_label(theme::WARN, "Roblox is running and may still be using these.");
+            }
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(egui::Button::new(egui::RichText::new("Remove and keep removing").color(Color32::WHITE)).fill(alpha(theme::DANGER, 0.75)))
+                    .clicked()
+                    && self.confirm_remove_skyboxes
+                {
+                    actions.push(Action::RemoveRivalsSkyboxes);
+                    close = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close || dismissed {
+            self.confirm_remove_skyboxes = false;
         }
     }
 
@@ -4095,7 +5382,7 @@ impl App {
                 ui.set_opacity(opacity);
                 let trail_slot = ui.painter().add(Shape::Noop);
                 let rect = egui::Frame::new()
-                    .fill(theme::CARD)
+                    .fill(theme::SURFACE)
                     .stroke(Stroke::new(1.0_f32, alpha(accent, 0.55)))
                     .corner_radius(radius)
                     .inner_margin(Margin::symmetric(16, 10))
@@ -4111,14 +5398,21 @@ impl App {
                     .response
                     .rect;
                 if speed > 0.02 {
-                    ui.painter().set(trail_slot, theme::motion_trail(rect, Vec2::new(0.0, 46.0 * speed), theme::CARD, radius, opacity * speed));
+                    ui.painter().set(trail_slot, theme::motion_trail(rect, Vec2::new(0.0, 46.0 * speed), theme::SURFACE, radius, opacity * speed));
                 }
             });
         ctx.request_repaint();
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
-        if self.confirm_delete || self.confirm_clear || self.confirm_configs || self.show_news || self.account_warn_from.is_some() {
+        if self.confirm_delete
+            || self.confirm_clear
+            || self.confirm_clear_skyboxes
+            || self.confirm_remove_skyboxes
+            || self.confirm_configs
+            || self.show_news
+            || self.account_warn_from.is_some()
+        {
             return;
         }
         let typing = ctx.wants_keyboard_input();
@@ -4202,6 +5496,7 @@ fn chip(ui: &mut egui::Ui, label: &str, count: Option<usize>, colour: Color32, s
     if let Some(number) = number {
         painter.galley(egui::pos2(x, rect.center().y - number.size().y / 2.0), number, theme::MUTED);
     }
+    painter.add(theme::glow_pop(ui.ctx(), rect, CornerRadius::same(14)));
     response
 }
 
@@ -4221,20 +5516,54 @@ fn rule_summary(rule: &config::Rule) -> String {
 
 /// A rounded panel for one thing on a page. `t` is how far its entrance has come.
 fn card(ui: &mut egui::Ui, t: f32, add: impl FnOnce(&mut egui::Ui)) {
+    // Anything above it on the page is set off from it by a wave divider. How far down the
+    // page it is sets the divider's own timing, so no two on a page sway in step, and
+    // scrolling does not change it.
+    let below_something = ui.cursor().top() > ui.min_rect().top() + 4.0;
+    let down_the_page = ui.cursor().top() - ui.max_rect().top();
     ui.scope(|ui| {
         ui.set_opacity(t);
         ui.add_space((1.0 - t) * 16.0);
-        egui::Frame::new()
+        if below_something {
+            wave_divider(ui, down_the_page);
+        }
+        let rect = egui::Frame::new()
             .fill(theme::CARD)
             .stroke(Stroke::new(1.0_f32, theme::BORDER))
             .corner_radius(CornerRadius::same(12))
-            .inner_margin(Margin::same(16))
+            .inner_margin(Margin::symmetric(20, 18))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 add(ui);
-            });
+            })
+            .response
+            .rect;
+        // Over the card, so the outline runs round its edge rather than under the fill.
+        ui.painter().add(theme::glow_pop(ui.ctx(), rect, CornerRadius::same(12)));
     });
-    ui.add_space(4.0);
+    ui.add_space(8.0);
+}
+
+fn divider_clock() -> egui::Id {
+    egui::Id::new("wave divider clock")
+}
+
+/// Two layered waves across the page that keep swaying slowly (Motion Prompt #165), between
+/// two things on it, `down_the_page` points from the top of the page. They hold still when
+/// motion is off.
+fn wave_divider(ui: &mut egui::Ui, down_the_page: f32) {
+    let (_, rect) = ui.allocate_space(Vec2::new(ui.available_width(), scenes::DIVIDER_HEIGHT));
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let sway = ui.ctx().data(|d| d.get_temp::<Option<f32>>(divider_clock())).flatten();
+    // A little over a second further on for each card's height down the page.
+    let offset = down_the_page / 157.0;
+    ui.painter().add(scenes::wave_divider(rect, sway.unwrap_or(0.0) + offset));
+    if sway.is_some() {
+        // They move slowly, so a frame every 33 ms is plenty.
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+    }
 }
 
 /// A card-shaped placeholder with a band of light passing over it, shown while a list loads.
@@ -4278,7 +5607,7 @@ fn versions_list(ui: &mut egui::Ui, versions: &[Version]) {
     for version in versions {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            theme::pill(ui, &version.version, theme::LIME);
+            theme::pill(ui, &version.version, theme::HIGHLIGHT);
             ui.label(egui::RichText::new(&version.date).color(theme::MUTED).small());
         });
         for change in &version.changes {
@@ -4317,14 +5646,18 @@ fn item(ui: &mut egui::Ui, actions: &mut Vec<Action>, enabled: bool, text: &str,
 }
 
 /// The per-entry commands, shared by the Entry menu and the row context menu.
-fn entry_items(ui: &mut egui::Ui, actions: &mut Vec<Action>, one: bool, any: bool, source: bool) {
+/// The Entry menu. `swappable` is false for a 3D entry, which is never replaced.
+fn entry_items(ui: &mut egui::Ui, actions: &mut Vec<Action>, one: bool, any: bool, source: bool, swappable: bool) {
     item(ui, actions, one, "Export...", "Ctrl+E", Action::Export);
     item(ui, actions, any, "Export selected to folder...", "", Action::ExportMany);
     item(ui, actions, one, "Open", "Double-click", Action::OpenExternally);
     ui.separator();
-    item(ui, actions, one, "Replace...", "", Action::Replace);
-    item(ui, actions, one, "Use as replacement source", "", Action::SetSource);
-    item(ui, actions, one && source, "Replace with source", "", Action::ReplaceFromSource);
+    item(ui, actions, one && swappable, "Replace...", "", Action::Replace);
+    item(ui, actions, one && swappable, "Use as replacement source", "", Action::SetSource);
+    item(ui, actions, one && source && swappable, "Replace with source", "", Action::ReplaceFromSource);
+    if one && !swappable {
+        ui.label(egui::RichText::new("3D models are not swapped").small().color(theme::MUTED));
+    }
     item(ui, actions, one, "Copy ID", "", Action::CopyId);
     ui.separator();
     let delete = egui::Button::new(egui::RichText::new("Delete").color(theme::DANGER)).shortcut_text(egui::RichText::new("Del").color(theme::MUTED));
@@ -4345,6 +5678,9 @@ impl eframe::App for App {
         self.poll_lookup(ctx);
         self.poll_add_account(ctx);
         self.poll_avatars(ctx);
+        self.poll_lab(ctx);
+        self.poll_sky(ctx);
+        self.poll_skyboxes(ctx);
         self.poll_config(ctx);
         self.poll_apply(ctx);
         self.poll_clear(ctx);
@@ -4379,6 +5715,16 @@ impl eframe::App for App {
         let mut actions = Vec::new();
         self.shortcuts(ctx, &mut actions);
 
+        // The backdrop goes down first, so it lies under every panel. The panels are
+        // see-through and the middle of the window has no fill, so it shows everywhere.
+        self.step_backdrop(ctx);
+        // The clock the wave dividers between cards sway by; none when motion is off.
+        let sway = (self.settings.animations && !self.reduced_motion).then(|| ctx.input(|i| i.time % 10_000.0) as f32);
+        ctx.data_mut(|d| d.insert_temp(divider_clock(), sway));
+        // Its place is kept now and it is painted last, so the zoom off the loading screen,
+        // which scales everything else on this layer, leaves it filling the window.
+        let backdrop = ctx.layer_painter(egui::LayerId::background()).add(Shape::Noop);
+
         let bar = egui::Frame::new().fill(theme::PANEL).inner_margin(Margin::symmetric(10, 6));
         egui::TopBottomPanel::top("menu").frame(bar).show(ctx, |ui| self.menu_bar(ui, &mut actions));
         egui::TopBottomPanel::bottom("status").frame(bar).show(ctx, |ui| {
@@ -4409,12 +5755,13 @@ impl eframe::App for App {
             .show(ctx, |ui| self.sidebar(ui, &mut actions));
         if !self.tab.lists() {
             egui::CentralPanel::default()
-                .frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin::symmetric(18, 0)))
+                .frame(egui::Frame::new().inner_margin(Margin::symmetric(18, 0)))
                 .show(ctx, |ui| self.page(ui, &mut actions));
         } else {
             egui::TopBottomPanel::top("toolbar").frame(bar.inner_margin(Margin::symmetric(10, 8))).show(ctx, |ui| {
                 self.browse_chips(ui, &mut actions);
-                ui.add_space(2.0);
+                // Room between the rows, for the lines a hovered tab or field sends out.
+                ui.add_space(6.0);
                 self.toolbar(ui, &mut actions);
             });
             egui::SidePanel::right("details")
@@ -4423,7 +5770,7 @@ impl eframe::App for App {
                 .width_range(340.0..=820.0)
                 .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(Margin::same(14)))
                 .show(ctx, |ui| self.details(ui, &mut actions));
-            egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin::symmetric(10, 6))).show(ctx, |ui| {
+            egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(Margin::symmetric(10, 6))).show(ctx, |ui| {
                 // A newly opened tab's list fades in as it settles into place.
                 let t = self.entrance(ui.ctx(), 0);
                 ui.set_opacity(0.2 + 0.8 * t);
@@ -4448,11 +5795,17 @@ impl eframe::App for App {
         }
         self.delete_dialog(ctx, &mut actions);
         self.clear_dialog(ctx, &mut actions);
+        self.clear_skyboxes_dialog(ctx, &mut actions);
+        self.remove_skyboxes_dialog(ctx, &mut actions);
         self.account_warn_dialog(ctx, &mut actions);
         self.configs_dialog(ctx, &mut actions);
         self.news_dialog(ctx);
         self.show_toast(ctx);
+        self.hover_burst(ctx);
         self.show_splash(ctx);
+        let screen = ctx.screen_rect();
+        let backdrop_shape = theme::backdrop_shape(screen, self.backdrop_look(ctx), 1.0);
+        ctx.layer_painter(egui::LayerId::background()).with_clip_rect(screen).set(backdrop, backdrop_shape);
 
         for action in actions {
             self.run_action(action, ctx);
@@ -4889,6 +6242,32 @@ mod tests {
         configs[1].off.clear();
         configs[0].enabled = false;
         assert_eq!(in_force(&configs, &winners), [own("night", &["asset 2", "asset 3", "asset 4"])]);
+    }
+
+    #[test]
+    fn rules_that_set_a_rivals_skybox_are_listed() {
+        let station = config::RIVALS_SKIES.iter().find(|sky| sky.name == "Station").unwrap().faces;
+        let every: Vec<u64> = config::RIVALS_SKYBOX_IDS.to_vec();
+        let mut configs = vec![
+            config("night", &[("back", &station[..1]), ("font", &[5]), ("up", &station[5..]), ("back", &every)]),
+            config("plain", &[("font", &[6])]),
+            config("off", &[("sky", &every)]),
+        ];
+        configs[2].enabled = false;
+        let none = HashSet::new();
+        let found = skybox_rules(&configs, &none);
+        // Only the config that is on and sets a skybox, with the rule that shares a name told apart.
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].config, 0);
+        let keys: Vec<&str> = found[0].rules.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(keys, ["back", "up", "back #2"]);
+        assert_eq!(skies_in_words(&found[0].skies), "every Rivals sky");
+        assert_eq!(skies_in_words(&["Station"]), "the Station sky");
+
+        // A rule that is off is not in use, so it is not listed; with only one face of one sky left, that sky is named.
+        configs[0].off.extend(["up".to_string(), "back #2".to_string()]);
+        let found = skybox_rules(&configs, &none);
+        assert_eq!((found[0].rules.len(), found[0].skies.as_slice()), (1, &["Station"][..]));
     }
 
     #[test]

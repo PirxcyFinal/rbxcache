@@ -12,6 +12,7 @@
 
 use crate::format;
 use crate::originals::Originals;
+use crate::removed::Removed;
 use crate::store::{hex, Entry, Id, Store};
 use crate::texture::{self, Pack};
 use anyhow::{bail, ensure, Context, Result};
@@ -21,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::cell::{OnceCell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -65,6 +66,95 @@ pub struct Rule {
     pub targets: Vec<Target>,
     pub action: Action,
 }
+
+/// One of the skies Rivals has published: what it is called, the maps that use
+/// it, and the asset ID of each face in the order back, down, front, left, right, up.
+pub struct RivalsSky {
+    pub name: &'static str,
+    pub maps: &'static [&'static str],
+    pub faces: [u64; 6],
+}
+
+/// Every Rivals sky, from the game's skybox list.
+pub const RIVALS_SKIES: &[RivalsSky] = &[
+    RivalsSky {
+        name: "Default",
+        maps: &["Battleground", "Default", "Docks", "Iceberg", "Village"],
+        faces: [14147881792, 14147882149, 14147882761, 14147883091, 14147882405, 14147881297],
+    },
+    RivalsSky { name: "Dimension", maps: &["Dimension"], faces: [10196550937, 10196550667, 10196550367, 10196550128, 10196549902, 10196567794] },
+    RivalsSky {
+        name: "Graveyard",
+        maps: &["Graveyard"],
+        faces: [135908632589654, 103020541883227, 135908632589654, 135908632589654, 135908632589654, 72960281658487],
+    },
+    RivalsSky {
+        name: "Graveyard Sudden Death",
+        maps: &["Graveyard Sudden Death", "Zombie Tower"],
+        faces: [84214501374682, 89972436184102, 84214501374682, 84214501374682, 84214501374682, 92138082970751],
+    },
+    RivalsSky { name: "Station", maps: &["Station"], faces: [2108482005, 2108545280, 2108482231, 2108482395, 2108482542, 2108482676] },
+    RivalsSky { name: "Westown", maps: &["Westown"], faces: [12261809766, 12261813110, 12261809766, 12261809766, 12261809766, 12261813678] },
+];
+
+/// The Rivals skies that any of `assets` is a face of, by name, in the order of [`RIVALS_SKIES`].
+pub fn rivals_skies_of(assets: &[u64]) -> Vec<&'static str> {
+    RIVALS_SKIES.iter().filter(|sky| sky.faces.iter().any(|face| assets.contains(face))).map(|sky| sky.name).collect()
+}
+
+/// The Rivals skybox faces a rule sets, or `None` when it sets none. A rule
+/// sets a skybox by naming its asset ID, or by naming one of `holding`, the
+/// cache entries that hold a skybox now; the latter adds no asset ID to the list.
+pub fn skybox_targets(rule: &Rule, holding: &HashSet<Id>) -> Option<Vec<u64>> {
+    let mut faces = Vec::new();
+    let mut by_entry = false;
+    for target in &rule.targets {
+        match target {
+            Target::Asset(id) if RIVALS_SKYBOX_IDS.contains(id) => {
+                if !faces.contains(id) {
+                    faces.push(*id);
+                }
+            }
+            Target::Entry(id) => by_entry |= holding.contains(id),
+            _ => {}
+        }
+    }
+    (by_entry || !faces.is_empty()).then_some(faces)
+}
+
+/// Rivals map skybox asset IDs: every face of every sky in [`RIVALS_SKIES`], once each.
+///
+/// With these, the skies alone can be deleted from the cache or put back,
+/// without emptying everything else.
+pub const RIVALS_SKYBOX_IDS: &[u64] = &[
+    2108482005,
+    2108482231,
+    2108482395,
+    2108482542,
+    2108482676,
+    2108545280,
+    10196549902,
+    10196550128,
+    10196550367,
+    10196550667,
+    10196550937,
+    10196567794,
+    12261809766,
+    12261813110,
+    12261813678,
+    14147881297,
+    14147881792,
+    14147882149,
+    14147882405,
+    14147882761,
+    14147883091,
+    72960281658487,
+    84214501374682,
+    89972436184102,
+    92138082970751,
+    103020541883227,
+    135908632589654,
+];
 
 fn parse_target(v: &Value) -> Option<Target> {
     match v {
@@ -529,7 +619,7 @@ fn fetch(url: &str) -> Result<Vec<u8>> {
     if body.len() as u64 > LIMIT {
         bail!("{url} is larger than {} MB", LIMIT >> 20);
     }
-    Ok(body)
+    crate::integrity::clear_download(None, body).with_context(|| format!("{url} was not used"))
 }
 
 /// What asking for a file came to.
@@ -582,6 +672,7 @@ fn obtain(key: &str, fetch: impl FnOnce() -> Result<Option<Vec<u8>>>) -> Result<
 fn download_asset(id: u64) -> Result<Option<Arc<Vec<u8>>>> {
     obtain(&format!("asset:{id}"), || match crate::resolve::fetch(id, false)? {
         crate::resolve::Fetched::Body(body) => Ok(Some(body)),
+        crate::resolve::Fetched::Withheld(verdict) => Err(crate::integrity::Refused(verdict)).with_context(|| format!("asset {id} was not used")),
         crate::resolve::Fetched::Denied(_) | crate::resolve::Fetched::Gone => Ok(None),
     })
 }
@@ -649,6 +740,86 @@ impl Payload {
         }
         current == &*self.fit(kind, current)
     }
+}
+
+/// Cache entries that currently hold any of `assets`, including every pack of a
+/// matched texture. Assets that were never looked up, or that Roblox has not
+/// downloaded, are skipped. With `originals`, an entry a config has replaced
+/// still counts as the asset it was. The IDs are unique and sorted.
+pub fn entries_of(store: &Store, entries: &[Entry], idmap: &IdMap, assets: &[u64], originals: Option<&Originals>) -> Result<Vec<Id>> {
+    let resolver = Resolver::new(store, entries, idmap, originals);
+    let mut found = BTreeSet::new();
+    for &asset in assets {
+        match resolver.resolve(&Target::Asset(asset)) {
+            Ok(indices) => {
+                for i in indices {
+                    found.insert(entries[i].id);
+                }
+            }
+            Err(Miss::Waiting) | Err(Miss::Refused) => {}
+            Err(Miss::Problem(why)) if why.contains("was never looked up") => {}
+            Err(Miss::Problem(why)) => bail!("{why}"),
+        }
+    }
+    Ok(found.into_iter().collect())
+}
+
+/// Deletes every cache entry that holds one of `assets`; see [`entries_of`].
+/// Returns how many were deleted, how many could not be, and which were.
+pub fn delete_assets(
+    store: &Store,
+    entries: &[Entry],
+    idmap: &IdMap,
+    assets: &[u64],
+    originals: Option<&Originals>,
+) -> Result<(usize, usize, Vec<Id>)> {
+    let ids = entries_of(store, entries, idmap, assets, originals)?;
+    let mut deleted = Vec::new();
+    let mut failed = 0usize;
+    for id in &ids {
+        match store.delete(id) {
+            Ok(()) => deleted.push(*id),
+            Err(_) => failed += 1,
+        }
+    }
+    Ok((deleted.len(), failed, deleted))
+}
+
+/// Deletes every cache entry that holds a Rivals skybox, keeping a copy of each
+/// in `removed` so that it can be put back. `only` limits this to the entries
+/// Roblox has just written. An entry a config has replaced is given its
+/// original back first, so the copy kept is the sky as Roblox wrote it.
+/// Returns the entries that were deleted and how many could not be.
+pub fn remove_skyboxes(
+    store: &Store,
+    entries: &[Entry],
+    idmap: &IdMap,
+    mut originals: Option<&mut Originals>,
+    removed: &mut Removed,
+    only: Option<&HashSet<Id>>,
+) -> Result<(Vec<Id>, usize)> {
+    let ids = entries_of(store, entries, idmap, RIVALS_SKYBOX_IDS, originals.as_deref())?;
+    let mut deleted = Vec::new();
+    let mut failed = 0;
+    let mut forgot = false;
+    for id in ids.iter().filter(|id| only.is_none_or(|only| only.contains(*id))) {
+        let done = match originals.as_deref_mut() {
+            Some(originals) => originals.give_back(store, id).map(|known| forgot |= known),
+            None => Ok(()),
+        }
+        .and_then(|()| removed.remove(store, id));
+        match done {
+            Ok(()) => deleted.push(*id),
+            Err(_) => failed += 1,
+        }
+    }
+    if !deleted.is_empty() {
+        removed.save()?;
+    }
+    if let Some(originals) = originals.filter(|_| forgot) {
+        originals.save()?;
+    }
+    Ok((deleted, failed))
 }
 
 /// The cached entries that hold the same asset as `id`: the entry itself and,
@@ -793,12 +964,24 @@ fn execute(
             Ok(None) => {}
             Ok(Some(payload)) => {
                 let payload = Payload::new(payload);
+                let mut left: Option<(crate::integrity::Verdict, usize)> = None;
                 for &i in &matched {
                     match store.read_body(&entries[i].id) {
-                        Ok(current) if payload.held_by(entries[i].kind, &current) => {}
-                        Ok(_) => plan.writes.push(i),
+                        Ok(current) => {
+                            let target =
+                                crate::integrity::Target { body: &current, asset_type: entries[i].asset_type, category: entries[i].category };
+                            let verdict = crate::integrity::write_verdict(&target, &payload.bytes);
+                            if verdict.refused() {
+                                left.get_or_insert((verdict, 0)).1 += 1;
+                            } else if !payload.held_by(entries[i].kind, &current) {
+                                plan.writes.push(i);
+                            }
+                        }
                         Err(e) => plan.report.notes.push(format!("{}: {e:#}", entries[i].id_hex)),
                     }
+                }
+                if let Some((verdict, n)) = left {
+                    plan.report.notes.push(format!("{} left alone: {}", format::count(n, "entry", "entries"), crate::integrity::Refused(verdict)));
                 }
                 plan.claims = matched;
                 plan.payload = Some(payload);
@@ -872,7 +1055,7 @@ pub fn summarize(reports: &[RuleReport], apply: bool) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -950,7 +1133,7 @@ mod tests {
 
     /// A cache holding these bodies as wrapped entries, in a fresh folder under
     /// the temp directory. The entries get the IDs 1, 2, ... repeated 16 times.
-    fn cache_of(tag: &str, bodies: &[&[u8]]) -> (PathBuf, Vec<Id>) {
+    pub(crate) fn cache_of(tag: &str, bodies: &[&[u8]]) -> (PathBuf, Vec<Id>) {
         let dir = std::env::temp_dir().join(format!("rbxcache-config-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("rbx-storage")).unwrap();
@@ -1030,6 +1213,60 @@ mod tests {
             assert!(decoded.pixels[1] > 240 && decoded.pixels[0] < 12, "pack of side {side} holds {:?}", &decoded.pixels[..4]);
         }
         assert_eq!(store.read_body(&ids[2]).unwrap(), other);
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn three_d_models_are_never_swapped() {
+        let part: &[u8] =
+            br#"<roblox version="4"><Item class="Part" referent="RBX0"><Properties><string name="Name">Wall</string></Properties></Item></roblox>"#;
+        let walk: &[u8] = br#"<roblox version="4"><Item class="KeyframeSequence" referent="RBX0"><Properties><string name="Name">Walk</string></Properties></Item></roblox>"#;
+        let picture = png([1, 2, 3, 255]);
+        let (dir, ids) = cache_of("models", &[b"version 2.00\n1\n[0,0,0]", &picture, part, walk]);
+        let (mesh, image, model, animation) = (ids[0], ids[1], ids[2], ids[3]);
+        // Collision data is kept unwrapped, in its own category.
+        let physics = [9u8; 16];
+        let db = rusqlite::Connection::open(dir.join("rbx-storage.db")).unwrap();
+        db.execute(
+            "INSERT INTO files (id, content, size, category) VALUES (?1, ?2, 4, 22)",
+            rusqlite::params![&physics[..], &b"\x01\x02\x03\x04"[..]],
+        )
+        .unwrap();
+        drop(db);
+        let store = Store::open(&dir, true).unwrap();
+        let other = png([200, 100, 50, 255]);
+        let refused = |result: Result<Entry>| result.is_err_and(|e| crate::integrity::is_refusal(&e));
+        // Nothing goes over a mesh, a model or collision data, not even nothing.
+        for id in [mesh, model, physics] {
+            let before = store.read(&id).unwrap();
+            assert!(refused(store.replace_body(&id, &other)), "{}", hex(&id));
+            assert!(refused(store.replace_body(&id, b"")), "{}", hex(&id));
+            assert_eq!(store.read(&id).unwrap(), before);
+        }
+        // Nothing 3D goes into anything else.
+        for body in [&b"version 4.00\n\x18\x00"[..], part, b"glTF\x02\x00\x00\x00", b"Kaydara FBX Binary  \x00"] {
+            assert!(refused(store.replace_body(&image, body)));
+        }
+        assert_eq!(store.read_body(&image).unwrap(), picture);
+        // Pictures, and animations, are swapped as before, with a checksum Roblox accepts.
+        store.replace_body(&image, &other).unwrap();
+        let (raw, header) = store.read_parsed(&image).unwrap();
+        let header = header.unwrap();
+        assert_eq!(&raw[header.body_offset..], &other[..]);
+        assert_eq!(header.body_sum, format::checksum(&other));
+        store.replace_body(&animation, walk).unwrap();
+        // A rule leaves the 3D entries alone and says why, and writes the rest.
+        let rules = [Rule { name: "all".into(), targets: ids.iter().map(|id| Target::Entry(*id)).collect(), action: Action::Remove }];
+        let entries = store.list(|_, _| {}).unwrap();
+        let reports = run(&store, &entries, &IdMap::default(), &rules, true, None, None);
+        assert_eq!(reports[0].changed, 2, "{:?}", reports[0].notes);
+        assert!(reports[0].notes.iter().any(|n| n.contains("2 entries left alone") && n.contains("3D")), "{:?}", reports[0].notes);
+        assert!(store.read_body(&mesh).unwrap().starts_with(b"version 2.00"));
+        assert_eq!(store.read_body(&model).unwrap(), part);
+        // A removed picture becomes a clear one of the same size; a removed animation, nothing.
+        assert_ne!(store.read_body(&image).unwrap(), other);
+        assert!(store.read_body(&animation).unwrap().is_empty());
         drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1209,6 +1446,131 @@ mod tests {
     fn accepts_a_bare_list_and_rejects_garbage() {
         assert_eq!(parse(r#"[{"replace_ids": [5], "mode": "remove"}]"#, Path::new(".")).unwrap().len(), 1);
         assert!(parse("not json", Path::new(".")).is_err());
+    }
+
+    #[test]
+    fn clearing_skyboxes_deletes_only_those_entries() {
+        let (dir, ids) = cache_of("skyboxes", &[b"sky-a", b"sky-b", b"keep-me"]);
+        let mut idmap = IdMap::default();
+        idmap.add(RIVALS_SKYBOX_IDS[0], fingerprint(b"sky-a"));
+        idmap.add(RIVALS_SKYBOX_IDS[1], fingerprint(b"sky-b"));
+        let store = Store::open(&dir, true).unwrap();
+        let entries = store.list(|_, _| {}).unwrap();
+        let matched = entries_of(&store, &entries, &idmap, RIVALS_SKYBOX_IDS, None).unwrap();
+        assert_eq!(matched, vec![ids[0], ids[1]]);
+        let (deleted, failed, _) = delete_assets(&store, &entries, &idmap, RIVALS_SKYBOX_IDS, None).unwrap();
+        assert_eq!((deleted, failed), (2, 0));
+        let left: Vec<_> = store.list(|_, _| {}).unwrap().into_iter().map(|e| e.id).collect();
+        assert_eq!(left, vec![ids[2]]);
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn skyboxes_are_removed_as_they_arrive_and_put_back_on_revert() {
+        let (dir, ids) = cache_of("skybox-remove", &[b"OggS station sky", b"OggS westown sky", b"OggS a gunshot"]);
+        std::fs::write(dir.join("night.ogg"), b"OggS a config's night sky").unwrap();
+        let (station, westown) = (RIVALS_SKYBOX_IDS[0], RIVALS_SKYBOX_IDS[1]);
+        let mut idmap = IdMap::default();
+        idmap.add(station, fingerprint(b"OggS station sky"));
+        idmap.add(westown, fingerprint(b"OggS westown sky"));
+        // A config has already put its own sky over the first.
+        let rules = [Rule { name: "night".into(), targets: vec![Target::Asset(station)], action: Action::Local(dir.join("night.ogg")) }];
+        let store = Store::open(&dir, true).unwrap();
+        let mut originals = originals_in(&dir);
+        sync(&store, &store.list(|_, _| {}).unwrap(), &idmap, &rules, &mut originals);
+        assert_eq!(store.read_body(&ids[0]).unwrap(), b"OggS a config's night sky");
+
+        // Only what Roblox has just written is looked at: here, the second sky.
+        let mut removed = Removed::load(dir.join("removed")).unwrap();
+        let entries = store.list(|_, _| {}).unwrap();
+        let just_written = HashSet::from([ids[1], ids[2]]);
+        let (deleted, failed) = remove_skyboxes(&store, &entries, &idmap, Some(&mut originals), &mut removed, Some(&just_written)).unwrap();
+        assert_eq!((deleted, failed), (vec![ids[1]], 0));
+        // Then all of them: the one the config replaced goes too, and nothing else does.
+        let entries = store.list(|_, _| {}).unwrap();
+        let (deleted, failed) = remove_skyboxes(&store, &entries, &idmap, Some(&mut originals), &mut removed, None).unwrap();
+        assert_eq!((deleted, failed), (vec![ids[0]], 0));
+        let left: Vec<_> = store.list(|_, _| {}).unwrap().into_iter().map(|e| e.id).collect();
+        assert_eq!(left, vec![ids[2]]);
+        // Nothing is left to delete until Roblox downloads a sky again.
+        let (deleted, _) = remove_skyboxes(&store, &store.list(|_, _| {}).unwrap(), &idmap, Some(&mut originals), &mut removed, None).unwrap();
+        assert!(deleted.is_empty());
+
+        // Reverting puts both back as Roblox wrote them, not as the config left them.
+        let mut removed = Removed::load(dir.join("removed")).unwrap();
+        let (restored, failed) = removed.restore_all(&store);
+        assert_eq!((restored.len(), failed), (2, 0));
+        assert_eq!(store.read_body(&ids[0]).unwrap(), b"OggS station sky");
+        assert_eq!(store.read_body(&ids[1]).unwrap(), b"OggS westown sky");
+        // The config then sets its sky again, as it does for anything Roblox writes.
+        let mut originals = originals_in(&dir);
+        let (reports, _) = sync(&store, &store.list(|_, _| {}).unwrap(), &idmap, &rules, &mut originals);
+        assert_eq!(reports[0].changed, 1);
+        assert_eq!(store.read_body(&ids[0]).unwrap(), b"OggS a config's night sky");
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_skybox_ids_are_the_faces_of_the_skies() {
+        let mut faces: Vec<u64> = RIVALS_SKIES.iter().flat_map(|sky| sky.faces).collect();
+        faces.sort_unstable();
+        faces.dedup();
+        assert_eq!(faces, RIVALS_SKYBOX_IDS);
+        assert_eq!(rivals_skies_of(&[2108482005, 12261813678]), ["Station", "Westown"]);
+        assert!(rivals_skies_of(&[5]).is_empty());
+    }
+
+    #[test]
+    fn rules_that_set_a_skybox_are_found() {
+        // The shape of a pack that reskins every Rivals sky: one rule a face, each naming that face of several skies.
+        let text = r#"{"replacement_rules": [
+            {"name": "SBK -> night sky", "replace_ids": [2108482005, 14147881792, 135908632589654, 84214501374682, 10196550937, 12261809766], "mode": "cdn", "cdn_url": "https://example.com/side.png"},
+            {"name": "SUP -> night sky", "replace_ids": [14147881297, 72960281658487, 92138082970751, 2108482676, 10196567794, 12261813678], "mode": "cdn", "cdn_url": "https://example.com/up.png"},
+            {"name": "font", "replace_ids": [12187365364], "mode": "id", "with_id": 99},
+            {"name": "by entry", "replace_ids": ["07070707070707070707070707070707"], "mode": "remove"}
+        ]}"#;
+        let rules = parse(text, Path::new(".")).unwrap();
+        let none = HashSet::new();
+        let found: Vec<Option<usize>> = rules.iter().map(|rule| skybox_targets(rule, &none).map(|faces| faces.len())).collect();
+        assert_eq!(found, [Some(6), Some(6), None, None]);
+        let faces: Vec<u64> = rules.iter().filter_map(|rule| skybox_targets(rule, &none)).flatten().collect();
+        assert_eq!(rivals_skies_of(&faces).len(), RIVALS_SKIES.len());
+        // A rule that names the cache entry a skybox is in sets it too.
+        let holding = HashSet::from([[7u8; 16]]);
+        assert_eq!(skybox_targets(&rules[3], &holding), Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_replaced_skybox_is_still_found_and_can_be_put_back() {
+        let (dir, ids) = cache_of("skybox-revert", &[b"OggS the real sky", b"OggS something else"]);
+        std::fs::write(dir.join("night.ogg"), b"OggS a config's night sky").unwrap();
+        let sky = RIVALS_SKYBOX_IDS[0];
+        let mut idmap = IdMap::default();
+        idmap.add(sky, fingerprint(b"OggS the real sky"));
+        let rules = [Rule { name: "night".into(), targets: vec![Target::Asset(sky)], action: Action::Local(dir.join("night.ogg")) }];
+        let store = Store::open(&dir, true).unwrap();
+        let mut originals = originals_in(&dir);
+        let entries = store.list(|_, _| {}).unwrap();
+        sync(&store, &entries, &idmap, &rules, &mut originals);
+        assert_eq!(store.read_body(&ids[0]).unwrap(), b"OggS a config's night sky");
+
+        // Its content is the config's now, so on content alone it is no longer the skybox.
+        let entries = store.list(|_, _| {}).unwrap();
+        assert!(entries_of(&store, &entries, &idmap, RIVALS_SKYBOX_IDS, None).unwrap().is_empty());
+        assert_eq!(entries_of(&store, &entries, &idmap, RIVALS_SKYBOX_IDS, Some(&originals)).unwrap(), vec![ids[0]]);
+
+        // With the rule gone the real sky is put back, and is found either way.
+        let (_, restored) = sync(&store, &entries, &idmap, &[], &mut originals);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(store.read_body(&ids[0]).unwrap(), b"OggS the real sky");
+        let entries = store.list(|_, _| {}).unwrap();
+        assert_eq!(entries_of(&store, &entries, &idmap, RIVALS_SKYBOX_IDS, None).unwrap(), vec![ids[0]]);
+        let (deleted, failed, _) = delete_assets(&store, &entries, &idmap, RIVALS_SKYBOX_IDS, Some(&originals)).unwrap();
+        assert_eq!((deleted, failed), (1, 0));
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

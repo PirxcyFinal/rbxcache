@@ -3787,7 +3787,7 @@ dependencies = [
 
 [[package]]
 name = "rbxcache"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -3797,6 +3797,7 @@ dependencies = [
  "eframe",
  "egui_extras",
  "image",
+ "libloading 0.8.9",
  "md-5",
  "open",
  "raw-window-handle",

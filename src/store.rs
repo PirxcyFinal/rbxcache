@@ -1,6 +1,7 @@
 //! Access to the cache: the `rbx-storage.db` index and the `rbx-storage` blob folder.
 
 use crate::format::{self, Header};
+use crate::integrity;
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection, OpenFlags};
 use std::io::Read;
@@ -46,6 +47,18 @@ pub struct Stamp {
     pub size: i64,
     pub hits: i64,
     pub atime: i64,
+}
+
+/// An entry as it was stored, for putting it back after it is deleted.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Kept {
+    /// The stored bytes, wrapper included.
+    pub raw: Vec<u8>,
+    pub hits: i64,
+    pub atime: i64,
+    pub category: i64,
+    pub score: i64,
+    pub ttl: i64,
 }
 
 /// The columns of a `files` row that do not depend on the content.
@@ -403,6 +416,56 @@ impl Store {
         Ok(())
     }
 
+    /// Everything needed to put an entry back after it is deleted: its stored
+    /// bytes, wrapper included, and the columns of its row.
+    pub fn keep(&self, id: &Id) -> Result<Kept> {
+        let raw = self.read(id)?;
+        let row = self.conn.query_row("SELECT hits, atime, category, score, ttl FROM files WHERE id = ?1", params![&id[..]], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?))
+        });
+        let (hits, atime, category, score, ttl) = self.lookup(id, row)?;
+        Ok(Kept { raw, hits, atime, category, score, ttl })
+    }
+
+    /// Puts back an entry that was deleted, as [`Store::keep`] saved it. An ID
+    /// that is in the cache again was written by Roblox since and is left
+    /// alone: `None` then. The index is only committed once the blob file is in place.
+    pub fn put_back(&self, id: &Id, kept: &Kept) -> Result<Option<Entry>> {
+        let there = self.conn.query_row("SELECT 1 FROM files WHERE id = ?1", params![&id[..]], |_| Ok(()));
+        match there {
+            Ok(()) => return Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => return Err(e).with_context(|| format!("reading entry {} from the index", hex(id))),
+        }
+        // What is put back is held to the same rules as any other write.
+        let header = format::parse_header(&kept.raw);
+        let body = header.as_ref().map_or(&kept.raw[..], |h| &kept.raw[h.body_offset.min(kept.raw.len())..]);
+        let target =
+            integrity::Target { body: b"", asset_type: header.as_ref().and_then(|h| format::asset_type_id(&h.headers)), category: kept.category };
+        let raw = integrity::permit(&target, body)?.seal(&kept.raw);
+        let kept = &Kept { raw, ..*kept };
+        let path = self.blob_path(id);
+        let inline = kept.raw.len() <= INLINE_MAX;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO files (id, content, size, hits, atime, category, score, ttl) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![&id[..], inline.then_some(&kept.raw), kept.raw.len() as i64, kept.hits, kept.atime, kept.category, kept.score, kept.ttl],
+        )?;
+        if !inline {
+            std::fs::create_dir_all(path.parent().expect("blob path has a parent"))?;
+            let tmp = path.with_extension("tmp");
+            let written = std::fs::write(&tmp, &kept.raw)
+                .with_context(|| format!("writing {}", tmp.display()))
+                .and_then(|()| std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display())));
+            if let Err(e) = written {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        }
+        tx.commit()?;
+        self.entry(id).map(Some)
+    }
+
     /// Swaps the payload of an entry for `body`, keeping the wrapper (URL, status,
     /// headers). The index is only committed once the blob file is in place.
     pub fn replace_body(&self, id: &Id, body: &[u8]) -> Result<Entry> {
@@ -410,9 +473,19 @@ impl Store {
             bail!("replacement is too large");
         }
         let (old, header) = self.read_parsed(id)?;
+        let category: i64 = self
+            .conn
+            .query_row("SELECT category FROM files WHERE id = ?1", params![&id[..]], |row| row.get(0))
+            .with_context(|| format!("reading entry {} from the index", hex(id)))?;
+        let target = integrity::Target {
+            body: header.as_ref().map_or(&old[..], |h| &old[h.body_offset.min(old.len())..]),
+            asset_type: header.as_ref().and_then(|h| format::asset_type_id(&h.headers)),
+            category,
+        };
+        let permit = integrity::permit(&target, body)?;
         let new = match &header {
-            Some(h) => format::with_new_body(&old, h, body),
-            None => body.to_vec(),
+            Some(h) => format::with_new_body(&old, h, body, &permit),
+            None => permit.seal(body),
         };
         let path = self.blob_path(id);
         let tx = self.conn.unchecked_transaction()?;
@@ -520,6 +593,31 @@ fn close_roblox() {
     for cmd in &mut commands {
         let _ = cmd.output();
     }
+}
+
+/// Closes the Roblox game client if it is open (Studio is left alone) and waits for it to
+/// exit. Returns whether a client was running.
+#[cfg(windows)]
+pub fn close_player() -> bool {
+    use std::os::windows::process::CommandExt;
+    let player_running = || {
+        let mut cmd = std::process::Command::new("tasklist");
+        cmd.args(["/FI", "IMAGENAME eq RobloxPlayerBeta.exe", "/FO", "CSV", "/NH"]).creation_flags(0x0800_0000);
+        cmd.output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).to_ascii_lowercase().contains("robloxplayerbeta"))
+    };
+    if !player_running() {
+        return false;
+    }
+    close_roblox();
+    for _ in 0..40 {
+        if !player_running() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+    // Let Windows release the shader pack the client had open.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    true
 }
 
 /// Deletes `path`, retrying for a few seconds while another process still has it open.

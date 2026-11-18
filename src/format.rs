@@ -8,6 +8,8 @@
 //! ```
 //! Both sums are [`checksum`] of the bytes they cover.
 
+use crate::integrity::Permit;
+
 pub const MAGIC: &[u8; 4] = b"RBXH";
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -72,25 +74,25 @@ pub fn wrapper_len(buf: &[u8]) -> Option<usize> {
 }
 
 /// The checksum Roblox stores for the response headers and for the body:
-/// XXH32 with a fixed seed, and zero for empty data.
+/// XXH32 with a fixed key (see [`crate::integrity::key`]), and zero for empty data.
 pub fn checksum(data: &[u8]) -> u32 {
-    const SEED: u32 = 0x00c4_e564;
     if data.is_empty() {
         0
     } else {
-        xxhash_rust::xxh32::xxh32(data, SEED)
+        xxhash_rust::xxh32::xxh32(data, crate::integrity::key())
     }
 }
 
 /// Rebuilds a wrapped blob around a new body, keeping URL, status and headers
-/// and updating the body's length and checksum.
-pub fn with_new_body(old: &[u8], header: &Header, body: &[u8]) -> Vec<u8> {
+/// and updating the body's length and checksum. `permit` is the leave to write
+/// this body into this entry.
+pub fn with_new_body(old: &[u8], header: &Header, body: &[u8], permit: &Permit) -> Vec<u8> {
     let mut out = Vec::with_capacity(header.body_offset + body.len());
     out.extend_from_slice(&old[..header.body_offset]);
     let len_at = 12 + header.url_len + 13;
     out[len_at..len_at + 4].copy_from_slice(&(body.len() as u32).to_le_bytes());
-    out[len_at + 4..len_at + 8].copy_from_slice(&checksum(body).to_le_bytes());
-    out.extend_from_slice(body);
+    out[len_at + 4..len_at + 8].copy_from_slice(&permit.checksum(body).to_le_bytes());
+    out.extend_from_slice(&permit.seal(body));
     out
 }
 
@@ -347,13 +349,16 @@ mod tests {
     fn replaces_body() {
         let old = blob("https://example.com/x", 200, "a: b\r\n", b"old body");
         let h = parse_header(&old).unwrap();
-        let new = with_new_body(&old, &h, b"a much longer new body");
+        let target = crate::integrity::Target { body: b"old body", asset_type: None, category: 10 };
+        let permit = crate::integrity::permit(&target, b"a much longer new body").unwrap();
+        let new = with_new_body(&old, &h, b"a much longer new body", &permit);
         let h2 = parse_header(&new).unwrap();
         assert_eq!(&new[h2.body_offset..], b"a much longer new body");
         assert_eq!(h2.body_len, 22);
         assert_eq!((h2.url.as_str(), h2.status, h2.headers.as_str()), ("https://example.com/x", 200, "a: b\r\n"));
         assert_eq!((h2.header_sum, h2.body_sum), (h.header_sum, checksum(b"a much longer new body")));
-        assert_eq!(parse_header(&with_new_body(&old, &h, b"")).unwrap().body_sum, 0);
+        let permit = crate::integrity::permit(&target, b"").unwrap();
+        assert_eq!(parse_header(&with_new_body(&old, &h, b"", &permit)).unwrap().body_sum, 0);
     }
 
     #[test]

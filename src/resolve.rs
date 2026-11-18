@@ -43,12 +43,9 @@ const WORKERS: usize = 8;
 /// The added account's session cookie. With it, an asset Roblox will not give
 /// a guest is asked for again, as that account would see it.
 static AUTH: Mutex<Option<String>> = Mutex::new(None);
-/// The place ID of the game last joined. Tried first when a signed-in request
-/// is refused, before the creator's other games.
+/// The place ID of the game last joined, named when a signed-in request is
+/// refused, the way that game's own client would.
 static PLACE: Mutex<Option<u64>> = Mutex::new(None);
-/// Games already listed for a creator, and the place that last unlocked one of
-/// their assets. Shared across the lookup threads so a creator is listed once.
-static PLACES: std::sync::LazyLock<Mutex<PlaceBook>> = std::sync::LazyLock::new(|| Mutex::new(PlaceBook::new()));
 
 /// IDs a guest was refused that have been asked for again since an account was added.
 static RETRIED: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
@@ -86,6 +83,8 @@ pub fn set_place(place: Option<u64>) {
 
 pub enum Fetched {
     Body(Vec<u8>),
+    /// A 3D model or mesh: stopped and thrown away (see [`crate::integrity`]).
+    Withheld(crate::integrity::Verdict),
     /// The asset needs a login (401) or a permission the current account does not have (403).
     Denied(u16),
     /// There is no such asset.
@@ -93,11 +92,11 @@ pub enum Fetched {
 }
 
 /// Downloads an asset by ID. `ktx2` asks for the KTX2 rendition the client
-/// prefers for images. The request is sent with the added account's cookie
-/// when one is set, so Roblox answers as that account. When it still refuses
-/// a signed-in request, the request is repeated naming a game: the one last
-/// joined, then each game of the asset's creator, until one hands the file
-/// out. That is how a sound can be fetched without having joined its game.
+/// prefers for images. The request carries the added account's cookie when one
+/// is set, so Roblox answers as that account; and when that is still refused,
+/// it is repeated once naming the game last joined, the context the real client
+/// sends for the game it is in. Assets a game keeps to itself, most sounds
+/// among them, stay refused: those are matched by ear instead (see the IDs tab).
 pub fn fetch(id: u64, ktx2: bool) -> Result<Fetched> {
     let mut url = format!("https://assetdelivery.roblox.com/v1/asset/?id={id}");
     if ktx2 {
@@ -105,185 +104,16 @@ pub fn fetch(id: u64, ktx2: bool) -> Result<Fetched> {
         url.push_str(KTX2_FIRST);
     }
     let first = get(id, &url, None)?;
-    if matches!(first, Fetched::Denied(_)) && signed_in() {
-        return with_a_place(id, &url, first);
+    // Signed in but refused: ask once more as the game last joined would, if the logs named one.
+    match (first, signed_in().then(last_place).flatten()) {
+        (Fetched::Denied(_), Some(place)) => get(id, &url, Some(place)),
+        (first, _) => Ok(first),
     }
-    Ok(first)
 }
 
 /// The place ID of the game last joined, if the logs named one.
 fn last_place() -> Option<u64> {
     PLACE.lock().ok().and_then(|place| *place)
-}
-
-/// Who made an asset. `kind` is 1 for a user and 2 for a group, as Roblox numbers them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct Creator {
-    id: u64,
-    kind: u8,
-}
-
-/// Places already asked about, per creator.
-struct PlaceBook {
-    listed: HashMap<Creator, Vec<u64>>,
-    /// The place that last unlocked an asset of this creator. Tried first next time.
-    worked: HashMap<Creator, u64>,
-}
-
-impl PlaceBook {
-    fn new() -> Self {
-        Self { listed: HashMap::new(), worked: HashMap::new() }
-    }
-}
-
-/// Page sizes tried, largest first. A smaller one is only used when the larger
-/// one lists nothing. At most this many of a creator's games are tried.
-const PAGE_LIMITS: [u32; 3] = [50, 25, 10];
-const MAX_PLACES: usize = 300;
-
-/// Asks again naming games until one hands the file out. `first` is what the
-/// request without a place was answered with, and is what comes back when none do.
-fn with_a_place(id: u64, url: &str, first: Fetched) -> Result<Fetched> {
-    let creator = creator_of(id);
-    let remembered = creator.and_then(place_that_worked);
-    let listed = creator.map(places_of).unwrap_or_default();
-    for place in place_order(last_place(), remembered, &listed) {
-        if let Fetched::Body(body) = get(id, url, Some(place))? {
-            if let Some(creator) = creator {
-                remember_place(creator, place);
-            }
-            return Ok(Fetched::Body(body));
-        }
-    }
-    Ok(first)
-}
-
-/// The places to name, in the order worth trying, with no repeats.
-fn place_order(last_joined: Option<u64>, remembered: Option<u64>, listed: &[u64]) -> Vec<u64> {
-    let mut order = Vec::new();
-    let mut seen = HashSet::new();
-    for place in last_joined.into_iter().chain(remembered).chain(listed.iter().copied()) {
-        if seen.insert(place) {
-            order.push(place);
-        }
-    }
-    order
-}
-
-fn place_that_worked(creator: Creator) -> Option<u64> {
-    PLACES.lock().ok().and_then(|book| book.worked.get(&creator).copied())
-}
-
-fn remember_place(creator: Creator, place: u64) {
-    if let Ok(mut book) = PLACES.lock() {
-        book.worked.insert(creator, place);
-    }
-}
-
-/// The creator's games. Listed once per creator and remembered for the rest of the run.
-fn places_of(creator: Creator) -> Vec<u64> {
-    if let Ok(book) = PLACES.lock() {
-        if let Some(places) = book.listed.get(&creator) {
-            return places.clone();
-        }
-    }
-    let places = list_places(creator);
-    if let Ok(mut book) = PLACES.lock() {
-        // Another thread may have listed them while this one was asking.
-        book.listed.entry(creator).or_insert(places).clone()
-    } else {
-        places
-    }
-}
-
-/// Every root place of a creator's games, up to [`MAX_PLACES`].
-fn list_places(creator: Creator) -> Vec<u64> {
-    let mut places = Vec::new();
-    let mut seen = HashSet::new();
-    for limit in PAGE_LIMITS {
-        let before = places.len();
-        let pages = MAX_PLACES.div_ceil(limit as usize);
-        for base in game_list_urls(creator, limit) {
-            let mut cursor = String::new();
-            for _ in 0..pages.max(1) {
-                if places.len() >= MAX_PLACES {
-                    return places;
-                }
-                let url = if cursor.is_empty() { base.clone() } else { format!("{base}&cursor={}", query_escape(&cursor)) };
-                let Some(page) = get_json(&url, false) else { break };
-                for id in place_ids_in(&page) {
-                    if seen.insert(id) {
-                        places.push(id);
-                    }
-                }
-                cursor = page["nextPageCursor"].as_str().unwrap_or("").to_string();
-                if cursor.is_empty() {
-                    break;
-                }
-            }
-        }
-        // A page size that listed something is enough; the smaller ones are only for when it did not.
-        if places.len() > before {
-            break;
-        }
-    }
-    places
-}
-
-/// The games.roblox.com addresses that list a creator's games at this page size.
-fn game_list_urls(creator: Creator, limit: u32) -> Vec<String> {
-    match creator.kind {
-        1 => vec![
-            format!("https://games.roblox.com/v2/users/{}/games?sortOrder=Asc&limit={limit}", creator.id),
-            format!("https://games.roblox.com/v2/users/{}/games?accessFilter=Public&sortOrder=Asc&limit={limit}", creator.id),
-        ],
-        2 => vec![
-            format!("https://games.roblox.com/v2/groups/{}/gamesV2?accessFilter=2&limit={limit}&sortOrder=Asc", creator.id),
-            format!("https://games.roblox.com/v2/groups/{}/gamesV2?accessFilter=1&limit={limit}&sortOrder=Asc", creator.id),
-        ],
-        _ => Vec::new(),
-    }
-}
-
-/// Who published an asset, from Roblox's catalogue. Needs the signed-in cookie.
-fn creator_of(asset: u64) -> Option<Creator> {
-    let body = get_json(&format!("https://develop.roblox.com/v1/assets?assetIds={asset}"), true)?;
-    creator_from(&body)
-}
-
-fn creator_from(body: &serde_json::Value) -> Option<Creator> {
-    let item = body.get("data")?.get(0)?;
-    let creator = &item["creator"];
-    let id = creator["targetId"].as_u64().or_else(|| item["creatorTargetId"].as_u64())?;
-    let kind = creator["typeId"].as_u64().or_else(|| item["creatorType"].as_u64())?;
-    matches!(kind, 1 | 2).then_some(Creator { id, kind: kind as u8 })
-}
-
-/// The root place ID of each game on a games.roblox.com page.
-fn place_ids_in(page: &serde_json::Value) -> Vec<u64> {
-    page["data"].as_array().map(|games| games.iter().filter_map(|game| game["rootPlace"]["id"].as_u64()).collect()).unwrap_or_default()
-}
-
-fn query_escape(text: &str) -> String {
-    let mut out = String::new();
-    for byte in text.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
-}
-
-/// A JSON document, or `None` when Roblox did not send one. `cookie` sends the
-/// signed-in account's cookie, which the catalogue requires and the games list does not.
-fn get_json(url: &str, cookie: bool) -> Option<serde_json::Value> {
-    let mut request = ureq::get(url).set("User-Agent", "rbxcache").set("Accept", "application/json").timeout(Duration::from_secs(15));
-    if cookie {
-        let auth = AUTH.lock().ok().and_then(|auth| auth.clone())?;
-        request = request.set("Cookie", &format!(".ROBLOSECURITY={auth}"));
-    }
-    serde_json::from_reader(request.call().ok()?.into_reader()).ok()
 }
 
 /// One request for an asset, with the added account's cookie when one is set
@@ -298,10 +128,20 @@ fn get(id: u64, url: &str, place: Option<u64>) -> Result<Fetched> {
     }
     match request.call() {
         Ok(response) => {
+            let asset_type = response.header("roblox-assettypeid").and_then(|v| v.trim().parse().ok());
+            let mut reader = response.into_reader().take(LIMIT + 1);
+            // The first bytes say whether it is a mesh, so most 3D assets stop before the rest comes.
             let mut body = Vec::new();
-            response.into_reader().take(LIMIT + 1).read_to_end(&mut body).with_context(|| format!("downloading asset {id}"))?;
+            reader.by_ref().take(64).read_to_end(&mut body).with_context(|| format!("downloading asset {id}"))?;
+            if let Err(refused) = crate::integrity::screen_start(asset_type, &body) {
+                return Ok(Fetched::Withheld(refused.0));
+            }
+            reader.read_to_end(&mut body).with_context(|| format!("downloading asset {id}"))?;
             anyhow::ensure!(body.len() as u64 <= LIMIT, "asset {id} is larger than {} MB", LIMIT >> 20);
-            Ok(Fetched::Body(body))
+            Ok(match crate::integrity::clear_download(asset_type, body) {
+                Ok(body) => Fetched::Body(body),
+                Err(refused) => Fetched::Withheld(refused.0),
+            })
         }
         Err(ureq::Error::Status(code @ (401 | 403), _)) => Ok(Fetched::Denied(code)),
         Err(ureq::Error::Status(400 | 404, _)) => Ok(Fetched::Gone),
@@ -321,6 +161,8 @@ pub enum Outcome {
     NotCached,
     Denied(u16),
     Gone,
+    /// A 3D model or mesh, which rbxcache does not download.
+    Withheld,
     Failed(String),
 }
 
@@ -342,6 +184,7 @@ impl std::fmt::Display for Outcome {
             Outcome::Denied(REMEMBERED) => write!(f, "not available without a login (remembered)"),
             Outcome::Denied(_) => write!(f, "not available to the public"),
             Outcome::Gone => write!(f, "no such asset"),
+            Outcome::Withheld => write!(f, "a 3D model, which rbxcache does not download"),
             Outcome::Failed(e) => write!(f, "lookup failed: {e}"),
         }
     }
@@ -494,6 +337,7 @@ pub fn identify(
                 idmap.assets.entry(id.to_string()).or_default();
                 Outcome::Gone
             }
+            Ok(Fetched::Withheld(_)) => Outcome::Withheld,
             Err(e) => Outcome::Failed(format!("{e:#}")),
         };
         outcomes.insert(id, outcome);
@@ -517,6 +361,7 @@ pub fn identify(
                 idmap.add(id, original);
                 Outcome::NotCached
             }
+            Ok(Fetched::Withheld(_)) => Outcome::Withheld,
             Err(e) => Outcome::Failed(format!("{e:#}")),
         };
         outcomes.insert(id, outcome);
@@ -572,36 +417,5 @@ mod tests {
         assert_eq!(Outcome::Denied(401).to_string(), "needs a Roblox login");
         assert_eq!(Outcome::Denied(403).to_string(), "not available to the public");
         assert!(Outcome::Exact.matched() && Outcome::Known.matched() && !Outcome::NotCached.matched());
-    }
-
-    #[test]
-    fn the_creator_and_their_places_are_read_out_of_roblox_answers() {
-        let body = serde_json::json!({"data": [{"creator": {"targetId": 9, "typeId": 2}, "creatorTargetId": 1, "creatorType": 1}]});
-        // The nested creator object wins over the flat fields.
-        assert_eq!(creator_from(&body), Some(Creator { id: 9, kind: 2 }));
-        assert_eq!(creator_from(&serde_json::json!({"data": [{"creatorTargetId": 4, "creatorType": 1}]})), Some(Creator { id: 4, kind: 1 }));
-        assert_eq!(creator_from(&serde_json::json!({"data": [{"creator": {"targetId": 4, "typeId": 3}}]})), None);
-
-        let page = serde_json::json!({"data": [{"rootPlace": {"id": 10}}, {"name": "no place"}, {"rootPlace": {"id": 11}}]});
-        assert_eq!(place_ids_in(&page), [10, 11]);
-    }
-
-    #[test]
-    fn a_creators_games_are_listed_at_the_addresses_roblox_serves() {
-        let user = Creator { id: 7, kind: 1 };
-        let urls = game_list_urls(user, 50);
-        assert_eq!(urls[0], "https://games.roblox.com/v2/users/7/games?sortOrder=Asc&limit=50");
-        assert!(urls[1].contains("accessFilter=Public"));
-        let group = game_list_urls(Creator { id: 8, kind: 2 }, 25);
-        assert!(group[0].contains("/v2/groups/8/gamesV2?accessFilter=2"));
-        assert!(group[1].contains("accessFilter=1"));
-        assert!(game_list_urls(Creator { id: 1, kind: 0 }, 10).is_empty());
-    }
-
-    #[test]
-    fn places_are_tried_last_joined_first_then_the_one_that_worked_then_the_list() {
-        assert_eq!(place_order(Some(1), Some(2), &[2, 3, 1]), [1, 2, 3]);
-        assert_eq!(place_order(None, None, &[4, 4, 5]), [4, 5]);
-        assert_eq!(query_escape("a+b/c="), "a%2Bb%2Fc%3D");
     }
 }

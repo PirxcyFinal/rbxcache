@@ -28,7 +28,7 @@ pub struct Originals {
     records: BTreeMap<String, Record>,
 }
 
-fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
@@ -89,6 +89,25 @@ impl Originals {
         Ok(())
     }
 
+    /// Puts back the original of one entry, if it still holds our replacement,
+    /// and forgets it either way. For an entry that is about to be handed to
+    /// something else: afterwards it holds what Roblox wrote. Returns whether
+    /// anything was known about the entry, so the caller knows to [`Originals::save`].
+    pub fn give_back(&mut self, store: &Store, id: &Id) -> Result<bool> {
+        let id_hex = hex(id);
+        if !self.records.contains_key(&id_hex) {
+            return Ok(false);
+        }
+        let ours = store.read_body(id).is_ok_and(|current| self.replaced(id, &fingerprint(&current)).is_some());
+        if ours {
+            let body = self.original_body(id)?;
+            put_back(store, id, &body)?;
+        }
+        self.records.remove(&id_hex);
+        let _ = std::fs::remove_file(self.body_path(&id_hex));
+        Ok(true)
+    }
+
     pub fn save(&self) -> Result<()> {
         std::fs::create_dir_all(&self.root).with_context(|| format!("creating {}", self.root.display()))?;
         write_atomically(&self.root.join("manifest.json"), &serde_json::to_vec_pretty(&self.records)?)
@@ -106,9 +125,10 @@ impl Originals {
             let Some(id) = parse_id(&id_hex) else { continue };
             let ours = store.read_body(&id).is_ok_and(|current| self.replaced(&id, &fingerprint(&current)).is_some());
             if ours {
-                let put_back = std::fs::read(self.body_path(&id_hex)).map_err(anyhow::Error::from).and_then(|body| store.replace_body(&id, &body));
-                match put_back {
-                    Ok(entry) => restored.push(entry),
+                let put = std::fs::read(self.body_path(&id_hex)).map_err(anyhow::Error::from).and_then(|body| put_back(store, &id, &body));
+                match put {
+                    Ok(Some(entry)) => restored.push(entry),
+                    Ok(None) => {}
                     // Kept for another try: the original is still on disk and the entry still replaced.
                     Err(_) => continue,
                 }
@@ -117,5 +137,15 @@ impl Originals {
             let _ = std::fs::remove_file(self.body_path(&id_hex));
         }
         restored
+    }
+}
+
+/// Puts `original` back into `id`. An original that is a 3D model is not written: the
+/// entry is deleted instead, and Roblox downloads its own copy again. `None` then.
+fn put_back(store: &Store, id: &Id, original: &[u8]) -> Result<Option<Entry>> {
+    match store.replace_body(id, original) {
+        Ok(entry) => Ok(Some(entry)),
+        Err(e) if crate::integrity::is_refusal(&e) => store.delete(id).map(|()| None),
+        Err(e) => Err(e),
     }
 }

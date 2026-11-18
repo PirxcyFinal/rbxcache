@@ -1,6 +1,34 @@
 {
   "versions": [
     {
+      "version": "1.2.0",
+      "date": "2026-11-18",
+      "changes": [
+        "Eleven skies. The best looking are Neo Tokyo (pirxcy's recommended), Aurora, Synthwave and Blood Moon; Rain, Snow, Storm, Sakura, Shooting Stars, Lantern Festival and Sunset Ocean are marked work in progress.",
+        "Neo Tokyo: streets of tall buildings covered in Japanese neon, video screens, scrolling LED tickers and posters for made-up brands whose products spin in and turn, with city behind the gaps, power lines overhead, a wet street that gives it all back and a very light rain.",
+        "New skies: Sakura, Shooting Stars, Lantern Festival, Sunset Ocean, Synthwave and Blood Moon. Sunset Ocean and Synthwave put their sun where the game's sun is, so shadows match.",
+        "Skies now show in games without an Atmosphere, such as Rivals, which draw the classic sky.",
+        "Sky shaders are compiled side by side in worker processes and kept, so applying a sky a second time, or again after a Roblox update, is quick.",
+        "Roblox is closed only once the new sky is built, so a sky that fails to build leaves the game running.",
+        "Skies are always built from Roblox's own shader pack from the newest install, so an update never gets an older version's shaders, and turning a sky off removes only rbxcache's pack from a launcher's mods folder.",
+        "3D models are never swapped or downloaded: meshes, models, packages, accessories and their collision data are left alone, and config rules say how many entries they skipped.",
+        "Lab tab: swaps an entry for a new picture over and over while you play and counts how often Roblox reads it, to see whether a game looks at a cached file again.",
+        "Cards on every page are divided by animated waves, the loading screen comes in with a puff or a bounce and leaves by zooming through the p, buttons burst with lines on hover, and the background gradient moves while Roblox is running.",
+        "Skies: animated rain, snow, storm, aurora and GIF skies by rewriting Roblox's Direct3D sky shaders, entirely inside the app. Experimental — works best on NVIDIA GPUs and can cause FPS drops.",
+        "Rain is the storm's slanted streaks under a grey overcast, slower and blurred by their fall; snow is soft round flakes drawn out a little by theirs; and the new Storm adds dark cloud, heavy driving rain and lightning.",
+        "Snow, rain and storm no longer travel, so nothing runs backward when the sky clock turns. Flakes and streaks fade in and out in place, with a tail above each flake and a bright lower end on each streak so they still read as falling.",
+        "The app is black and purple. When it opens, a purple gradient rises from the bottom of the window behind every page, its front glowing on the way up. It sinks away while another window has the focus and rises again when you come back.",
+        "Skies tab: Remove Rivals skyboxes fetches the map skybox IDs and deletes the cache files that hold them.",
+        "Skies are slower, sparser and less glowy: far fewer flakes and streaks, gentle motion, and a dimmer sky behind them.",
+        "GIF skies are lighter: smaller frames, a better colour palette, fewer reads per pixel, and no picture in reflections, so they build and run faster.",
+        "New log (rbxcache.log in the app's data folder, with Open log and recent lines on the Skies page) records build timings, errors and crashes.",
+        "Applying or turning off a sky closes Roblox first if it is open, since it holds the shader pack.",
+        "Skies installs into every Roblox client on the machine: stock Roblox, Voidstrap, Bloxstrap and Fishstrap, not only one launcher.",
+        "File > Clear skyboxes deletes only the Rivals map skies from the cache so Roblox can fetch them again.",
+        "A GIF sky stores the frames inside the shader, so it works in any experience without swapping that game's sky textures."
+      ]
+    },
+    {
       "version": "1.1.1",
       "date": "2026-11-16",
       "changes": [

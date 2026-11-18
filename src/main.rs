@@ -7,12 +7,19 @@ mod config;
 mod format;
 mod gui;
 mod instance;
+mod integrity;
+mod lab;
+mod log;
 mod lookup;
+mod motion;
 mod originals;
 mod packs;
 mod protection;
+mod removed;
 mod resolve;
+mod scenes;
 mod settings;
+mod skies;
 mod store;
 mod texture;
 mod theme;
@@ -31,6 +38,13 @@ extern "system" {
 }
 
 fn main() -> Result<()> {
+    // A sky build compiles its shaders in copies of this program started as workers; such a
+    // copy does only that, before anything else starts.
+    #[cfg(windows)]
+    if let Some(code) = skies::compile_worker() {
+        std::process::exit(code);
+    }
+    log::install_panic_hook();
     let args = cli::Args::parse();
     let dir = args.dir.or_else(store::Store::default_dir).context("could not locate the Roblox folder; pass --dir")?;
     let idmap = args.idmap.unwrap_or_else(config::IdMap::default_path);
@@ -48,6 +62,7 @@ fn main() -> Result<()> {
             if detached {
                 unsafe { FreeConsole() };
             }
+            log::write(&format!("rbxcache {} started", env!("CARGO_PKG_VERSION")));
             let result = gui::run(dir, idmap, tab.as_deref(), fetch);
             if let (true, Err(error)) = (detached, &result) {
                 rfd::MessageDialog::new().set_level(rfd::MessageLevel::Error).set_title("rbxcache").set_description(format!("{error:#}")).show();
