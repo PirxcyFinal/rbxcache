@@ -552,3 +552,8 @@ distance fields of the characters it needs are kept, in
 `src/skies/hlsl/neotokyo_glyphs.hlsl`, made by `skies/neotokyo_glyphs.py`; the fonts
 themselves are not included. The brands (Kira Cola, ZAPP, HOSHI, KURO Coffee, Sora
 Beer, BIG BUN, ONPU) are invented.
+
+## License
+
+rbxcache is released under the MIT License; see [LICENSE](LICENSE). The fonts
+named under Credits keep their own SIL Open Font License.

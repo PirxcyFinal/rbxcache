@@ -3,6 +3,7 @@ name = "rbxcache"
 version = "1.2.0"
 edition = "2021"
 description = "Viewer and editor for the Roblox client asset cache (rbx-storage)"
+license = "MIT"
 
 [dependencies]
 ab_glyph = "0.2.32"
