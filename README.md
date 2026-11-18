@@ -90,6 +90,8 @@ as those that draw the classic sky, such as Rivals.
 | Synthwave | Shooting Stars |
 | Blood Moon | Lantern Festival, Sunset Ocean |
 
+![Every sky in rbxcache 1.2.0, labelled](docs/skies.jpg)
+
 A GIF of your own can be used as the sky too. Applying a sky closes Roblox
 if it is open; start it again and join a game with a visible sky. Turn off
 puts Roblox's own shaders back. Skies are experimental: they add shader work
